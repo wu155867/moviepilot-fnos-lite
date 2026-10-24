@@ -1,0 +1,549 @@
+"""
+音乐来源、目录搜索与详情路由 owner。
+"""
+
+from copy import deepcopy
+from typing import Any, Iterable, Optional, Union, cast
+
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.application.music.catalog import MusicCatalogService
+from app.chain.douban import DoubanChain
+from app.chain.media.contract import _MediaOwnerBase, _MusicMetadataT
+from app.chain.musicbrainz import MusicBrainzChain, MusicMetadataSourceChain
+from app.chain.theaudiodb import TheAudioDbChain
+from app.domain.context import (
+    MusicAlbumInfo,
+    MusicArtistInfo,
+    MusicInfo,
+)
+from app.domain.meta.metamusic import MetaMusic
+from app.foundation.text import convert as zhconv_convert
+from app.runtime.log import logger
+from app.schemas.media import normalize_media_source, resolve_media_identity
+from app.schemas.types import (
+    MUSIC_ENTITY_ALBUM,
+    MediaSource,
+    MediaSourceSelection,
+    MediaType,
+    MusicEntityType,
+)
+
+
+class MediaCatalogOwner(_MediaOwnerBase):
+    """
+    音乐来源、目录搜索与详情路由 owner。
+    """
+
+    @staticmethod
+    def _contains_han(value: str) -> bool:
+        """
+        判断名称中是否包含可用于中文展示的汉字。
+        """
+        return any("\u3400" <= char <= "\u9fff" for char in value)
+
+    @classmethod
+    def _music_artist_aliases(
+        cls,
+        info: Union[MusicInfo, MusicAlbumInfo],
+        artist_index: int,
+    ) -> list[str]:
+        """
+        按艺术家身份提取别名，避免多位艺术家的别名相互串用。
+        """
+        artists = list(info.artists or [])
+        current_name = str(artists[artist_index] or "") if artist_index < len(artists) else ""
+        artist_ids = list(info.artist_ids or [])
+        artist_id = str(artist_ids[artist_index] or "") if artist_index < len(artist_ids) else ""
+        raw_data = info.raw_data if isinstance(info.raw_data, dict) else {}
+        credits = raw_data.get("artist-credit")
+        for credit in credits if isinstance(credits, list) else []:
+            if not isinstance(credit, dict):
+                continue
+            artist = credit.get("artist") or {}
+            if not isinstance(artist, dict):
+                continue
+            if artist_id and str(artist.get("id") or "") != artist_id:
+                continue
+            credit_names = {
+                str(value).strip()
+                for value in (credit.get("name"), artist.get("name"))
+                if str(value or "").strip()
+            }
+            if not artist_id and current_name not in credit_names:
+                continue
+            aliases = [credit.get("name"), artist.get("name")]
+            aliases.extend(
+                alias.get("name")
+                for alias in artist.get("aliases") or []
+                if isinstance(alias, dict)
+            )
+            return list(dict.fromkeys(
+                str(alias).strip() for alias in aliases if str(alias or "").strip()
+            ))
+        if len(artists) == 1:
+            return list(info.artist_aliases or [])
+        return []
+
+    @classmethod
+    def _simplify_music_artist_name(
+        cls,
+        name: str,
+        aliases: Iterable[str],
+    ) -> str:
+        """
+        将艺术家名称转为简体，并在可信别名中优先选择汉字名称。
+        """
+        candidates = [name, *aliases]
+        seen: set[str] = set()
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text or text.casefold() in seen:
+                continue
+            seen.add(text.casefold())
+            simplified = zhconv_convert(text, "zh-hans")
+            if cls._contains_han(simplified):
+                return str(simplified)
+        return str(zhconv_convert(name, "zh-hans"))
+
+    @classmethod
+    def _simplify_music_artist_names(cls, info: Union[MusicInfo, MusicAlbumInfo]) -> list[str]:
+        """
+        逐位转换艺术家名称，保留多艺术家结果的身份边界。
+        """
+        return [
+            cls._simplify_music_artist_name(
+                str(name),
+                cls._music_artist_aliases(info, index),
+            )
+            for index, name in enumerate(info.artists or [])
+        ]
+
+    @staticmethod
+    def _music_source_chain(
+        media_source: MediaSource,
+    ) -> Optional[MusicMetadataSourceChain | DoubanChain]:
+        """
+        返回内置来源专用链，或绑定插件扩展来源的通用音乐端口。
+        """
+        source = normalize_media_source(media_source)
+        if not source:
+            return None
+        chains: dict[
+            MediaSource,
+            type[MusicMetadataSourceChain] | type[DoubanChain],
+        ] = {
+            MediaSource.MusicBrainz: MusicBrainzChain,
+            MediaSource.TheAudioDB: TheAudioDbChain,
+            MediaSource.DoubanMusic: DoubanChain,
+        }
+        chain_type = chains.get(source)
+        if chain_type:
+            return chain_type()
+        plugin_chain = MusicMetadataSourceChain()
+        plugin_chain.source = source
+        return plugin_chain
+
+    @classmethod
+    def _music_search_sources(
+        cls,
+        media_source: Optional[MediaSourceSelection],
+    ) -> list[MediaSource]:
+        """
+        解析有序音乐搜索来源集合，保留合法插件扩展来源并去重。
+        """
+        return MusicCatalogService(
+            source_resolver=cls._music_source_chain,
+            warning=logger.warning,
+            primary_source=cls._music_primary_source,
+        ).search_sources(media_source)
+
+    @staticmethod
+    async def _async_search_music_source(
+        chain: MusicMetadataSourceChain | DoubanChain,
+        source: MediaSource,
+        meta: MetaMusic,
+        limit: int,
+    ) -> list[MusicInfo]:
+        """
+        异步搜索单个音乐来源，来源失败时保留其它来源的候选。
+        """
+        try:
+            return await chain.async_search_music(meta, limit=limit)
+        except Exception as err:
+            logger.warning(f"音乐来源 {source} 搜索失败：{str(err)}")
+            return []
+
+    @classmethod
+    def normalize_music_candidates(
+        cls,
+        candidates: Optional[Iterable[MusicInfo | dict[str, Any]]],
+        limit: Optional[int] = None,
+    ) -> list[MusicInfo]:
+        """
+        标准化并按来源身份或元数据去重音乐候选。
+        """
+        return MusicCatalogService.normalize_candidates(candidates, limit)
+
+    def _music_catalog(self) -> MusicCatalogService:
+        """
+        构造绑定当前来源解析规则的音乐目录服务。
+        """
+        return MusicCatalogService(
+            source_resolver=self._music_source_chain,
+            warning=logger.warning,
+            primary_source=self._music_primary_source,
+        )
+
+    def search_music(
+        self,
+        query: str,
+        limit: int = 20,
+        media_source: Optional[MediaSourceSelection] = None,
+        music_types: Optional[Iterable[MusicEntityType]] = None,
+    ) -> list[MusicInfo]:
+        """
+        按一个或多个音乐来源搜索候选，未指定时使用 MusicBrainz。
+        """
+        if music_types is not None:
+            return self._music_catalog().search(
+                MetaMusic.parse_query(query),
+                limit=limit,
+                media_source=media_source,
+                music_types=music_types,
+            )
+        _meta, results = self.search(
+            query,
+            limit=limit,
+            media_source=media_source,
+            mtype=MediaType.MUSIC,
+        )
+        return cast(list[MusicInfo], results)
+
+    async def async_search_music(
+        self,
+        query: str,
+        limit: int = 20,
+        media_source: Optional[MediaSourceSelection] = None,
+        music_types: Optional[Iterable[MusicEntityType]] = None,
+    ) -> list[MusicInfo]:
+        """
+        并行搜索一个或多个音乐来源，单一来源失败不影响其它结果。
+        """
+        if music_types is not None:
+            return await self._music_catalog().async_search(
+                MetaMusic.parse_query(query),
+                limit=limit,
+                media_source=media_source,
+                music_types=music_types,
+            )
+        _meta, results = await self.async_search(
+            query,
+            limit=limit,
+            media_source=media_source,
+            mtype=MediaType.MUSIC,
+        )
+        return cast(list[MusicInfo], results)
+
+    @classmethod
+    def _validate_music_result(
+        cls,
+        result: Optional[MusicInfo],
+        media_source: MediaSource,
+        media_id: Optional[str],
+        music_type: Optional[str],
+    ) -> Optional[MusicInfo]:
+        """
+        校验来源链返回的音乐身份和实体类型。
+        """
+        if not isinstance(result, MusicInfo):
+            return None
+        if result.media_source and result.media_source != media_source:
+            return None
+        if music_type and result.music_type != music_type:
+            return None
+        if media_id and (result.media_source != media_source or str(result.media_id or "") != media_id):
+            return None
+        return cls._simplify_recognized_music_info(result)
+
+    @classmethod
+    def _simplify_recognized_music_info(cls, info: _MusicMetadataT) -> _MusicMetadataT:
+        """
+        按开关转换音乐及专辑曲目文本，保留来源缓存、原文别名和身份。
+        """
+        if not get_chain_runtime_config_snapshot().music_metadata_to_simplified:
+            return info
+        updates: dict[str, Any] = {}
+        for field_name in cls._music_simplified_text_fields:
+            value = getattr(info, field_name, None)
+            if isinstance(value, str):
+                converted = zhconv_convert(value, "zh-hans")
+                if converted != value:
+                    updates[field_name] = converted
+        for field_name in cls._music_simplified_list_fields:
+            value = getattr(info, field_name, None)
+            if isinstance(value, list):
+                converted_items = (
+                    cls._simplify_music_artist_names(info)
+                    if field_name == "artists"
+                    else [
+                        zhconv_convert(item, "zh-hans")
+                        if isinstance(item, str)
+                        else item
+                        for item in value
+                    ]
+                )
+                if converted_items != value:
+                    updates[field_name] = converted_items
+        if isinstance(info, MusicAlbumInfo):
+            tracks = [cls._simplify_recognized_music_info(track) for track in info.tracks]
+            if any(converted is not original for converted, original in zip(tracks, info.tracks)):
+                updates["tracks"] = tracks
+        if not updates:
+            return info
+        simplified: _MusicMetadataT = deepcopy(info)
+        alias_field: str
+        for field_name, alias_field in (
+            ("title", "title_aliases"),
+            ("album", "album_aliases"),
+            ("artists", "artist_aliases"),
+            ("album_artist", "artist_aliases"),
+            ("names", "title_aliases"),
+        ):
+            if field_name not in updates:
+                continue
+            if field_name in ("album_artist", "names") and info.music_type != MUSIC_ENTITY_ALBUM:
+                continue
+            original = getattr(info, field_name)
+            originals: list[Any] = original if isinstance(original, list) else [original]
+            setattr(simplified, alias_field, list(dict.fromkeys([
+                *(getattr(simplified, alias_field, None) or []), *originals,
+            ])))
+        for field_name, value in updates.items():
+            setattr(simplified, field_name, value)
+        return simplified
+
+    @classmethod
+    def _simplify_recognized_music_mapping(
+        cls,
+        matched: dict[str, MusicInfo],
+    ) -> dict[str, MusicInfo]:
+        """
+        转换目录识别结果，同时让缓存始终保留来源返回的原始文本。
+        """
+        simplified = {path: cls._simplify_recognized_music_info(info) for path, info in matched.items()}
+        if all(simplified[path] is info for path, info in matched.items()):
+            return matched
+        return simplified
+
+    def recognize_music_from_source(
+        self,
+        media_source: MediaSource,
+        meta: Optional[MetaMusic] = None,
+        media_id: Optional[str] = None,
+        cache: bool = True,
+        music_type: Optional[str] = None,
+    ) -> Optional[MusicInfo]:
+        """
+        通过固定来源链同步识别音乐实体。
+        """
+        source = normalize_media_source(media_source)
+        normalized_id = str(media_id).strip() if media_id is not None else None
+        if not source or normalized_id == "0":
+            return None
+        chain = self._music_source_chain(source)
+        if not chain:
+            return None
+        result = chain.recognize_music(
+            meta=meta,
+            media_id=normalized_id,
+            cache=cache,
+            music_type=music_type,
+        )
+        validated = self._validate_music_result(
+            result,
+            source,
+            normalized_id,
+            music_type,
+        )
+        return cast(
+            Optional[MusicInfo],
+            self._finalize_recognition_result(validated),
+        )
+
+    async def async_recognize_music_from_source(
+        self,
+        media_source: MediaSource,
+        meta: Optional[MetaMusic] = None,
+        media_id: Optional[str] = None,
+        cache: bool = True,
+        music_type: Optional[str] = None,
+    ) -> Optional[MusicInfo]:
+        """
+        通过固定来源链异步识别音乐实体。
+        """
+        source = normalize_media_source(media_source)
+        normalized_id = str(media_id).strip() if media_id is not None else None
+        if not source or normalized_id == "0":
+            return None
+        chain = self._music_source_chain(source)
+        if not chain:
+            return None
+        result = await chain.async_recognize_music(
+            meta=meta,
+            media_id=normalized_id,
+            cache=cache,
+            music_type=music_type,
+        )
+        validated = self._validate_music_result(
+            result,
+            source,
+            normalized_id,
+            music_type,
+        )
+        return cast(
+            Optional[MusicInfo],
+            await self._async_finalize_recognition_result(validated),
+        )
+
+    def get_music_album(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        music_release_regions: Optional[list[str]] = None,
+        music_release_scripts: Optional[list[str]] = None,
+        musicbrainz_release_id: Optional[str] = None,
+    ) -> Optional[MusicAlbumInfo]:
+        """
+        按音乐来源和原生 ID 同步获取专辑详情，按开关转换专辑及曲目文本。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return None
+        if musicbrainz_release_id is not None and source != MediaSource.MusicBrainz:
+            return None
+        chain = self._music_source_chain(source)
+        preference_kwargs: dict[str, Any] = {}
+        if musicbrainz_release_id is not None:
+            preference_kwargs["musicbrainz_release_id"] = musicbrainz_release_id
+        if music_release_regions is not None:
+            preference_kwargs["music_release_regions"] = music_release_regions
+        if music_release_scripts is not None:
+            preference_kwargs["music_release_scripts"] = music_release_scripts
+        result = chain.get_music_album(normalized_id, **preference_kwargs) if chain else None
+        if result:
+            result = self._simplify_recognized_music_info(result)
+        return cast(
+            Optional[MusicAlbumInfo],
+            self._finalize_recognition_result(result),
+        )
+
+    async def async_get_music_album(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        music_release_regions: Optional[list[str]] = None,
+        music_release_scripts: Optional[list[str]] = None,
+        musicbrainz_release_id: Optional[str] = None,
+    ) -> Optional[MusicAlbumInfo]:
+        """
+        按音乐来源和原生 ID 异步获取专辑详情，按开关转换专辑及曲目文本。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return None
+        if musicbrainz_release_id is not None and source != MediaSource.MusicBrainz:
+            return None
+        chain = self._music_source_chain(source)
+        preference_kwargs: dict[str, Any] = {}
+        if musicbrainz_release_id is not None:
+            preference_kwargs["musicbrainz_release_id"] = musicbrainz_release_id
+        if music_release_regions is not None:
+            preference_kwargs["music_release_regions"] = music_release_regions
+        if music_release_scripts is not None:
+            preference_kwargs["music_release_scripts"] = music_release_scripts
+        result = await chain.async_get_music_album(normalized_id, **preference_kwargs) if chain else None
+        if result:
+            result = self._simplify_recognized_music_info(result)
+        return cast(
+            Optional[MusicAlbumInfo],
+            await self._async_finalize_recognition_result(result),
+        )
+
+    async def async_get_music_album_related(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        count: int = 24,
+    ) -> list[MusicInfo]:
+        """
+        按音乐来源读取指定专辑的关联条目。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return []
+        chain = self._music_source_chain(source)
+        if not chain:
+            return []
+        return self.normalize_music_candidates(
+            await chain.async_get_music_album_related(normalized_id, count=count),
+            limit=count,
+        )
+
+    async def async_get_music_artist(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+    ) -> Optional[MusicArtistInfo]:
+        """
+        按音乐来源读取艺术家详情。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return None
+        chain = self._music_source_chain(source)
+        if not chain or not hasattr(chain, "async_get_music_artist"):
+            return None
+        result = await chain.async_get_music_artist(normalized_id)
+        return cast(
+            Optional[MusicArtistInfo],
+            await self._async_finalize_recognition_result(result),
+        )
+
+    async def async_get_music_artist_albums(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        page: int = 1,
+        count: int = 30,
+        album_type: Optional[str] = None,
+    ) -> list[MusicInfo]:
+        """
+        按音乐来源分页读取艺术家的专辑目录。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return []
+        chain = self._music_source_chain(source)
+        if not chain or not hasattr(chain, "async_get_music_artist_albums"):
+            return []
+        return self.normalize_music_candidates(
+            await chain.async_get_music_artist_albums(normalized_id, page=page, count=count, album_type=album_type),
+            limit=count,
+        )
+
+    async def async_get_music_artist_related(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        count: int = 24,
+    ) -> list[MusicArtistInfo]:
+        """
+        按音乐来源读取关联艺术家。
+        """
+        source, normalized_id = resolve_media_identity(media_source=media_source, media_id=media_id)
+        if not source or not normalized_id:
+            return []
+        chain = self._music_source_chain(source)
+        if not chain or not hasattr(chain, "async_get_music_artist_related"):
+            return []
+        return await chain.async_get_music_artist_related(normalized_id, count=count)

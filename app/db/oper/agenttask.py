@@ -1,0 +1,409 @@
+"""
+Agent 定时任务定义和执行状态的数据访问入口，适配调用方会话及兼容事务执行器。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, List, Optional, cast
+from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+
+from app.db.base import DbOper
+from app.db.models.agenttask import (
+    AgentTask,
+    _get_for_user_statement,
+    _list_for_user_statement,
+)
+from app.db.models.agenttaskrun import AgentTaskRun
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTaskFinishRecord:
+    """
+    一次任务运行收口后由数据库事务确认的三个独立事实。
+
+    :param run_finalized: 是否成功把本次运行记录更新为终态
+    :param task_projection_updated: 是否同步更新任务当前状态，旧运行收口不会覆盖较新运行投影
+    :param date_task_disabled: 是否已禁用完成后不再调度的一次性任务
+    """
+
+    run_finalized: bool
+    task_projection_updated: bool
+    date_task_disabled: bool
+
+
+class AgentTaskOper(DbOper):
+    """
+    Agent 自主定时任务管理。
+    """
+
+    @staticmethod
+    def _now() -> str:
+        """
+        生成当前数据库时间字符串。
+        """
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def add(self, **kwargs: object) -> Optional[AgentTask]:
+        """
+        新增 Agent 定时任务。
+        """
+        now = self._now()
+        task_id = self._execute_sync_write(
+            lambda session: AgentTask.add_task(
+                session,
+                **kwargs,
+                enabled=True,
+                last_status="waiting",
+                run_count=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return self.get(task_id)
+
+    def get(
+            self,
+            task_id: int,
+            user_id: Optional[str] = None,
+    ) -> Optional[AgentTask]:
+        """
+        查询单个 Agent 定时任务。
+        """
+        def query(session: Session) -> Optional[AgentTask]:
+            """
+            在调用方会话中读取单个任务。
+            """
+            return cast(
+                Optional[AgentTask],
+                session.execute(
+                    _get_for_user_statement(
+                        AgentTask,
+                        task_id=task_id,
+                        user_id=user_id,
+                    )
+                ).scalars().first(),
+            )
+
+        return self._execute_sync_query(query)
+
+    async def async_get(
+            self,
+            task_id: int,
+            user_id: Optional[str] = None,
+    ) -> Optional[AgentTask]:
+        """
+        通过异步会话查询单个 Agent 定时任务。
+        """
+        async def query(session: AsyncSession) -> Optional[AgentTask]:
+            """
+            在调用方异步会话中执行与同步入口相同的查询语义。
+            """
+            result = await session.execute(
+                _get_for_user_statement(
+                    AgentTask,
+                    task_id=task_id,
+                    user_id=user_id,
+                )
+            )
+            return cast(Optional[AgentTask], result.scalars().first())
+
+        return await self._execute_async_query(query)
+
+    def list(
+            self,
+            user_id: Optional[str] = None,
+            enabled: Optional[bool] = None,
+    ) -> List[AgentTask]:
+        """
+        查询 Agent 定时任务列表。
+        """
+        def query(session: Session) -> List[AgentTask]:
+            """
+            在调用方会话中读取任务列表。
+            """
+            return list(session.execute(
+                _list_for_user_statement(
+                    AgentTask,
+                    user_id=user_id,
+                    enabled=enabled,
+                )
+            ).scalars().all())
+
+        return self._execute_sync_query(query)
+
+    def update(
+            self,
+            task_id: int,
+            payload: dict[str, Any],
+            user_id: Optional[str] = None,
+    ) -> bool:
+        """
+        更新 Agent 定时任务。
+        """
+        normalized_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in {
+                "name",
+                "content",
+                "trigger_type",
+                "cron_expression",
+                "run_at",
+                "enabled",
+                "last_status",
+                "last_result",
+            }
+        }
+        if not normalized_payload:
+            return False
+        normalized_payload["updated_at"] = self._now()
+        return self._execute_sync_write(
+            lambda session: AgentTask.update_task(
+                session,
+                task_id=task_id,
+                payload=normalized_payload,
+                user_id=user_id,
+            )
+        )
+
+    def delete(self, task_id: int, user_id: Optional[str] = None) -> bool:
+        """
+        删除非运行中的 Agent 定时任务及其运行历史。
+        """
+        return self._execute_sync_write(
+            lambda session: AgentTaskRun.delete_task_and_runs(
+                session,
+                task_id=task_id,
+                user_id=user_id,
+            )
+        )
+
+    def begin_run(
+            self,
+            task_id: int,
+            trigger_source: str = "scheduled",
+            *,
+            run_id: Optional[str] = None,
+            started_at: Optional[str] = None,
+    ) -> Optional[AgentTaskRun]:
+        """
+        原子创建一次运行并返回其任务快照。
+
+        可选运行 ID 和开始时间用于恢复/幂等验证；正常调度入口由本方法生成。
+        """
+        resolved_run_id = run_id or uuid4().hex
+        resolved_started_at = started_at or self._now()
+        created_run_id = self._execute_sync_write(
+            lambda session: AgentTaskRun.begin_run(
+                session,
+                task_id=task_id,
+                run_id=resolved_run_id,
+                trigger_source=trigger_source,
+                started_at=resolved_started_at,
+            )
+        )
+        return self.get_run(created_run_id) if created_run_id else None
+
+    def mark_running(self, task_id: int) -> bool:
+        """
+        兼容既有调用并为该次执行创建运行记录。
+        """
+        return self.begin_run(task_id=task_id) is not None
+
+    def mark_interrupted(self, task_id: int, result: str) -> bool:
+        """
+        将遗留的运行中任务标记为中断且结果未知。
+        """
+        finished_at = self._now()
+        normalized_result = (result or "")[:20000]
+        return self._execute_sync_write(
+            lambda session: AgentTaskRun.interrupt_task(
+                session,
+                task_id=task_id,
+                result=normalized_result,
+                finished_at=finished_at,
+            )
+        )
+
+    def get_run(self, run_id: str) -> Optional[AgentTaskRun]:
+        """
+        查询一次 Agent 任务运行。
+        """
+        return self._execute_sync_query(
+            lambda session: AgentTaskRun.get_by_run_id(session, run_id=run_id)
+        )
+
+    def list_runs(
+            self,
+            task_id: int,
+            user_id: Optional[str] = None,
+            limit: int = 10,
+    ) -> List[AgentTaskRun]:
+        """
+        查询任务最近的有界运行历史。
+        """
+        return self._execute_sync_query(
+            lambda session: AgentTaskRun.list_for_task(
+                session,
+                task_id=task_id,
+                user_id=user_id,
+                limit=limit,
+            )
+        )
+
+    def finish_run(
+            self,
+            run_id: str,
+            success: bool,
+            result: str,
+            disable_date_task: bool = False,
+    ) -> bool:
+        """
+        收口精确运行并更新仍匹配的任务投影。
+        """
+        finished_at = self._now()
+        normalized_result = (result or "")[:20000]
+        return self._execute_sync_write(
+            lambda session: AgentTaskRun.finish_run(
+                session,
+                run_id=run_id,
+                success=success,
+                result=normalized_result,
+                finished_at=finished_at,
+                disable_date_task=disable_date_task,
+            )
+        )
+
+    def finish_run_outcome(
+            self,
+            run_id: str,
+            success: bool,
+            result: str,
+    ) -> AgentTaskFinishRecord:
+        """
+        收口运行，并返回当前事务实际更新的任务投影和停用事实。
+        """
+        finished_at = self._now()
+        normalized_result = (result or "")[:20000]
+        expected_status = "success" if success else "failed"
+
+        def finalize(session: Session) -> AgentTaskFinishRecord:
+            """
+            使用列查询绕过 ORM identity-map，读取刚写入的真实投影。
+            """
+            finalized = AgentTaskRun.finish_run(
+                session,
+                run_id=run_id,
+                success=success,
+                result=normalized_result,
+                finished_at=finished_at,
+                disable_date_task=True,
+            )
+            run = session.execute(
+                select(
+                    AgentTaskRun.task_id,
+                    AgentTaskRun.trigger_type,
+                ).where(AgentTaskRun.run_id == run_id)
+            ).mappings().first()
+            task = None
+            if run:
+                task = session.execute(
+                    select(
+                        AgentTask.last_run_id,
+                        AgentTask.last_status,
+                        AgentTask.enabled,
+                    ).where(AgentTask.id == run["task_id"])
+                ).mappings().first()
+            projection_updated = bool(
+                finalized
+                and task
+                and task["last_run_id"] == run_id
+                and task["last_status"] == expected_status
+            )
+            return AgentTaskFinishRecord(
+                run_finalized=finalized,
+                task_projection_updated=projection_updated,
+                date_task_disabled=bool(
+                    projection_updated
+                    and run
+                    and run["trigger_type"] == "date"
+                    and task
+                    and not task["enabled"]
+                ),
+            )
+
+        return self._execute_sync_write(finalize)
+
+    def finish(
+            self,
+            task_id: int,
+            success: bool,
+            result: str,
+            disable: bool = False,
+    ) -> bool:
+        """
+        记录 Agent 定时任务执行结果。
+        """
+        task = self.get(task_id)
+        if not task or not task.last_run_id:
+            return False
+        return self.finish_run(
+            run_id=task.last_run_id,
+            success=success,
+            result=result,
+            disable_date_task=disable,
+        )
+
+    @staticmethod
+    def to_dict(
+            task: AgentTask,
+            next_run_at: Optional[str] = None,
+            timezone: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        将 Agent 定时任务转换为工具可返回的结构。
+        """
+        return {
+            "id": task.id,
+            "name": task.name,
+            "content": task.content,
+            "trigger_type": task.trigger_type,
+            "cron_expression": task.cron_expression,
+            "run_at": task.run_at,
+            "timezone": timezone,
+            "enabled": bool(task.enabled),
+            "last_status": task.last_status,
+            "last_run_at": task.last_run_at,
+            "last_result": task.last_result,
+            "last_run_id": task.last_run_id,
+            "run_count": task.run_count or 0,
+            "next_run_at": next_run_at,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+
+    @staticmethod
+    def run_to_dict(run: AgentTaskRun) -> dict[str, Any]:
+        """
+        将一次 Agent 任务运行转换为工具返回结构。
+        """
+        return {
+            "run_id": run.run_id,
+            "task_id": run.task_id,
+            "trigger_source": run.trigger_source,
+            "name": run.name,
+            "content": run.content,
+            "trigger_type": run.trigger_type,
+            "cron_expression": run.cron_expression,
+            "run_at": run.run_at,
+            "status": run.status,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "result": run.result,
+        }

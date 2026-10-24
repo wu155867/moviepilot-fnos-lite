@@ -1,0 +1,142 @@
+"""
+检查系统目录监控限制并给出配置提示。
+"""
+
+import platform
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.adapters.system.host import SystemUtils
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+
+
+def count_directory_entries(directory: Path, max_check: int = 10000) -> Tuple[int, int]:
+    """
+    统计目录下的文件与子目录数量（用于检测是否超过系统限制）。
+    :param directory: 目录路径
+    :param max_check: 最大检查文件数量，避免长时间阻塞
+    :return: (文件数量, 目录数量)
+    """
+    try:
+        # 走可强杀的子进程：挂载挂死时 os.walk 永不返回，会把启动重试的
+        # 恢复动作永久钉死，进而饿死其他健康目录的待重试项
+        # 延迟导入：filemanager 包的 __init__ 会拖入整条 chain 依赖，
+        # 模块级导入会破坏 monitor 包的轻量加载
+        from app.adapters.system.fsproxy import fsproxy
+        result = fsproxy.count_entries(directory, max_check=max_check)
+        return result.get("file_count", 0), result.get("dir_count", 0)
+    except Exception as err:
+        logger.debug(f"统计目录规模失败: {err}")
+    return 0, 0
+
+
+def count_directory_files(directory: Path, max_check: int = 10000) -> int:
+    """
+    统计目录下的文件数量。
+    :param directory: 目录路径
+    :param max_check: 最大检查数量，避免长时间阻塞
+    :return: 文件数量
+    """
+    file_count, _ = count_directory_entries(directory, max_check=max_check)
+    return file_count
+
+
+def check_system_limits() -> Dict[str, Any]:
+    """
+    检查系统监控相关限制。
+    :return: 系统限制信息
+    """
+    warnings: List[str] = []
+    limits = {
+        'max_user_watches': 0,
+        'max_user_instances': 0,
+        'warnings': warnings
+    }
+
+    try:
+        if platform.system() == 'Linux':
+            # 检查 inotify 限制
+            try:
+                with open('/proc/sys/fs/inotify/max_user_watches', 'r', encoding='utf-8', errors='replace') as f:
+                    limits['max_user_watches'] = int(f.read().strip())
+            except Exception as e:
+                logger.debug(f"读取 inotify 限制失败: {e}")
+                limits['max_user_watches'] = 8192
+
+            try:
+                with open('/proc/sys/fs/inotify/max_user_instances', 'r', encoding='utf-8', errors='replace') as f:
+                    limits['max_user_instances'] = int(f.read().strip())
+            except Exception as e:
+                logger.debug(f"读取 inotify 实例限制失败: {e}")
+    except Exception as e:
+        warnings.append(f"检查系统限制时出错: {e}")
+
+    return limits
+
+
+def get_system_optimization_tips() -> List[str]:
+    """
+    获取系统优化建议。
+    :return: 优化建议列表
+    """
+    tips = []
+    system = platform.system()
+
+    if system == 'Linux':
+        tips.extend([
+            "增加 inotify 监控数量限制:",
+            "echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf",
+            "echo fs.inotify.max_user_instances=524288 | sudo tee -a /etc/sysctl.conf",
+            "sudo sysctl -p",
+            "",
+            "如果在Docker中运行，请在宿主机上执行以上命令"
+        ])
+    elif system == 'Darwin':
+        tips.extend([
+            "macOS 系统优化建议:",
+            "sudo sysctl kern.maxfiles=65536",
+            "sudo sysctl kern.maxfilesperproc=32768",
+            "ulimit -n 32768"
+        ])
+    elif system == 'Windows':
+        tips.extend([
+            "Windows 系统优化建议:",
+            "1. 关闭不必要的实时保护软件对监控目录的扫描",
+            "2. 将监控目录添加到Windows Defender排除列表",
+            "3. 确保有足够的可用内存"
+        ])
+
+    return tips
+
+
+def decide_monitor_mode(directory: Path,
+                        monitor_mode: str) -> Tuple[bool, str, Optional[Dict[str, Any]], Optional[int]]:
+    """
+    决策监控模式。兼容模式与网络文件系统直接短路，只有快速模式候选才统计
+    目录规模与系统限制，避免启动期对网络挂载做无谓的全量遍历。
+
+    inotify 的 max_user_watches 按监视点（目录）计数，因此用目录数量而不是
+    文件数量与上限比较。
+
+    :param directory: 监控目录
+    :param monitor_mode: 配置的监控模式
+    :return: (是否使用轮询, 原因, 系统限制信息或None, 文件数量或None)
+    """
+    if monitor_mode == "compatibility":
+        return True, "用户配置为兼容模式", None, None
+
+    # 检查网络文件系统
+    if SystemUtils.is_network_filesystem(directory):
+        if not get_runtime_setting('MONITOR_NETWORK_FAST_MODE'):
+            return True, "检测到网络文件系统，建议使用兼容模式", None, None
+        # 用户已确认该挂载支持 inotify，继续走快速模式的系统限制检查
+        logger.info(f"检测到网络文件系统，但已配置允许快速模式: {directory}")
+
+    limits = check_system_limits()
+    file_count, dir_count = count_directory_entries(directory)
+    max_watches = limits.get('max_user_watches')
+    if max_watches and dir_count > max_watches * 0.8:
+        return (True, f"目录数量({dir_count})接近 inotify 监控上限({max_watches})",
+                limits, file_count)
+    return False, "使用快速模式", limits, file_count

@@ -1,0 +1,51 @@
+.idea/
+.DS_Store
+*.c
+*.so
+*.pyd
+build/
+cython_cache/
+dist/
+rust/**/target/
+nginx/
+test.py
+app/application/site/*.bin
+# 忽略历史 app/helper 目录遗留的站点数据；当前资源写入 app/application/site。
+# 动态库已由上方的 .so/.pyd 通配规则排除。
+app/helper/*.bin
+app/plugins/**
+!app/plugins/__init__.py
+config/*
+!config/category.yaml
+# 运行期设置持久化目录（settings 写回 app.env 的落点）与本地验证产物
+app/config/
+.verify_tmp/
+.artifacts/
+.runtime/
+public/
+.moviepilot.env
+*.pyc
+*.log
+.coverage
+coverage.xml
+coverage.json
+htmlcov/
+.vscode
+venv
+moviepilot-site-capture-*.zip
+
+# Pylint 检查报告与缓存
+pylint-report.json
+.pylint.d/
+
+# AI 协作工具的本地配置
+.claude/
+!.claude/*.json
+.claude/settings.local.json
+
+# Superpowers 设计/计划文档（本地协作产物，不纳入仓库）
+docs/superpowers/
+
+# 保留本地前端构建产物目录，目录内产物不纳入仓库
+frontend-dist/*
+!frontend-dist/.gitkeep

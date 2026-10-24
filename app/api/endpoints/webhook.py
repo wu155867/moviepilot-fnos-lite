@@ -1,0 +1,57 @@
+"""
+接收外部服务回调并交给对应消息或业务流程处理。
+"""
+
+from typing import Annotated, Any
+
+from fastapi import Depends, Request
+
+from app.adapters.web.security.access import verify_apitoken
+from app.api.context import get_background_task_registry, resolve_background_task_registry
+from app.api.response import ResponseAPIRouter
+from app.chain.webhook import WebhookChain
+from app.runtime.tasks import TaskRegistry
+from app.schemas.response import Response as _SchemaResponse
+
+router = ResponseAPIRouter()
+
+
+def start_webhook_chain(body: Any, form: Any, args: Any) -> None:
+    """
+    启动链式任务
+    """
+    WebhookChain().message(body=body, form=form, args=args)
+
+
+@router.post("/", summary="Webhook消息响应", response_model=_SchemaResponse[None])
+async def webhook_message(
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
+    request: Request,
+    _: Annotated[str, Depends(verify_apitoken)],
+) -> Any:
+    """
+    Webhook响应，配置请求中需要添加参数：token=API_TOKEN&source=媒体服务器名
+    """
+    body = await request.body()
+    form = await request.form()
+    args = request.query_params
+    resolve_background_task_registry(task_registry).create_sync(
+        start_webhook_chain, body, form, args, owner="api.webhook.message"
+    )
+    return _SchemaResponse(success=True)
+
+
+@router.get("/", summary="Webhook消息响应", response_model=_SchemaResponse[None])
+async def webhook_message_get(
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
+    request: Request,
+    _: Annotated[str, Depends(verify_apitoken)],
+) -> Any:
+    """
+    Webhook响应，配置请求中需要添加参数：token=API_TOKEN&source=媒体服务器名
+    """
+    args = request.query_params
+    resolve_background_task_registry(task_registry).create_sync(
+        start_webhook_chain, None, None, args, owner="api.webhook.message"
+    )
+    return _SchemaResponse(success=True)

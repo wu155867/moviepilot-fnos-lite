@@ -1,0 +1,449 @@
+"""
+WebAgent 运行时类型适配，不包含 HTTP 或 SSE 编码。
+"""
+
+import time
+import uuid
+from threading import Lock
+from typing import Any, Awaitable, Callable, Optional
+
+from app.agent.loader import get_moviepilot_agent_type
+from app.application.security.user import get_configured_user_id_lookup
+from app.runtime.log import logger
+from app.schemas.message import Message
+from app.schemas.types import NotificationChannel
+
+
+class _WebAgentStreamingHandlerMixin:
+    """
+    Web 前端专用流式处理器，将工具提示和文本统一回调给 SSE。
+    """
+
+    _lock: Lock
+    _pending_tool_stats: dict[str, int]
+
+    def _should_buffer_thinking_status(self) -> bool:
+        """
+        WebAgent 通过结构化 SSE 展示思考状态，不把它写入正文。
+        """
+        return False
+
+    def __init__(
+        self,
+        on_emit: Callable[[str], None],
+        on_tool_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
+        """
+        绑定当前 Web 请求的输出回调。
+        """
+        super().__init__()
+        self._on_emit = on_emit
+        self._on_tool_event = on_tool_event
+
+    def set_emit_callback(self, on_emit: Callable[[str], None]) -> None:
+        """
+        更新流式输出回调，复用 WebAgent 实例时指向当前 SSE 请求。
+
+        :param on_emit: 当前请求的输出回调
+        """
+        self._on_emit = on_emit
+
+    def set_tool_event_callback(
+        self,
+        on_tool_event: Optional[Callable[[dict[str, Any]], None]],
+    ) -> None:
+        """
+        更新当前 Web 请求的结构化工具生命周期回调。
+        """
+        self._on_tool_event = on_tool_event
+
+    def _uses_structured_tool_events(self) -> bool:
+        """
+        仅在啰嗦模式下使用 WebAgent 的逐条工具生命周期事件。
+        """
+        # ``StreamingHandler`` 是运行时组合进当前 MRO 的基础实现。
+        return bool(self._on_tool_event and super()._is_verbose_mode())  # type: ignore[misc]
+
+    def _publish_tool_event(self, event: dict[str, Any]) -> None:
+        """
+        向 Web SSE 发布结构化工具生命周期事件，并隔离回调异常。
+        """
+        if not self._on_tool_event:
+            return
+        try:
+            self._on_tool_event(event)
+        except Exception as error:
+            logger.debug(f"Web工具生命周期回调失败: {error}")
+
+    def thinking_started(self) -> None:
+        """
+        发布 Web SSE 的模型思考开始事件，由前端负责持续计时。
+        """
+        was_active = bool(getattr(self, "_thinking_active", False))
+        super().thinking_started()  # type: ignore[misc]
+        if not was_active and self._thinking_active:
+            self._publish_tool_event({"type": "thinking", "status": "running", "started_at": int(time.time() * 1000)})
+
+    def thinking_finished(self) -> None:
+        """
+        发布 Web SSE 的模型思考结束事件，并清理基础流式状态。
+        """
+        was_active = bool(getattr(self, "_thinking_active", False))
+        super().thinking_finished()  # type: ignore[misc]
+        if was_active:
+            self._publish_tool_event({"type": "thinking", "status": "done"})
+
+    def tool_call_started(
+        self,
+        tool_name: str,
+        tool_message: Optional[str] = None,
+    ) -> str:
+        """
+        发布真实工具开始事件，调用方随后用同一 ID 收口结果。
+        """
+        super().tool_call_started(tool_name, tool_message)  # type: ignore[misc]
+        if not self._uses_structured_tool_events():
+            return ""
+        tool_id = f"tool-{uuid.uuid4().hex}"
+        self._publish_tool_event(
+            {
+                "type": "tool",
+                "status": "running",
+                "tool_id": tool_id,
+                "tool_name": str(tool_name or ""),
+                "message": " ".join(str(tool_message or tool_name).splitlines()),
+            }
+        )
+        return tool_id
+
+    def tool_call_finished(self, tool_id: str, status: str = "done") -> None:
+        """
+        发布真实工具完成或失败事件，保持与开始事件的 ID 对应。
+        """
+        normalized_status = status if status in {"done", "error"} else "done"
+        if tool_id and self._uses_structured_tool_events():
+            self._publish_tool_event(
+                {
+                    "type": "tool",
+                    "status": normalized_status,
+                    "tool_id": tool_id,
+                }
+            )
+        super().tool_call_finished(tool_id, status)  # type: ignore[misc]
+
+    def report_tool_call(
+        self,
+        tool_name: str,
+        tool_message: Optional[str] = None,
+        tool_kwargs: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """
+        为没有 MoviePilotTool 包装层的内部工具建立完整生命周期。
+        """
+        if self._uses_structured_tool_events():
+            del tool_kwargs
+            return self.tool_call_started(tool_name, tool_message)
+        return str(super().report_tool_call(  # type: ignore[misc]
+            tool_name=tool_name,
+            tool_message=tool_message,
+            tool_kwargs=tool_kwargs,
+        ) or "")
+
+    def record_tool_call(
+        self,
+        tool_name: str,
+        tool_message: Optional[str] = None,
+        tool_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        记录 Web 工具调用；详细模式使用生命周期事件，其他模式保留计数汇总。
+        """
+        if self._uses_structured_tool_events():
+            return
+        # 该方法由运行时组合进 MRO 的 StreamingHandler 提供。
+        super().record_tool_call(  # type: ignore[misc]
+            tool_name=tool_name,
+            tool_message=tool_message,
+            tool_kwargs=tool_kwargs,
+        )
+
+    def _on_tool_stats_recorded(self) -> None:
+        """
+        WebAgent 非啰嗦模式在每次工具开始时立即发布最新摘要。
+        """
+        if self._uses_structured_tool_events():
+            return
+        if self._streaming_enabled:
+            self.flush_pending_tool_summary()
+            return
+        # 兼容尚未进入流式生命周期的直接调用；正式 Web 请求会在上面的
+        # 分支中逐次回调 SSE，而不会等正文或流结束后才显示统计。
+        if not self._on_tool_event:
+            self.flush_pending_tool_summary()
+
+    def emit_tool_message(self, message: str) -> str:
+        """
+        将工具摘要压成一行，防止多行参数被 SSE 文本解析器拆入正文。
+
+        仅处理展示文案；实际工具参数保持原样，由前端在工具提示条内自动折行。
+        """
+        normalized_message = " ".join(str(message or "").splitlines())
+        if self._on_tool_event:
+            return ""
+        emitted = str(super().emit_tool_message(normalized_message))  # type: ignore[misc]
+        if emitted:
+            self._on_emit(emitted)
+        return emitted
+
+    def emit(self, token: str) -> str:
+        """
+        追加 token 并同步通知 SSE 生产者。
+        """
+        # 该方法由运行时组合进 MRO 的 StreamingHandler 提供。
+        emitted = super().emit(token)  # type: ignore[misc]
+        if emitted:
+            self._on_emit(emitted)
+        return str(emitted)
+
+    def flush_pending_tool_summary(self) -> str:
+        """
+        输出延迟聚合的工具摘要。
+        """
+        if self._uses_structured_tool_events():
+            return ""
+        # 该方法由运行时组合进 MRO 的 StreamingHandler 提供。
+        emitted = super().flush_pending_tool_summary()  # type: ignore[misc]
+        if emitted:
+            self._on_emit(emitted)
+        return ""
+
+    async def start_streaming(
+        self,
+        channel: Optional[str] = None,
+        source: Optional[str] = None,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        original_message_id: Optional[str] = None,
+        original_chat_id: Optional[str] = None,
+        title: str = "",
+    ) -> None:
+        """
+        Web SSE 自身负责外发，不启动消息模块编辑循环。
+        """
+        self._channel = channel
+        self._source = source
+        self._user_id = user_id
+        self._username = username
+        self._original_message_id = original_message_id
+        self._original_chat_id = original_chat_id
+        self._title = title
+        self._streaming_enabled = True
+        self._sent_text = ""
+        self._message_response = None
+        self._msg_start_offset = 0
+        self._pending_tool_stats = {}
+        self._live_tool_summary = None
+        self._thinking_started_at = None
+        self._thinking_active = False
+        self._thinking_status_text = ""
+
+    async def stop_streaming(self) -> tuple[bool, str]:
+        """
+        停止 Web SSE 流式状态，保留缓冲区给 Agent 收口逻辑去重。
+        """
+        if not self._streaming_enabled:
+            return False, ""
+        self.thinking_finished()
+        self._streaming_enabled = False
+        self.flush_pending_tool_summary()
+        with self._lock:
+            self._sent_text = ""
+            self._message_response = None
+            self._msg_start_offset = 0
+            self._pending_tool_stats = {}
+            self._live_tool_summary = None
+        return False, ""
+
+    @property
+    def is_auto_flushing(self) -> bool:
+        """
+        让工具执行提示进入缓冲区，由 SSE 回调负责外发。
+        """
+        return True
+
+
+def _get_web_agent_streaming_handler_type() -> type:
+    """
+    首次构造 Web Agent 时才解析完整流式处理器实现。
+    """
+    global _WEB_AGENT_STREAMING_HANDLER_TYPE
+    if _WEB_AGENT_STREAMING_HANDLER_TYPE is not None:
+        return _WEB_AGENT_STREAMING_HANDLER_TYPE
+    with _WEB_AGENT_STREAMING_HANDLER_TYPE_LOCK:
+        if _WEB_AGENT_STREAMING_HANDLER_TYPE is None:
+            from app.agent.callback import StreamingHandler
+
+            _WEB_AGENT_STREAMING_HANDLER_TYPE = type(
+                "_RuntimeWebAgentStreamingHandler",
+                (_WebAgentStreamingHandlerMixin, StreamingHandler),
+                {"__module__": __name__},
+            )
+        return _WEB_AGENT_STREAMING_HANDLER_TYPE
+
+
+_WEB_AGENT_STREAMING_HANDLER_TYPE_LOCK = Lock()
+_WEB_AGENT_STREAMING_HANDLER_TYPE: Optional[type] = None
+
+
+class _WebAgentMoviePilotAgentMixin:
+    """
+    Web 前端专用 Agent，强制使用流式推理。
+    """
+
+    is_background: bool
+    output_callback: Optional[Callable[[str], None]]
+    stream_handler: Any
+    user_id: Optional[str]
+    _streamed_output: str
+    channel: Optional[str]
+    source: Optional[str]
+
+    def __init__(
+        self,
+        *args: Any,
+        message_callback: Optional[Callable[[Message], Awaitable[None] | None]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        绑定当前 Web 消息回调，并装配支持结构化事件的流式处理器。
+        """
+        tool_event_callback = kwargs.pop("tool_event_callback", None)
+        super().__init__(*args, **kwargs)
+        self._message_callback = message_callback
+        self.stream_handler = _get_web_agent_streaming_handler_type()(
+            self._emit_output,
+            tool_event_callback,
+        )
+
+    def _should_stream(self) -> bool:
+        """
+        Web 对话实时输出，复用会话执行后台任务时改用非流式广播。
+        """
+        if self.is_background:
+            return False
+        return True
+
+    def set_message_callback(
+        self,
+        message_callback: Optional[Callable[[Message], Awaitable[None] | None]],
+    ) -> None:
+        """
+        更新 Web SSE 通知回调，复用 Agent 实例时指向当前请求队列。
+
+        :param message_callback: 当前请求的 Web 通知回调
+        """
+        self._message_callback = message_callback
+
+    def set_output_callback(self, output_callback: Optional[Callable[[str], None]]) -> None:
+        """
+        更新 Web SSE 输出回调，复用 Agent 实例时指向当前请求队列。
+
+        :param output_callback: 当前请求的输出回调
+        """
+        self.output_callback = output_callback
+        if output_callback and isinstance(self.stream_handler, _WebAgentStreamingHandlerMixin):
+            self.stream_handler.set_emit_callback(self._emit_output)
+
+    def set_tool_event_callback(
+        self,
+        tool_event_callback: Optional[Callable[[dict[str, Any]], None]],
+    ) -> None:
+        """
+        更新当前 Web SSE 结构化工具生命周期回调。
+        """
+        if isinstance(self.stream_handler, _WebAgentStreamingHandlerMixin):
+            self.stream_handler.set_tool_event_callback(tool_event_callback)
+
+    async def _is_system_admin_context(self) -> bool:
+        """
+        Web Agent 根据当前登录用户 ID 判断工具管理员上下文。
+        """
+        if not self.user_id:
+            return False
+        try:
+            user = get_configured_user_id_lookup()(int(self.user_id))
+        except (TypeError, ValueError):
+            return False
+        except Exception as e:
+            logger.error(f"检查 Web Agent 用户管理员身份失败: {e}")
+            return False
+        return bool(user and user.is_superuser)
+
+    async def _build_tool_context(self, should_dispatch_reply: bool) -> dict[str, object]:
+        """
+        向工具上下文注入 Web SSE 通知回调。
+        """
+        # 该方法由运行时组合进 MRO 的 MoviePilotAgent 提供。
+        context = await super()._build_tool_context(  # type: ignore[misc]
+            should_dispatch_reply
+        )
+        context["message_callback"] = self._message_callback
+        return dict(context)
+
+    async def _can_restore_cross_owner_history(self) -> bool:
+        """
+        仅真实 Web 登录管理员可续聊已授权历史，不把后台复用扩展为全局读取。
+        """
+        return (
+            self.channel == NotificationChannel.WebAgent.value
+            and self.source == "web-agent"
+            and await self._is_system_admin_context()
+        )
+
+    def _handle_stream_text(self, text: str) -> None:
+        """
+        文本输出交由 Web 流式处理器统一回调，避免重复增量。
+        """
+        self.stream_handler.emit(text)
+
+    def _emit_output(self, text: str) -> None:
+        """
+        保留完整输出状态，同时只把本次增量交给 Web SSE 回调。
+        """
+        if not text:
+            return
+        self._streamed_output += text
+        if not callable(self.output_callback):
+            return
+        try:
+            self.output_callback(text)
+        except Exception as e:
+            logger.debug(f"Web智能体输出回调失败: {e}")
+
+
+def _build_web_agent_type(agent_base_type: type) -> type:
+    """
+    为 Web 通道组合唯一的运行时 Agent 类型。
+    """
+    return type(
+        "_RuntimeWebAgentMoviePilotAgent",
+        (_WebAgentMoviePilotAgentMixin, agent_base_type),
+        {"__module__": __name__},
+    )
+
+
+_WEB_AGENT_TYPE_LOCK = Lock()
+_WEB_AGENT_TYPE: Optional[type] = None
+
+
+def _get_web_agent_type() -> type:
+    """
+    在真实 Web Agent 调用边界 single-flight 解析运行时类型。
+    """
+    global _WEB_AGENT_TYPE
+    if _WEB_AGENT_TYPE is not None:
+        return _WEB_AGENT_TYPE
+    with _WEB_AGENT_TYPE_LOCK:
+        if _WEB_AGENT_TYPE is None:
+            _WEB_AGENT_TYPE = _build_web_agent_type(get_moviepilot_agent_type())
+        return _WEB_AGENT_TYPE

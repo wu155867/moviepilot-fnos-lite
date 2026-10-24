@@ -1,0 +1,222 @@
+"""
+验证搜索事件流的结果投递与结束行为。
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+import app.api.endpoints.search as search_endpoint
+from app.schemas.types import MediaSource
+
+
+def test_large_replace_event_is_split_into_ordered_batches(monkeypatch):
+    """
+    超大最终结果应拆成首个 replace 和后续 append 批次。
+    """
+    monkeypatch.setattr(search_endpoint, "_SSE_REPLACE_MAX_ITEMS", 2)
+    source_event = {
+        "type": "replace",
+        "stage": "filtered",
+        "items": [1, 2, 3, 4, 5],
+        "total_items": 5,
+    }
+
+    async def _collect_events():
+        """
+        通过完整批处理适配器收集拆分后的最终结果。
+        """
+
+        async def _source():
+            """
+            输出一个超大最终替换事件。
+            """
+            yield source_event
+
+        return [
+            event
+            async for event in search_endpoint._iter_batched_search_events(_source())
+        ]
+
+    events = asyncio.run(_collect_events())
+
+    assert [event["type"] for event in events] == ["replace", "append", "append"]
+    assert [event["batch_index"] for event in events] == [0, 1, 2]
+    assert all(event["batch_count"] == 3 for event in events)
+    assert all(event["replace_batch"] for event in events)
+    assert [item for event in events for item in event["items"]] == source_event["items"]
+
+
+def test_small_replace_event_keeps_original_protocol(monkeypatch):
+    """
+    小型最终结果应保持单个 replace 事件，兼容现有客户端。
+    """
+    monkeypatch.setattr(search_endpoint, "_SSE_REPLACE_MAX_ITEMS", 2)
+    source_event = {
+        "type": "replace",
+        "items": [1, 2],
+        "total_items": 2,
+    }
+
+    assert list(search_endpoint._iter_replace_event_batches(source_event)) == [source_event]
+
+
+def test_batched_search_events_emit_heartbeat_while_source_is_idle(monkeypatch):
+    """
+    上游长时间无业务事件时应持续输出心跳，避免连接被空闲超时关闭。
+    """
+    monkeypatch.setattr(search_endpoint, "_SSE_HEARTBEAT_INTERVAL", 0.01)
+
+    async def _read_heartbeat():
+        """
+        读取首个心跳并关闭仍在等待的上游迭代器。
+        """
+        blocker = asyncio.Event()
+
+        async def _source():
+            """
+            模拟长时间处于过滤匹配阶段的事件源。
+            """
+            await blocker.wait()
+            yield {"type": "done"}
+
+        events = search_endpoint._iter_batched_search_events(_source())
+        try:
+            return await asyncio.wait_for(anext(events), timeout=0.5)
+        finally:
+            await events.aclose()
+
+    assert asyncio.run(_read_heartbeat()) == {"type": "heartbeat"}
+
+
+def test_search_stream_disconnect_closes_upstream_before_return():
+    """
+    客户端断开时应在流返回前关闭上游，立即触发搜索任务清理。
+    """
+
+    async def _consume_disconnected_stream():
+        """
+        消费一个会立即断开的搜索流，并返回上游关闭状态。
+        """
+        source_closed = asyncio.Event()
+
+        async def _source():
+            """
+            输出首个事件后等待包装器显式关闭。
+            """
+            try:
+                yield {"type": "progress", "stage": "searching", "items": []}
+            finally:
+                source_closed.set()
+
+        async def _disconnected():
+            """
+            模拟客户端在首个业务事件到达时已经断开。
+            """
+            return True
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/api/v1/search/title/stream"),
+            headers={},
+            query_params={},
+            is_disconnected=_disconnected,
+        )
+        payloads = [
+            payload
+            async for payload in search_endpoint._stream_search_events(
+                request,
+                _source(),
+            )
+        ]
+        return payloads, source_closed.is_set()
+
+    payloads, source_closed = asyncio.run(_consume_disconnected_stream())
+
+    assert payloads == []
+    assert source_closed is True
+
+
+def test_search_stream_response_disables_proxy_buffering(monkeypatch):
+    """
+    搜索 SSE 响应应显式禁用缓存和 Nginx 代理缓冲。
+    """
+
+    class FakeSearchChain:
+        """
+        提供无需外部依赖的空搜索流。
+        """
+
+        def async_search_by_title_stream(self, **_kwargs):
+            """
+            返回立即完成的搜索流。
+            """
+
+            async def _source():
+                """
+                输出一个完成事件。
+                """
+                yield {"type": "done", "stage": "done", "total_items": 0}
+
+            return _source()
+
+    monkeypatch.setattr(search_endpoint, "SearchChain", FakeSearchChain)
+
+    async def _never_disconnected():
+        """
+        模拟始终在线的 SSE 客户端。
+        """
+        return False
+
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/v1/search/title/stream"),
+        is_disconnected=_never_disconnected,
+    )
+
+    response = asyncio.run(
+        search_endpoint.search_by_title_stream(request=request, keyword="Demo", _=None)
+    )
+
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_search", [False, True])
+async def test_manual_routes_forward_source_and_page_without_client_signature(monkeypatch, media_search):
+    """
+    手动搜索路由传递来源和页码，不要求客户端生成搜索签名。
+    """
+    captured = []
+
+    class FakeSearchChain:
+        """
+        按测试约定产出搜索分页事件，隔离站点请求。
+        """
+        async def search_page_events(self, *, params):
+            """
+            记录路由传入的搜索参数，并返回空来源的完成事件。
+            """
+            captured.append(params)
+            yield {"type": "done", "sources": []}
+
+    monkeypatch.setattr(search_endpoint, "SearchChain", FakeSearchChain)
+    monkeypatch.setattr(search_endpoint, "_resolve_media_search_params", AsyncMock(return_value=({"tmdbid": 1}, None)))
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/v1/search/manual/stream"), headers={}, query_params={},
+        is_disconnected=AsyncMock(return_value=False),
+    )
+    params = {"request": request, "manual_paging": True, "page": 1,
+              "source": "opaque-source", "_": None}
+    if media_search:
+        response = await search_endpoint.search_by_id_stream(**params, media_id="1", media_source=MediaSource.TMDB)
+    else:
+        response = await search_endpoint.search_by_title_stream(**params, keyword="Show")
+    payloads = [payload async for payload in response.body_iterator]
+    assert payloads
+    assert len(captured) == 1
+    assert "prev_signature" not in captured[0]
+    assert {key: captured[0][key] for key in ("page", "source")} == {
+        "page": 1, "source": "opaque-source",
+    }

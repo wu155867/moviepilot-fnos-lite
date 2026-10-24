@@ -1,0 +1,448 @@
+"""
+下载历史及关联文件列表的数据访问入口，适配调用方会话及兼容事务执行器。
+"""
+
+from typing import Any, Dict, List, Optional, cast
+
+from sqlalchemy import delete as sqlalchemy_delete
+from sqlalchemy import func, select
+from sqlalchemy import update as sqlalchemy_update
+from sqlalchemy.orm import Session
+
+from app.db.base import DbOper
+from app.db.models.downloadhistory import DownloadFiles, DownloadHistory
+from app.db.oper.query import (
+    descending,
+    enum_values,
+    execute_page,
+    literal_contains,
+    media_identity_conditions,
+    music_type_condition,
+)
+from app.schemas.query import (
+    DownloadHistoryFilter,
+    QueryPageRequest,
+    QuerySortField,
+)
+from app.schemas.types import MediaSource
+
+
+class DownloadHistoryOper(DbOper):
+    """
+    下载历史管理
+    """
+
+    def get_by_id(self, record_id: int) -> Optional[DownloadHistory]:
+        """
+        按稳定记录 ID 读取单条下载历史。
+        """
+        return cast(
+            Optional[DownloadHistory],
+            self._execute_sync_query(
+                lambda session: session.execute(
+                    select(DownloadHistory).where(DownloadHistory.id == record_id)
+                ).scalars().first()
+            ),
+        )
+
+    def query(
+        self,
+        filters: DownloadHistoryFilter,
+        page: QueryPageRequest,
+    ) -> tuple[list[DownloadHistory], int]:
+        """
+        按稳定筛选和分页合同读取下载历史记录及总数。
+        """
+        def execute(session: Session) -> tuple[list[DownloadHistory], int]:
+            """
+            在同一会话中构造并执行下载历史 count/page 查询。
+            """
+            conditions = media_identity_conditions(DownloadHistory, filters)
+            ids = enum_values(filters.ids)
+            media_types = enum_values(filters.media_types)
+            usernames = enum_values(filters.usernames)
+            if ids:
+                conditions.append(DownloadHistory.id.in_(ids))
+            if media_types:
+                conditions.append(DownloadHistory.type.in_(media_types))
+            for column, value in (
+                (DownloadHistory.title, filters.title),
+                (DownloadHistory.year, filters.year),
+                (DownloadHistory.seasons, filters.seasons),
+                (DownloadHistory.episodes, filters.episodes),
+                (DownloadHistory.path, filters.path),
+                (DownloadHistory.download_hash, filters.download_hash),
+                (DownloadHistory.username, filters.username),
+                (DownloadHistory.episode_group, filters.episode_group),
+            ):
+                if value is not None and value != "":
+                    conditions.append(column == value)
+            if filters.text:
+                conditions.append(
+                    literal_contains(DownloadHistory.title, filters.text)
+                    | literal_contains(DownloadHistory.path, filters.text)
+                )
+            if usernames:
+                conditions.append(DownloadHistory.username.in_(usernames))
+            music_condition = music_type_condition(
+                DownloadHistory.music_type,
+                filters.music_type,
+            )
+            if music_condition is not None:
+                conditions.append(music_condition)
+
+            count_statement = select(func.count(DownloadHistory.id))
+            page_statement = select(DownloadHistory)
+            if conditions:
+                count_statement = count_statement.where(*conditions)
+                page_statement = page_statement.where(*conditions)
+            descending_order = descending(page)
+            if page.sort.field == QuerySortField.ID:
+                primary = (
+                    DownloadHistory.id.desc()
+                    if descending_order
+                    else DownloadHistory.id.asc()
+                )
+                secondary = (
+                    DownloadHistory.date.desc()
+                    if descending_order
+                    else DownloadHistory.date.asc()
+                )
+            else:
+                primary = (
+                    DownloadHistory.date.desc().nullslast()
+                    if descending_order
+                    else DownloadHistory.date.asc().nullsfirst()
+                )
+                secondary = (
+                    DownloadHistory.id.desc()
+                    if descending_order
+                    else DownloadHistory.id.asc()
+                )
+            page_statement = page_statement.order_by(primary, secondary)
+            return cast(
+                tuple[list[DownloadHistory], int],
+                execute_page(session, count_statement, page_statement, page),
+            )
+
+        return self._execute_sync_query(execute)
+
+    def get_by_path(self, path: str) -> Optional[DownloadHistory]:
+        """
+        按路径查询下载记录
+
+        :param path: 数据key
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.get_by_path(session, path)
+        )
+
+    def get_by_hash(self, download_hash: str) -> Optional[DownloadHistory]:
+        """
+        按Hash查询下载记录
+
+        :param download_hash: 数据key
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.get_by_hash(session, download_hash)
+        )
+
+    def get_by_hashes(self, download_hashes: List[str]) -> Dict[str, DownloadHistory]:
+        """
+        批量按 Hash 查询下载记录，并返回以 Hash 为键的映射。
+        """
+        histories = self._execute_sync_query(
+            lambda session: DownloadHistory.get_by_hashes(
+                session, download_hashes
+            )
+        )
+        return {
+            history.download_hash: history
+            for history in histories
+            if history and history.download_hash
+        }
+
+    def get_by_media_identity(
+            self, media_source: MediaSource, media_id: str,
+            music_type: Optional[str] = None,
+    ) -> List[DownloadHistory]:
+        """
+        按规范媒体身份查询下载记录。
+
+        :param media_source: 媒体数据源
+        :param media_id: 数据源原生 ID
+        :param music_type: 音乐实体类型
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.get_by_media_identity(
+                session,
+                media_source=media_source,
+                media_id=media_id,
+                music_type=music_type,
+            )
+        )
+
+    def add(self, **kwargs: Any) -> None:
+        """
+        新增下载历史
+        """
+        self._stage_create(DownloadHistory(**kwargs))
+
+    def stage_add(self, payload: dict[str, Any]) -> DownloadHistory:
+        """
+        在调用方同步 Session 中暂存下载历史并返回已分配 ID 的记录。
+        """
+        if not isinstance(self._db, Session):
+            raise RuntimeError("下载历史事务写入需要调用方提供同步 Session")
+        history = DownloadHistory(**payload)
+        self._db.add(history)
+        self._db.flush()
+        return history
+
+    def add_files(self, file_items: List[dict[str, Any]]) -> None:
+        """
+        新增下载历史文件
+        """
+        for file_item in file_items:
+            downloadfile = DownloadFiles(**file_item)
+            self._stage_create(downloadfile)
+
+    def stage_add_files(self, file_items: List[dict[str, Any]]) -> None:
+        """
+        在调用方事务内批量暂存下载文件，不逐条提交。
+        """
+        if not isinstance(self._db, Session):
+            raise RuntimeError("下载文件事务写入需要调用方提供同步 Session")
+        self._db.add_all(DownloadFiles(**item) for item in file_items)
+        self._db.flush()
+
+    def truncate_files(self) -> None:
+        """
+        清空下载历史文件记录
+        """
+        self._stage_truncate(DownloadFiles)
+
+    def get_files_by_hash(self, download_hash: str, state: Optional[int] = None) -> List[DownloadFiles]:
+        """
+        按Hash查询下载文件记录
+
+        :param download_hash: 数据key
+        :param state: 删除状态
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadFiles.get_by_hash(
+                session, download_hash, state
+            )
+        )
+
+    def get_file_by_fullpath(self, fullpath: str) -> Optional[DownloadFiles]:
+        """
+        按fullpath查询下载文件记录
+
+        :param fullpath: 数据key
+        """
+        return self._execute_sync_query(
+            lambda session: cast(
+                Optional[DownloadFiles],
+                DownloadFiles.get_by_fullpath(
+                    session, fullpath=fullpath, all_files=False
+                ),
+            )
+        )
+
+    def get_files_by_fullpath(self, fullpath: str) -> List[DownloadFiles]:
+        """
+        按fullpath查询下载文件记录
+
+        :param fullpath: 数据key
+        """
+        return self._execute_sync_query(
+            lambda session: cast(
+                List[DownloadFiles],
+                DownloadFiles.get_by_fullpath(
+                    session, fullpath=fullpath, all_files=True
+                ),
+            )
+        )
+
+    def get_files_by_savepath(self, fullpath: str) -> List[DownloadFiles]:
+        """
+        按savepath查询下载文件记录
+
+        :param fullpath: 数据key
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadFiles.get_by_savepath(session, fullpath)
+        )
+
+    def delete_file_by_fullpath(self, fullpath: str) -> None:
+        """
+        按fullpath删除下载文件记录
+
+        :param fullpath: 数据key
+        """
+        self._execute_sync_write(
+            lambda session: DownloadFiles.delete_by_fullpath(session, fullpath)
+        )
+
+    def stage_delete_file_by_fullpath(self, fullpath: str) -> None:
+        """
+        暂存指定完整路径的下载文件记录删除。
+        """
+        if not isinstance(self._db, Session):
+            raise RuntimeError("下载文件事务删除需要调用方提供同步 Session")
+        self._db.execute(
+            sqlalchemy_update(DownloadFiles)
+            .where(
+                DownloadFiles.fullpath == fullpath,
+                DownloadFiles.state == 1,
+            )
+            .values(state=0)
+        )
+
+    def get_hash_by_fullpath(self, fullpath: str) -> Optional[str]:
+        """
+        按fullpath查询下载文件记录hash
+
+        :param fullpath: 数据key
+        """
+        fileinfo = self._execute_sync_query(
+            lambda session: cast(
+                Optional[DownloadFiles],
+                DownloadFiles.get_by_fullpath(
+                    session, fullpath=fullpath, all_files=False
+                ),
+            )
+        )
+        if fileinfo:
+            download_hash: Optional[str] = fileinfo.download_hash
+            return download_hash
+        return ""
+
+    def list_by_page(self, page: int = 1, count: int = 30) -> List[DownloadHistory]:
+        """
+        分页查询下载历史
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.list_by_page(session, page, count)
+        )
+
+    async def async_list_by_page(
+        self,
+        page: int = 1,
+        count: int = 30,
+    ) -> List[DownloadHistory]:
+        """
+        异步分页查询下载历史。
+        """
+        return await self._execute_async_query(
+            lambda session: DownloadHistory.async_list_by_page(
+                session, page, count
+            )
+        )
+
+    async def async_count(self) -> int:
+        """
+        异步统计全部下载历史记录。
+        """
+        count = await self._execute_async_query(DownloadHistory.async_count)
+        return int(count or 0)
+
+    async def async_delete_history(self, historyid: int) -> None:
+        """
+        异步删除下载记录。
+        """
+        await self._stage_async_delete(DownloadHistory, historyid)
+
+    def truncate(self) -> None:
+        """
+        清空下载记录
+        """
+        self._stage_truncate(DownloadHistory)
+
+    def get_last_by(self, mtype: Optional[str] = None, title: Optional[str] = None, year: Optional[str] = None,
+                    season: Optional[str] = None, episode: Optional[str] = None,
+                    media_source: Optional[MediaSource] = None,
+                    media_id: Optional[str] = None) -> List[DownloadHistory]:
+        """
+        按类型、标题、年份、季集查询下载记录
+        媒体身份 + mtype 或 title + year
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.get_last_by(
+                db=session,
+                mtype=mtype,
+                title=title,
+                year=year,
+                season=season,
+                episode=episode,
+                media_source=media_source,
+                media_id=media_id,
+            )
+        )
+
+    def list_by_user_date(self, date: str, username: Optional[str] = None) -> List[DownloadHistory]:
+        """
+        查询某用户某时间之前的下载历史
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.list_by_user_date(
+                db=session,
+                date=date,
+                username=username,
+            )
+        )
+
+    def list_by_date(
+            self, date: str, type: str, media_source: MediaSource, media_id: str,
+            seasons: Optional[str] = None,
+    ) -> List[DownloadHistory]:
+        """
+        查询某时间之后的下载历史
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.list_by_date(
+                db=session,
+                date=date,
+                type=type,
+                media_source=media_source,
+                media_id=media_id,
+                seasons=seasons,
+            )
+        )
+
+    def list_by_type(self, mtype: str, days: int = 7) -> List[DownloadHistory]:
+        """
+        获取指定类型的下载历史
+        """
+        return self._execute_sync_query(
+            lambda session: DownloadHistory.list_by_type(
+                db=session,
+                mtype=mtype,
+                days=days,
+            )
+        )
+
+    def delete_history(self, historyid: int) -> None:
+        """
+        删除下载记录
+        """
+        self._stage_delete(DownloadHistory, historyid)
+
+    def stage_delete_history(self, historyid: int) -> None:
+        """
+        暂存下载记录删除，事务由调用方统一提交。
+        """
+        if not isinstance(self._db, Session):
+            raise RuntimeError("下载历史事务删除需要调用方提供同步 Session")
+        self._db.execute(
+            sqlalchemy_delete(DownloadHistory).where(
+                DownloadHistory.id == historyid
+            )
+        )
+
+    def delete_downloadfile(self, downloadfileid: int) -> None:
+        """
+        删除下载文件记录
+        """
+        self._stage_delete(DownloadFiles, downloadfileid)

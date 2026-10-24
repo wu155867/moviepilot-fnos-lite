@@ -1,0 +1,307 @@
+# 04 — Design Patterns
+
+This document defines the structural patterns used across this codebase. When implementing complex features, you are required to use these patterns rather than inventing new abstractions.
+
+---
+
+## 1. Module Pattern (Pluggable Backends)
+
+**When to use:** Adding a new downloader, media server, message channel, storage backend, or any other capability that requires lifecycle management, configuration switches, priority ordering, or independent testing.
+
+**Base class:** `_ModuleBase` in `app/modules/__init__.py`
+
+**Specialized base classes:**
+- `_DownloaderBase` — for download clients
+- `_MediaServerBase` — for media servers (implied by existing patterns)
+
+**Required methods every module must implement:**
+
+```python
+class ExampleModule(_ModuleBase, _DownloaderBase):
+    """
+    展示下载器模块的注册、配置开关与生命周期接口。
+    """
+
+    def init_module(self) -> None:
+        """
+        初始化本模块管理的下载器服务。
+        """
+        super().init_service(service_name=..., service_type=...)
+
+    def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """
+        声明启用本下载器模块所需的配置匹配条件。
+
+        :return: 配置项 DOWNLOADER 及其启用值 example
+        """
+        return "DOWNLOADER", "example"
+
+    @staticmethod
+    def get_name() -> str:
+        """
+        提供模块的展示名称。
+
+        :return: 示例下载器的名称
+        """
+        return "Example"
+
+    @staticmethod
+    def get_type() -> ModuleType:
+        """
+        声明模块所属的能力分类。
+
+        :return: 下载器模块分类
+        """
+        return ModuleType.Downloader
+
+    @staticmethod
+    def get_subtype() -> DownloaderType:
+        """
+        声明下载器的具体类型。
+
+        :return: 示例下载器对应的类型枚举
+        """
+        return DownloaderType.Example
+
+    @staticmethod
+    def get_priority() -> int:
+        """
+        提供模块调度的排序优先级。
+
+        :return: 示例优先级 1，数值越小越先调用
+        """
+        return 1
+
+    def test(self) -> Optional[Tuple[bool, str]]:
+        """
+        检查已配置下载器的连接状态。
+
+        :return: 检测结果与说明组成的二元组；未启用检测时返回 None
+        """
+        ...
+
+    def stop(self):
+        """
+        结束模块生命周期；本示例没有需要释放的资源。
+        """
+        pass
+```
+
+**Module directory convention:** `app/modules/<backend_name>/` containing at minimum `__init__.py` (the module class) and the implementation class.
+
+**Module types** are defined in `app/schemas/types.py` as `ModuleType`, `DownloaderType`, `MediaServerType`, `MessageChannel`, `StorageSchema`, `OtherModulesType`. When adding a new category, update these enums.
+
+---
+
+## 2. Chain Orchestration Pattern
+
+**When to use:** Adding a new business workflow that is shared across multiple entrypoints (API endpoint, CLI, agent, scheduler, webhook). Chains coordinate modules, helpers, databases, events, and caches.
+
+**Base class:** `ChainBase` in `app/chain/base.py`
+
+**Calling modules from a chain:**
+
+```python
+# 通过模块调度接口调用，避免链直接依赖具体模块实例
+result = self.run_module("method_name", kwarg1=val1, kwarg2=val2)
+result = await self.async_run_module("method_name", kwarg1=val1)
+
+# 仅在枚举模块、查看实例或检查健康状态时直接使用 ModuleManager
+```
+
+**Chain-to-chain calls:** A chain may call another chain to reuse stable domain logic. Avoid introducing new circular dependencies between chains.
+
+**File convention:** small workflows use `app/chain/<domain>.py`; a stable workflow with several independently owned responsibilities uses the same-named `app/chain/<domain>/` package. The package root lazily exposes only `<Domain>Chain`, `facade.py` preserves its public identity, and focused child modules use single-word responsibility names. The retired monolith and `source.py` copies must not coexist with the package.
+
+---
+
+## 3. Event / Observer Pattern
+
+**When to use:** Triggering cross-cutting reactions (e.g., notifying the media server after a transfer completes, reloading a module after config changes, dispatching user messages to message channels).
+
+**Core classes:** `EventManager` (singleton instance `eventmanager`) and `Event` in `app/runtime/events.py`.
+
+**Registering a handler:**
+
+```python
+from app.runtime.events import eventmanager, Event
+from app.schemas.types import EventType
+
+@eventmanager.register(EventType.TransferComplete)
+def on_transfer_complete(self, event: Event):
+    """
+    接收整理完成事件并读取本次整理结果。
+
+    :param event: 事件对象，event_data 保存整理完成后的业务数据
+    """
+    event_data = event.event_data
+    ...
+```
+
+**Sending an event:**
+
+```python
+eventmanager.send_event(EventType.TransferComplete, data_dict)
+```
+
+**Event types** are defined as `EventType` and `ChainEventType` enums in `app/schemas/types.py`. Add new event types there when extending the event system.
+
+---
+
+## 4. Repository (Oper) Pattern
+
+**When to use:** Implementing table-oriented persistence behind an Application-owned
+Protocol. Never issue SQLAlchemy queries or construct Oper objects directly from
+chain, module, endpoint, Agent, scheduler, or workflow code.
+
+**Convention:** Each SQLAlchemy model in `app/db/models/` has a corresponding `<Model>Oper` class in `app/db/oper/<model>.py` — the two packages mirror each other file for file, so the module name carries the entity and the package carries the role.
+
+```
+app/db/models/subscribe.py       → app/db/oper/subscribe.py       (SubscribeOper)
+app/db/models/systemconfig.py    → app/db/oper/systemconfig.py    (SystemConfigOper)
+app/db/models/transferhistory.py → app/db/oper/transferhistory.py (TransferHistoryOper)
+```
+
+**Host usage:**
+
+Host entrypoints depend on an Application service or Protocol. The concrete
+`app/db/adapters/` implementation creates one operation-scoped Session, adapts the
+Protocol with Oper objects, and gives commit/rollback ownership to the Application
+command. Oper methods only query, stage, or flush in that caller-owned Session.
+
+```python
+from app.application.subscription.write import SubscribeWriter
+
+def create_subscription(writer: SubscribeWriter, identity: dict, payload: dict):
+    """
+    通过应用写入服务创建订阅。
+
+    :param writer: 已完成依赖注入的订阅写入服务
+    :param identity: 订阅媒体身份，用于确定订阅对象
+    :param payload: 本次提交的订阅配置
+    :return: 写入服务返回的创建结果，保留其成功或失败信息
+    """
+    return writer.add(identity=identity, payload=payload)
+```
+
+The explicit Session/Oper composition belongs in `app/db/adapters/`, not at the
+host call site:
+
+```python
+with SessionFactory() as session:
+    command = CreateSubscriptionCommand(
+        repository=SubscribeOper(session),
+        unit_of_work=SqlAlchemyUnitOfWork(session),
+    )
+    result = command.execute(identity=identity, payload=payload)
+```
+
+The no-Session `SubscribeOper()` facade is legacy plugin ABI only. It may remain
+available through the curated SDK/Compat boundary, but new host code and examples
+must not copy that form.
+
+---
+
+## 5. Config Reload Pattern
+
+**When to use:** A chain, module, or helper holds a long-lived object that must be rebuilt when specific configuration keys change (e.g., a downloader client reconnects when its host/port changes).
+
+**Mixin:** `ConfigReloadMixin` in `app/runtime/reload.py`
+
+**How it works:**
+1. Inherit `ConfigReloadMixin`.
+2. Define a `CONFIG_WATCH` class attribute as a set of config key names.
+3. Implement `on_config_changed()` — called automatically when any watched key changes.
+4. Optionally implement `get_reload_name()` to provide a descriptive name for log messages.
+
+```python
+class MyChain(ChainBase, ConfigReloadMixin):
+    """
+    在下载器配置变化后重新初始化模块。
+
+    :cvar CONFIG_WATCH: 触发重新初始化的下载器类型、地址和端口配置项
+    """
+
+    CONFIG_WATCH = {"DOWNLOADER", "QB_HOST", "QB_PORT"}
+
+    def on_config_changed(self):
+        """
+        在受监控的配置项变化后刷新模块实例。
+        """
+        self.init_module()
+```
+
+`_ModuleBase` already inherits `ConfigReloadMixin` and calls `init_module()` from `on_config_changed()` by default. Modules typically only need to declare `CONFIG_WATCH`.
+
+---
+
+## 6. Singleton Pattern
+
+**When to use:** Classes that must have exactly one instance shared application-wide (e.g., `EventManager`, `ModuleManager`, `PluginManager`).
+
+**Implementation:** Inherit from `Singleton` in `app/foundation/singleton.py`.
+
+```python
+from app.foundation.singleton import Singleton
+
+class MyManager(metaclass=Singleton):
+    """
+    展示进程内共享同一管理器实例的声明方式。
+    """
+    ...
+```
+
+Do not introduce new singletons unless the class genuinely manages global shared state. Prefer dependency injection or parameter passing for everything else.
+
+---
+
+## 7. SystemConfig Pattern
+
+**When to use:** Storing runtime business configuration that is user-editable, persistent across restarts, and not tied to a specific deployment environment.
+
+**Enum:** `SystemConfigKey` in `app/schemas/types.py`
+
+**Host service:** `SystemConfigService` and `get_configured_system_config()` in
+`app/application/configuration.py`.
+
+```python
+from app.application.configuration import get_configured_system_config
+from app.schemas.types import SystemConfigKey
+
+configuration = get_configured_system_config()
+value = configuration.get(SystemConfigKey.RssUrls)
+configuration.set(SystemConfigKey.RssUrls, ["https://..."])
+```
+
+`SystemConfigOper` is the DB/composition implementation and legacy plugin-facing
+facade; canonical host consumers do not construct it.
+
+**Rule:** Never use raw string literals as SystemConfig keys. Always add a new entry to the `SystemConfigKey` enum first.
+
+---
+
+## 8. UserConfig Pattern
+
+**When to use:** Per-user settings that must survive across sessions but differ by user.
+
+**Host service:** `UserConfigurationService` and
+`get_configured_user_configuration()` in
+`app/application/security/userconfig.py`.
+
+The concrete repository uses `UserConfigOper` behind the service boundary. Host
+callers do not construct it.
+
+---
+
+## Anti-Patterns to Avoid
+
+| Anti-Pattern | Correct Alternative |
+|---|---|
+| `module -> chain` coupling | Move orchestration into `chain` and shared logic into its owning canonical package |
+| `module -> module` direct calls | Use `chain` to orchestrate cross-module workflows |
+| Lower-level module importing a chain or manager | Register a callback/resolver from `app/startup/` or move orchestration to `chain` |
+| Raw SQLAlchemy queries or Oper construction in host entrypoints | Define/use an Application Protocol or command; implement it in `app/db/adapters/` with an operation-scoped Session/UoW |
+| Raw string keys for SystemConfig | Define and use a `SystemConfigKey` enum entry |
+| HTTP requests via `requests` or `httpx` directly | Host code uses `RequestUtils` from `app/adapters/network/http.py`; plugins use `app.sdk.network` |
+
+*Last Updated: 2026-08-27*

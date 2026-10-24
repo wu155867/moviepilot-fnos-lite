@@ -1,0 +1,151 @@
+"""
+提供通知渠道配置查询、管理和测试接口。
+"""
+
+from typing import Any, Dict
+
+from fastapi import Body, Depends
+
+from app.api.dependencies.auth import get_current_active_superuser, get_current_active_user
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import get_configured_system_config
+from app.chain.notification import NotificationChain
+from app.schemas.common import ManageRequest as _SchemaManageRequest
+from app.schemas.push import AppPushInstanceRequest, AppPushRequest
+from app.schemas.response import Response as _SchemaResponse
+from app.schemas.system import NotificationConf
+from app.schemas.types import SystemConfigKey
+
+router = ResponseAPIRouter()
+
+
+@router.post("/app/instance", summary="轮换 App 通知实例凭据", response_model=_SchemaResponse[Dict[str, Any]])
+def manage_app_instance(request: AppPushInstanceRequest,
+                        current_user: ApiPrincipal = Depends(get_current_active_superuser)) -> _SchemaResponse[object]:
+    """
+    仅容器管理员能轮换整个实例的发送凭据，响应只包含结果，不下发密钥。
+    """
+    result = NotificationChain().manage_channel(channel="AppPush", action="rotate_instance", source=request.source,
+                                               owner=current_user.notification_identity, administrative=True)
+    return _SchemaResponse(success=bool(result.get("success")), message=result.get("message") or "", data=result.get("data"))
+
+
+@router.post("/app", summary="管理当前用户的 App 通知", response_model=_SchemaResponse[Dict[str, Any]])
+def manage_app_notification(
+    request: AppPushRequest,
+    current_user: ApiPrincipal = Depends(get_current_active_user),
+) -> _SchemaResponse[object]:
+    """
+    复用现有用户认证并强制注入账号通知身份，客户端不能操作其他用户设备。
+    """
+    if not current_user.notification_identity:
+        return _SchemaResponse(success=False, message="请完成数据库升级后重新登录")
+    params = request.model_dump(exclude={"action"})
+    result = NotificationChain().manage_channel(channel="AppPush", action=request.action,
+                                               owner=current_user.notification_identity, **params)
+    return _SchemaResponse(success=bool(result.get("success")), message=result.get("message") or "", data=result.get("data"))
+
+
+def _normalize_configs(value: list[NotificationConf], *, validate_identities: bool = True) -> list[dict[str, Any]]:
+    """
+    规整通知配置身份和名称，拒绝会导致运行目录覆盖的输入。
+
+    :param value: 待规整的通知配置集合
+    :param validate_identities: 新保存值校验稳定身份；旧值只用于缓存对账，允许读取以修复历史重复
+    :return: 已规整的独立配置字典列表
+    :raises ValueError: 名称为空或重复，或新值稳定身份为空或重复
+    """
+    normalized: list[dict[str, Any]] = []
+    names: set[str] = set()
+    identities: set[str] = set()
+    for config in value:
+        identity = config.id.strip()
+        if validate_identities and (not identity or identity in identities):
+            raise ValueError("通知渠道稳定身份ID不能为空或重复")
+        identities.add(identity)
+        name = (config.name or "").strip()
+        if not name:
+            raise ValueError("通知渠道名称不能为空")
+        key = name.casefold()
+        if key in names:
+            raise ValueError(f"通知渠道名称重复：{name}")
+        names.add(key)
+        data = config.model_dump()
+        data["id"] = identity
+        data["name"] = name
+        normalized.append(data)
+    return normalized
+
+
+@router.post(
+    "/config",
+    summary="保存通知渠道并同步登录缓存",
+    response_model=_SchemaResponse[Dict[str, Any]],
+)
+async def save_config(
+    configs: list[NotificationConf] = Body(...),
+    _: object = Depends(get_current_active_superuser),
+) -> _SchemaResponse[object]:
+    """
+    一次保存通知配置，并由渠道模块处理改名与删除缓存。
+    """
+    try:
+        current = _normalize_configs(configs)
+        previous = get_configured_system_config().get(SystemConfigKey.Notifications) or []
+        previous_models = []
+        for item in previous:
+            if not isinstance(item, dict):
+                continue
+            legacy = dict(item)
+            if not legacy.get("id"):
+                legacy["id"] = f"legacy-{legacy.get('type') or 'notification'}-{legacy.get('name') or 'unnamed'}"
+            previous_models.append(NotificationConf(**legacy))
+        previous_data = _normalize_configs(previous_models, validate_identities=False)
+        saved = await get_configured_system_config().async_set(SystemConfigKey.Notifications, current)
+        if saved is False:
+            return _SchemaResponse(success=False, message="通知配置保存失败")
+        # 配置写入成功后再同步 ClawBot 缓存，避免持久化失败留下半完成的登录状态。
+        result = NotificationChain().manage_channel(
+            channel="WechatClawBot",
+            action="reconcile_config",
+            previous=previous_data,
+            current=current,
+        )
+        # ClawBot 模块未加载时无需阻断其它通知渠道的配置保存；模块加载后由链路完成缓存同步。
+        if result and not result.get("success") and result.get("message") != "该通知渠道未启用或不支持此管理动作":
+            return _SchemaResponse(
+                success=False,
+                message="通知配置已保存，但缓存同步失败，请重试",
+                data={"value": current},
+            )
+        return _SchemaResponse(success=True, message="通知配置保存成功", data={"value": current})
+    except ValueError as error:
+        return _SchemaResponse(success=False, message=str(error))
+
+
+@router.post(
+    "/manage",
+    summary="通知渠道统一管理",
+    response_model=_SchemaResponse[Dict[str, Any]],
+)
+def manage_channel(
+    request: _SchemaManageRequest,
+    _: object = Depends(get_current_active_superuser),
+) -> _SchemaResponse[object]:
+    """
+    通知渠道统一管理入口
+
+    端点层不定义任何渠道特定的名称与参数，
+    渠道标识、管理动作与表单参数由前端上送并原样透传给渠道模块
+    """
+    result = NotificationChain().manage_channel(
+        channel=request.target,
+        action=request.action,
+        **request.params,
+    )
+    return _SchemaResponse(
+        success=bool(result.get("success")),
+        message=result.get("message") or "",
+        data=result.get("data"),
+    )

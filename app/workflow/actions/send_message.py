@@ -1,0 +1,75 @@
+"""
+向通知渠道发送工作流消息。
+"""
+
+from typing import List, Optional, Union
+
+from pydantic import Field
+
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.schemas.message import Message
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import ActionChain, BaseAction
+
+
+class SendMessageParams(ActionParams):
+    """
+    发送消息参数
+    """
+    client: Optional[List[str]] = Field(default=[], description="消息渠道")
+    userid: Optional[Union[str, int]] = Field(default=None, description="用户ID")
+
+
+class SendMessageAction(BaseAction):
+    """
+    发送消息
+    """
+
+    contract = {}
+
+    def __init__(self, action_id: str) -> None:
+        """
+        初始化当前动作独立的执行状态。
+        """
+        super().__init__(action_id)
+
+    name = "发送消息"
+    description = "发送任务执行消息"
+    data = SendMessageParams().model_dump()
+
+    @property
+    def success(self) -> bool:
+        """
+        返回当前动作是否已达到完成条件。
+        """
+        return self.done
+
+    def execute(self, workflow_id: int, params: dict[str, object], context: ActionContext) -> ActionContext:
+        """
+        发送messages中的消息
+        """
+        action_params = SendMessageParams.model_validate(params)
+        msg_text = f"当前进度：{context.progress}%"
+        index = 1
+        if context.execute_history:
+            for history in context.execute_history:
+                if not history.message:
+                    continue
+                msg_text += f"\n{index}. {history.action}：{history.message}"
+                index += 1
+            # 发送消息
+            if not action_params.client:
+                action_params.client = [""]
+            for client in action_params.client:
+                ActionChain().post_message(
+                    Message(
+                        source=client,
+                        userid=action_params.userid,
+                        title="【工作流执行结果】",
+                        text=msg_text,
+                        link=get_chain_runtime_config_snapshot().workflow_url
+                    )
+                )
+
+        self.job_done()
+        return context

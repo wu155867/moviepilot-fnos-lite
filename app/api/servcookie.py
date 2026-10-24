@@ -1,0 +1,231 @@
+"""
+接收浏览器扩展提交的站点 Cookie，并保留旧请求体读取方式的兼容支持。
+"""
+
+import gzip
+import hmac
+import json
+from collections.abc import Callable, Coroutine
+from typing import Annotated, Optional
+
+import aiofiles
+from anyio import Path as AsyncPath
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Response
+from fastapi.responses import PlainTextResponse
+from fastapi.routing import APIRoute
+from starlette.requests import Request
+
+from app.api.response import ERROR_RESPONSES
+from app.application.configuration import get_api_runtime_config_snapshot
+from app.foundation.crypto import CryptoJsUtils, HashUtils
+from app.runtime.log import logger
+from app.schemas.servcookie import CookieActionResponse as _SchemaCookieActionResponse
+from app.schemas.servcookie import CookieData as _SchemaCookieData
+from app.schemas.servcookie import CookieDecryptedPayload as _SchemaCookieDecryptedPayload
+from app.schemas.servcookie import CookieEncryptedPayload as _SchemaCookieEncryptedPayload
+from app.schemas.servcookie import CookiePassword as _SchemaCookiePassword
+
+
+class GzipRequest(Request):
+    """
+    按请求头透明解压 gzip 请求体。
+    """
+
+    async def body(self) -> bytes:
+        """
+        读取请求体，并在需要时完成 gzip 解压。
+        """
+        if not hasattr(self, "_body"):
+            body = await super().body()
+            if "gzip" in self.headers.getlist("Content-Encoding"):
+                body = gzip.decompress(body)
+            # 兼容 Starlette 请求对象的内部请求体缓存，保留既有检查豁免。
+            self._body = body  # noqa
+        return self._body
+
+
+class GzipRoute(APIRoute):
+    """
+    为 CookieCloud 路由注入 gzip 请求对象。
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[object, object, Response]]:
+        """
+        返回支持 gzip 请求体的路由处理器。
+        """
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            """
+            将原始请求替换为可解压的请求对象后继续处理。
+            """
+            request = GzipRequest(request.scope, request.receive)
+            return await original_route_handler(request)
+
+        return custom_route_handler
+
+
+async def verify_server_enabled() -> bool:
+    """
+    校验CookieCloud服务路由是否打开
+    """
+    if not get_api_runtime_config_snapshot().cookiecloud_enable_local:
+        raise HTTPException(status_code=400, detail="本地CookieCloud服务器未启用")
+    return True
+
+
+async def verify_update_auth(
+    x_cookiecloud_auth: Annotated[
+        Optional[str], Header(alias="X-CookieCloud-Auth")
+    ] = None,
+) -> bool:
+    """
+    校验CookieCloud上传接口的可选共享认证头。
+    """
+    expected_header = (
+        get_api_runtime_config_snapshot().cookiecloud_auth_header or ""
+    ).strip()
+    if not expected_header:
+        return True
+
+    provided_header = (x_cookiecloud_auth or "").strip()
+    if not hmac.compare_digest(provided_header, expected_header):
+        raise HTTPException(status_code=403, detail="CookieCloud认证失败")
+    return True
+
+
+cookie_router = APIRouter(
+    route_class=GzipRoute,
+    tags=["servcookie"],
+    dependencies=[Depends(verify_server_enabled)],
+    responses=ERROR_RESPONSES,
+)
+
+
+@cookie_router.get(
+    "/",
+    response_model=None,
+    response_class=Response,
+    responses={
+        200: {
+            "description": "CookieCloud 服务说明",
+            "content": {"text/plain": {"schema": {"type": "string"}}},
+        }
+    },
+)
+async def get_root() -> PlainTextResponse:
+    """
+    返回 CookieCloud 兼容服务的根路径说明。
+    """
+    return PlainTextResponse("Hello MoviePilot! COOKIECLOUD API ROOT = /cookiecloud")
+
+
+@cookie_router.post(
+    "/",
+    response_model=None,
+    response_class=Response,
+    responses={
+        200: {
+            "description": "CookieCloud 服务说明",
+            "content": {"text/plain": {"schema": {"type": "string"}}},
+        }
+    },
+)
+async def post_root() -> PlainTextResponse:
+    """
+    通过 POST 返回 CookieCloud 兼容服务的根路径说明。
+    """
+    return PlainTextResponse("Hello MoviePilot! COOKIECLOUD API ROOT = /cookiecloud")
+
+
+@cookie_router.post(
+    "/update",
+    dependencies=[Depends(verify_update_auth)],
+    response_model=_SchemaCookieActionResponse,
+)
+async def update_cookie(req: _SchemaCookieData) -> _SchemaCookieActionResponse:
+    """
+    上传Cookie数据
+    """
+    file_path = AsyncPath(get_api_runtime_config_snapshot().cookie_path) / f"{req.uuid}.json"
+    content = json.dumps({"encrypted": req.encrypted})
+    async with aiofiles.open(file_path, encoding="utf-8", mode="w") as file:
+        await file.write(content)
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
+        read_content = await file.read()
+    if read_content == content:
+        return _SchemaCookieActionResponse(action="done")
+    else:
+        return _SchemaCookieActionResponse(action="error")
+
+
+async def load_encrypt_data(uuid: str) -> _SchemaCookieEncryptedPayload:
+    """
+    加载本地加密原始数据
+    """
+    file_path = AsyncPath(get_api_runtime_config_snapshot().cookie_path) / f"{uuid}.json"
+
+    # 检查文件是否存在
+    if not await file_path.exists():
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # 读取文件
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
+        read_content = await file.read()
+    data = json.loads(read_content.encode("utf-8"))
+    return _SchemaCookieEncryptedPayload.model_validate(data)
+
+
+def get_decrypted_cookie_data(
+    uuid: str, password: str, encrypted: str
+) -> Optional[_SchemaCookieDecryptedPayload]:
+    """
+    加载本地加密数据并解密为Cookie
+    """
+    combined_string = f"{uuid}-{password}"
+    aes_key = HashUtils.md5(combined_string)[:16].encode("utf-8")
+
+    if encrypted:
+        try:
+            decrypted_data = CryptoJsUtils.decrypt(encrypted, aes_key).decode("utf-8")
+            decrypted_data = json.loads(decrypted_data)
+            if "cookie_data" in decrypted_data:
+                return _SchemaCookieDecryptedPayload.model_validate(decrypted_data)
+        except Exception as e:
+            logger.error(f"解密Cookie数据失败：{str(e)}")
+            return None
+    else:
+        return None
+    return None
+
+
+@cookie_router.get("/get/{uuid}", response_model=_SchemaCookieEncryptedPayload)
+async def get_cookie(
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+) -> _SchemaCookieEncryptedPayload:
+    """
+    GET 下载加密数据
+    """
+    return _SchemaCookieEncryptedPayload.model_validate(
+        await load_encrypt_data(uuid)
+    )
+
+
+@cookie_router.post(
+    "/get/{uuid}",
+    response_model=_SchemaCookieEncryptedPayload | _SchemaCookieDecryptedPayload | None,
+)
+async def post_cookie(
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+    request: Optional[_SchemaCookiePassword] = Body(None),
+) -> _SchemaCookieEncryptedPayload | _SchemaCookieDecryptedPayload | None:
+    """
+    POST 下载加密数据
+    """
+    data = _SchemaCookieEncryptedPayload.model_validate(
+        await load_encrypt_data(uuid)
+    )
+    if request is not None:
+        return get_decrypted_cookie_data(uuid, request.password, data.encrypted)
+    else:
+        return data

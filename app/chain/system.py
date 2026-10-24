@@ -1,0 +1,727 @@
+"""
+系统升级、重启、备份恢复及通知渠道管理入口。
+"""
+
+import asyncio
+import errno
+import json
+import re
+import shutil
+import threading
+import uuid
+from collections.abc import Callable, Coroutine, Iterable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Union
+
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.chain.base import ChainBase
+from app.runtime import version as runtime_version
+from app.runtime.log import logger
+from app.runtime.loop import main_loop_registry
+from app.runtime.state import SystemHelper
+from app.runtime.tasks import get_task_registry
+from app.schemas.message import Message
+from app.schemas.types import NotificationChannel
+
+if TYPE_CHECKING:
+    from app.application.messaging.update import SystemUpdateInteractionHandler
+
+
+class SystemResponsePort(Protocol):
+    """
+    系统链查询发布版本所需的最小同步 HTTP 响应契约。
+    """
+
+    def json(self) -> Any:
+        """
+        返回响应 JSON 载荷。
+
+        :return: 解析后的 JSON 值，无效内容抛出解析异常
+        """
+        ...
+
+    def close(self) -> None:
+        """
+        释放响应与连接资源。
+        """
+        ...
+
+
+class SystemHttpPort(Protocol):
+    """
+    系统链查询发布版本所需的同步 GET 端口。
+    """
+
+    def get(
+        self,
+        url: str,
+        *,
+        proxies: Optional[dict[str, str]],
+        headers: Mapping[str, str],
+    ) -> Optional[SystemResponsePort]:
+        """
+        读取远端发布列表，并保留无响应与有响应两态。
+
+        :param url: 远程发布版本接口的完整地址
+        :param proxies: 协议到代理地址的映射，None 表示未指定代理
+        :param headers: 版本接口请求头，包含鉴权或内容协商信息
+        :return: 发布接口响应，未取得响应时为 None；调用方解析后负责关闭
+        """
+        ...
+
+
+class SystemEnvironmentPort(Protocol):
+    """
+    系统链备份插件时所需的最小运行环境端口。
+    """
+
+    def is_docker(self) -> bool:
+        """
+        返回当前进程是否运行在 Docker 容器中。
+
+        :return: 当前进程位于 Docker 容器中时为 True，否则为 False
+        """
+        ...
+
+
+_system_port_lock = threading.RLock()
+_system_http_port: Optional[SystemHttpPort] = None
+_system_environment_port: Optional[SystemEnvironmentPort] = None
+
+
+def configure_system_ports(
+    *,
+    http: SystemHttpPort,
+    environment: SystemEnvironmentPort,
+) -> tuple[Optional[SystemHttpPort], Optional[SystemEnvironmentPort]]:
+    """
+    由启动组合根装配系统链技术端口，并返回旧快照。
+    """
+    global _system_http_port, _system_environment_port
+    with _system_port_lock:
+        previous = (_system_http_port, _system_environment_port)
+        _system_http_port = http
+        _system_environment_port = environment
+        return previous
+
+
+def reset_system_ports(
+    http: Optional[SystemHttpPort] = None,
+    environment: Optional[SystemEnvironmentPort] = None,
+) -> None:
+    """
+    恢复指定系统链端口；省略参数时回到未装配状态。
+    """
+    global _system_http_port, _system_environment_port
+    with _system_port_lock:
+        _system_http_port = http
+        _system_environment_port = environment
+
+
+def _system_ports_snapshot() -> tuple[SystemHttpPort, SystemEnvironmentPort]:
+    """
+    读取一致的系统链端口快照，未装配时稳定失败。
+    """
+    with _system_port_lock:
+        http = _system_http_port
+        environment = _system_environment_port
+    if http is None or environment is None:
+        raise RuntimeError("系统链技术端口尚未由启动组合根装配")
+    return http, environment
+
+
+def _close_system_response(response: SystemResponsePort) -> None:
+    """
+    释放版本响应；关闭失败只记录诊断，不覆盖解析结果。
+    """
+    try:
+        response.close()
+    except Exception as err:
+        logger.debug(f"释放版本响应失败：{str(err)}")
+
+
+async def _run_update_operation(
+    function: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """
+    通过任务登记器在线程池执行同步更新操作并等待真实终态。
+    """
+    task = get_task_registry().create_sync(
+        function,
+        *args,
+        owner="chain.system.update_progress.operation",
+        **kwargs,
+    )
+    return await asyncio.shield(task)
+
+
+class _SystemUpdateChain(ChainBase):
+    """
+    提供通知渠道主程序升级交互的 Chain 入口。
+    """
+
+    _update_restart_file = "__system_update_restart__"
+
+    def _update_interaction_handler(self) -> "SystemUpdateInteractionHandler":
+        """
+        构造复用当前消息网关和系统应用服务的更新交互控制器。
+        """
+        from app.application.messaging.update import SystemUpdateInteractionHandler
+
+        if self.system_service is None:
+            raise RuntimeError("系统更新服务尚未由启动组合根装配")
+        return SystemUpdateInteractionHandler(
+            messenger=self,
+            actions=self.system_service,
+            submit_monitor=self._submit_update_monitor,
+            run_sync=_run_update_operation,
+            mark_restart=self._mark_update_restart,
+            clear_restart_marker=self._clear_update_restart_marker,
+        )
+
+    @staticmethod
+    def _submit_update_monitor(monitor: Coroutine[Any, Any, None]) -> None:
+        """
+        把进度监视协程跨线程登记到宿主事件循环。
+        """
+        get_task_registry().submit_threadsafe(
+            monitor,
+            loop=main_loop_registry.require(),
+            owner="chain.system.update_progress",
+        )
+
+    def _mark_update_restart(
+        self,
+        channel: NotificationChannel,
+        userid: Union[int, str],
+        source: Optional[str],
+    ) -> None:
+        """
+        记录升级重启的回复目标，供服务恢复后发送完成通知。
+        """
+        self.save_cache(
+            {"channel": channel.value, "userid": userid, "source": source},
+            self._update_restart_file,
+        )
+
+    def _clear_update_restart_marker(self) -> None:
+        """
+        升级安装未能进入重启阶段时删除完成通知标记。
+        """
+        self.remove_cache(self._update_restart_file)
+
+    def remote_update(
+        self,
+        arg_str: str = "",
+        channel: Optional[NotificationChannel] = None,
+        userid: Optional[Union[int, str]] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        """
+        检查正式版本并启动通知渠道中的升级确认交互。
+        """
+        self._update_interaction_handler().remote_update(
+            arg_str=arg_str,
+            channel=channel,
+            userid=userid,
+            source=source,
+        )
+
+    def handle_update_callback_interaction(
+        self,
+        callback_data: str,
+        channel: NotificationChannel,
+        source: Optional[str],
+        userid: Union[int, str],
+        username: Optional[str],
+        original_message_id: Optional[Union[str, int]] = None,
+        original_chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        处理更新交互按钮并把原消息定位参数交给进度编辑器。
+        """
+        return self._update_interaction_handler().handle_callback_interaction(
+            callback_data=callback_data,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+
+    def handle_update_text_interaction(
+        self,
+        channel: NotificationChannel,
+        source: Optional[str],
+        userid: Union[int, str],
+        username: Optional[str],
+        text: str,
+    ) -> bool:
+        """
+        处理不支持按钮渠道中的升级或重启确认文本。
+        """
+        return self._update_interaction_handler().handle_text_interaction(
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            text=text,
+        )
+
+
+class SystemChain(_SystemUpdateChain):
+    """
+    系统级处理链。
+    """
+
+    _restart_file = "__system_restart__"
+    _plugin_restore_pending_file = "__plugin_restore_pending__"
+
+    def remote_clear_cache(self, channel: NotificationChannel, userid: Union[int, str], source: Optional[str] = None) -> None:
+        """
+        清理系统缓存
+        """
+        self.clear_cache()
+        self.post_message(Message(
+            channel=channel,
+            source=source,
+            title="缓存清理完成！",
+            userid=userid,
+            save_history=False))
+
+    def restart(self, channel: NotificationChannel, userid: Union[int, str], source: Optional[str] = None) -> None:
+        """
+        重启系统
+        """
+        if channel and userid:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title="系统正在重启，请耐心等候！",
+                userid=userid,
+                save_history=False))
+            self.save_cache({
+                "channel": channel.value,
+                "userid": userid,
+                "source": source,
+            }, self._restart_file)
+        self.backup_plugins()
+        SystemHelper.restart()
+
+    @staticmethod
+    def backup_plugins() -> None:
+        """
+        备份插件到用户配置目录（仅docker环境）
+        """
+
+        # 非docker环境不处理
+        _, environment = _system_ports_snapshot()
+        if not environment.is_docker():
+            return
+
+        try:
+            config = get_chain_runtime_config_snapshot()
+            plugins_dir = config.root_path / "app" / "plugins"
+            backup_dir = config.config_path / "plugins_backup"
+
+            if not plugins_dir.exists():
+                logger.info("插件目录不存在，跳过备份")
+                return
+
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            pending_file = backup_dir / SystemChain._plugin_restore_pending_file
+            pending_items = (
+                SystemChain.__read_plugin_restore_pending(pending_file)
+                if pending_file.exists()
+                else None
+            )
+            exclude_items = {"__init__.py", "__pycache__", ".DS_Store"}
+
+            backup_failed = False
+
+            for item in plugins_dir.iterdir():
+                if item.name in exclude_items:
+                    continue
+                # 失败项目的原快照是下一次恢复的唯一材料，关停备份不能覆盖它。
+                if pending_file.exists() and (
+                    pending_items is None or item.name in pending_items
+                ):
+                    logger.debug(f"插件 {item.name} 有待重试恢复标记，保留原快照")
+                    continue
+                target_path = backup_dir / item.name
+
+                try:
+                    SystemChain.__replace_snapshot(
+                        item,
+                        target_path,
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.pyc", ".DS_Store"
+                        ) if item.is_dir() else None,
+                    )
+                    logger.debug(f"已备份插件项目: {item.name}")
+                except Exception as e:
+                    backup_failed = True
+                    logger.error(f"备份插件 {item.name} 失败: {e}")
+
+            if backup_failed:
+                logger.warning(f"插件备份部分失败，保留可用旧快照: {backup_dir}")
+            else:
+                logger.info(f"插件备份完成，备份位置: {backup_dir}")
+
+        except Exception as e:
+            logger.error(f"插件备份失败: {str(e)}")
+
+    @staticmethod
+    def restore_plugins() -> None:
+        """
+        从备份恢复插件到app/plugins目录，恢复完成后删除备份（仅docker环境）
+        """
+
+        # 非docker环境不处理
+        _, environment = _system_ports_snapshot()
+        if not environment.is_docker():
+            return
+
+        config = get_chain_runtime_config_snapshot()
+        plugins_dir = config.root_path / "app" / "plugins"
+        backup_dir = config.config_path / "plugins_backup"
+
+        if not backup_dir.exists():
+            logger.info("插件备份目录不存在，跳过恢复")
+            return
+
+        pending_file = backup_dir / SystemChain._plugin_restore_pending_file
+
+        # 系统重置或上次恢复未完成时才消费备份。
+        system_reset = SystemHelper().is_system_reset()
+        should_restore = system_reset or pending_file.exists()
+        if not should_restore:
+            logger.info("当前不是系统重置，保留插件备份供后续重置使用")
+            return
+
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+
+        restored_count = 0
+        restore_failed = False
+        failed_items: dict[str, bool] = {}
+        pending_items = (
+            SystemChain.__read_plugin_restore_pending(pending_file)
+            if pending_file.exists() and not system_reset
+            else None
+        )
+        for item in backup_dir.iterdir():
+            if (
+                item.name == SystemChain._plugin_restore_pending_file
+                or SystemChain.__is_snapshot_artifact(item.name)
+            ):
+                continue
+            target_path = plugins_dir / item.name
+            if pending_items is not None:
+                if item.name not in pending_items:
+                    continue
+                if not pending_items[item.name] and target_path.exists():
+                    logger.info(f"插件 {item.name} 已在恢复失败后重新安装，跳过备份覆盖")
+                    continue
+            target_existed = target_path.exists()
+            try:
+                if item.is_dir() or item.is_file():
+                    SystemChain.__replace_snapshot(item, target_path)
+                    logger.debug(f"已恢复插件文件: {item.name}")
+                    restored_count += 1
+            except Exception as e:
+                restore_failed = True
+                failed_items[item.name] = target_existed
+                logger.error(f"恢复插件 {item.name} 时发生错误: {str(e)}")
+                continue
+
+        logger.info(f"插件恢复完成，共恢复 {restored_count} 个项目")
+
+        if restore_failed:
+            if SystemChain.__write_plugin_restore_pending(pending_file, failed_items):
+                logger.warning("插件恢复未完成，保留备份并标记为下次启动重试")
+            else:
+                logger.warning("插件恢复未完成，已保留备份，但无法写入下次启动重试标记")
+            return
+
+        # 源码恢复完成后即可消费备份；依赖由启动后的统一后台任务处理。
+        try:
+            shutil.rmtree(backup_dir)
+            logger.info(f"已删除插件备份目录: {backup_dir}")
+        except Exception as e:
+            logger.warning(f"删除备份目录失败: {str(e)}")
+            if backup_dir.exists():
+                SystemChain.__write_plugin_restore_pending(pending_file, {})
+
+    @staticmethod
+    def __is_snapshot_artifact(name: str) -> bool:
+        """
+        识别快照替换过程中生成的临时或旧快照条目。
+        """
+        return bool(re.fullmatch(r"\..+\.(?:tmp|old)-[0-9a-f]{32}", name))
+
+    @staticmethod
+    def __read_plugin_restore_pending(pending_file: Path) -> Optional[dict[str, bool]]:
+        """
+        读取仍需恢复的插件项目；无效内容按全部项目重试。
+        """
+        try:
+            payload = json.loads(pending_file.read_text(encoding="utf-8"))
+            failed_items = payload.get("failed_items")
+            if not isinstance(failed_items, dict):
+                return None
+            return {
+                str(name): target_existed
+                for name, target_existed in failed_items.items()
+                if isinstance(name, str) and isinstance(target_existed, bool)
+            }
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def __write_plugin_restore_pending(
+        pending_file: Path,
+        failed_items: dict[str, bool],
+    ) -> bool:
+        """
+        记录失败项目及其原目标状态，供普通重启继续未完成恢复。
+        """
+        try:
+            pending_file.write_text(
+                json.dumps({"failed_items": failed_items}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return True
+        except Exception as e:
+            logger.error(f"写入插件恢复重试标记失败: {e}")
+            return False
+
+    @staticmethod
+    def __replace_snapshot(
+        source: Path, target: Path, *,
+        ignore: Callable[[str, list[str]], Iterable[str]] | None = None,
+    ) -> None:
+        """
+        复制到同级临时路径后替换目标，避免失败时丢失旧快照。
+        """
+        target.parent.mkdir(parents=True, exist_ok=True)
+        suffix = uuid.uuid4().hex
+        staging = target.with_name(f".{target.name}.tmp-{suffix}")
+        previous = target.with_name(f".{target.name}.old-{suffix}")
+        previous_available = False
+        published = False
+        try:
+            if source.is_dir():
+                shutil.copytree(source, staging, ignore=ignore)
+            else:
+                shutil.copy2(source, staging)
+            if target.exists():
+                try:
+                    target.replace(previous)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    # overlayfs 可能拒绝把镜像层目录直接 rename 到可写层，
+                    # 先复制旧目标保留恢复材料，再删除旧目录继续发布快照。
+                    if target.is_dir():
+                        shutil.copytree(target, previous, symlinks=True)
+                    else:
+                        shutil.copy2(target, previous, follow_symlinks=False)
+                    previous_available = True
+                    SystemChain.__remove_snapshot_path(target)
+                else:
+                    previous_available = True
+            staging.replace(target)
+            published = True
+        except Exception:
+            if previous_available and not published:
+                try:
+                    SystemChain.__remove_snapshot_path(target)
+                    previous.replace(target)
+                    previous_available = False
+                except Exception as rollback_error:
+                    logger.error(
+                        f"恢复旧快照失败，已保留恢复材料 {previous}: "
+                        f"{rollback_error}"
+                    )
+            raise
+        finally:
+            if staging.is_dir():
+                shutil.rmtree(staging, ignore_errors=True)
+            elif staging.exists():
+                staging.unlink(missing_ok=True)
+            if published and previous.exists():
+                if previous.is_dir():
+                    shutil.rmtree(previous, ignore_errors=True)
+                else:
+                    previous.unlink(missing_ok=True)
+
+    @staticmethod
+    def __remove_snapshot_path(path: Path) -> None:
+        """
+        删除待替换目标，保留失败回滚所需的旧快照副本。
+        """
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+
+    def __get_version_message(self) -> str:
+        """
+        获取版本信息文本
+        """
+        server_release_version = self.__get_server_release_version()
+        front_release_version = self.__get_front_release_version()
+        server_local_version = runtime_version.get_app_version()
+        front_local_version = runtime_version.get_frontend_version()
+        if server_release_version == server_local_version:
+            title = f"当前后端版本：{server_local_version}，已是最新版本\n"
+        else:
+            title = f"当前后端版本：{server_local_version}，远程版本：{server_release_version}\n"
+        if front_release_version == front_local_version:
+            title += f"当前前端版本：{front_local_version}，已是最新版本"
+        else:
+            title += f"当前前端版本：{front_local_version}，远程版本：{front_release_version}"
+        return title
+
+    def version(self, channel: NotificationChannel, userid: Union[int, str], source: Optional[str] = None) -> None:
+        """
+        查看当前版本、远程版本
+        """
+        self.post_message(Message(
+            channel=channel,
+            source=source,
+            title=self.__get_version_message(),
+            userid=userid,
+            save_history=False))
+
+    def restart_finish(self) -> None:
+        """
+        如通过交互命令重启，
+        重启完发送msg
+        """
+        restart_channel = self.load_cache(self._restart_file)
+        if restart_channel:
+            if not isinstance(restart_channel, dict):
+                restart_channel = json.loads(restart_channel)
+            channel = next(
+                (channel for channel in NotificationChannel.__members__.values() if
+                 channel.value == restart_channel.get('channel')), None)
+            userid = restart_channel.get('userid')
+
+            title = self.__get_version_message()
+            self.post_message(Message(
+                channel=channel,
+                source=restart_channel.get("source"),
+                title=f"系统已重启完成！\n{title}",
+                userid=userid,
+                save_history=False))
+            self.remove_cache(self._restart_file)
+
+        update_restart_channel = self.load_cache(self._update_restart_file)
+        if update_restart_channel:
+            if not isinstance(update_restart_channel, dict):
+                update_restart_channel = json.loads(update_restart_channel)
+            channel = next(
+                (
+                    candidate
+                    for candidate in NotificationChannel.__members__.values()
+                    if candidate.value == update_restart_channel.get("channel")
+                ),
+                None,
+            )
+            userid = update_restart_channel.get("userid")
+            source = update_restart_channel.get("source")
+            self.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    title=(
+                        "MoviePilot 更新安装完成！\n"
+                        f"当前后端版本：{runtime_version.get_app_version()}\n"
+                        f"当前前端版本：{runtime_version.get_frontend_version()}"
+                    ),
+                    userid=userid,
+                    save_history=False,
+                )
+            )
+            self.remove_cache(self._update_restart_file)
+
+    @staticmethod
+    def __get_server_release_version() -> Optional[str]:
+        """
+        获取后端V3最新版本
+        """
+        try:
+            http, _ = _system_ports_snapshot()
+            response = http.get(
+                "https://api.github.com/repos/jxxghp/MoviePilot/releases",
+                proxies=get_chain_runtime_config_snapshot().proxy,
+                headers=get_chain_runtime_config_snapshot().github_headers,
+            )
+            if response:
+                try:
+                    releases: list[str] = [release['tag_name'] for release in response.json()]
+                    v3_releases = [tag for tag in releases if re.match(r"^v3\.", tag)]
+                    if not v3_releases:
+                        logger.warning("获取v3后端最新版本出错！")
+                    else:
+                        # 找到最新的v3版本
+                        latest_v3 = sorted(v3_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
+                        logger.info(f"获取到后端最新版本：{latest_v3}")
+                        return latest_v3
+                finally:
+                    _close_system_response(response)
+            else:
+                logger.error("无法获取后端版本信息，请检查网络连接或GitHub API请求。")
+        except Exception as err:
+            logger.error(f"获取后端最新版本失败：{str(err)}")
+        return None
+
+    @staticmethod
+    def __get_front_release_version() -> Optional[str]:
+        """
+        获取前端V3最新版本
+        """
+        try:
+            http, _ = _system_ports_snapshot()
+            response = http.get(
+                "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases",
+                proxies=get_chain_runtime_config_snapshot().proxy,
+                headers=get_chain_runtime_config_snapshot().github_headers,
+            )
+            if response:
+                try:
+                    releases: list[str] = [release['tag_name'] for release in response.json()]
+                    v3_releases = [tag for tag in releases if re.match(r"^v3\.", tag)]
+                    if not v3_releases:
+                        logger.warning("获取v3前端最新版本出错！")
+                    else:
+                        # 找到最新的v3版本
+                        latest_v3 = sorted(v3_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
+                        logger.info(f"获取到前端最新版本：{latest_v3}")
+                        return latest_v3
+                finally:
+                    _close_system_response(response)
+            else:
+                logger.error("无法获取前端版本信息，请检查网络连接或GitHub API请求。")
+        except Exception as err:
+            logger.error(f"获取前端最新版本失败：{str(err)}")
+        return None
+
+    @staticmethod
+    def get_server_local_version() -> str:
+        """
+        返回当前后端构建版本。
+        """
+        return runtime_version.get_app_version()
+
+    @staticmethod
+    def get_frontend_version() -> str | None:
+        """
+        返回当前部署的前端资源版本。
+        """
+        return runtime_version.get_frontend_version()

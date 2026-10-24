@@ -1,0 +1,216 @@
+"""
+保存、比较存储快照并调整监控间隔。
+"""
+
+import json
+import time
+from typing import Any, Optional, Set, Tuple
+
+from app.runtime.cache import CacheBackend, FileCache
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+
+
+class SnapshotStore:
+    """
+    远程目录监控快照的存取与比对。
+    """
+    VERSION = 2
+
+    def __init__(self, cache: Optional[CacheBackend] = None):
+        """
+        初始化快照存储。
+
+        快照是整个远程目录树的 JSON，文件数多时可达数十 MB，且丢失会被当作首次快照
+        静默重建基线、漏处理期间新增的文件，因此始终保存在本地文件系统：不进入 Redis，
+        既避免占用 Redis 内存，也避免被 ``allkeys-lru`` 淘汰。
+        Redis 模式下升级前的快照仍在 Redis 中，读取时作为一次性旧数据来源兜底，
+        下一次保存落盘后删除旧键，避免升级后首轮轮询丢失基线。
+        :param cache: 快照文件缓存，默认使用 CACHE_PATH/snapshots
+        """
+        self._cache: CacheBackend
+        self._legacy_cache: Optional[CacheBackend] = None
+        # 已完成旧键清理的快照键，避免每次轮询保存都访问 Redis
+        self._legacy_dropped: Set[str] = set()
+        if cache is not None:
+            self._cache = cache
+            return
+        base = get_runtime_setting('CACHE_PATH') / "snapshots"
+        self._cache = FileCache(base=base, local_only=True)
+        legacy_cache = FileCache(base=base)
+        if legacy_cache.is_redis():
+            self._legacy_cache = legacy_cache
+
+    def save(self, storage: str, snapshot: dict[str, Any], file_count: int = 0,
+             last_snapshot_time: Optional[float] = None,
+             snapshot_time: Optional[float] = None) -> bool:
+        """
+        保存快照到文件缓存。
+        :param storage: 存储名称
+        :param snapshot: 快照数据
+        :param file_count: 文件数量，用于调整监控间隔
+        :param last_snapshot_time: 上次快照时间戳
+        :param snapshot_time: 强制指定的增量游标，用于部分路径失败时固定游标不前进
+        :return: 是否保存成功
+        """
+        try:
+            if snapshot_time is None:
+                # 取「上次游标」与「本轮最大 mtime」的较大者：本轮全是旧文件时
+                # 游标不能回退，否则已处理过的变更会被重新判定为新增
+                snapshot_time = max(
+                    last_snapshot_time or 0,
+                    max((item.get('modify_time', 0) for item in snapshot.values()), default=0)
+                )
+                if not snapshot_time:
+                    snapshot_time = time.time()
+            snapshot_data = {
+                'version': self.VERSION,
+                'timestamp': snapshot_time,
+                'file_count': file_count,
+                'snapshot': snapshot
+            }
+            cache_key = f"{storage}_snapshot"
+            snapshot_json = json.dumps(snapshot_data, ensure_ascii=False, indent=2)
+            self._cache.set(cache_key, snapshot_json.encode('utf-8'), region="snapshots")
+            self._drop_legacy(cache_key)
+            logger.debug(f"快照已保存到缓存: {storage}")
+            return True
+        except Exception as e:
+            logger.error(f"保存快照失败: {e}")
+            return False
+
+    def load_checked(self, storage: str) -> Tuple[Optional[dict[str, Any]], bool]:
+        """
+        从文件缓存加载快照，并区分「快照不存在」与「读取失败」。
+        读取失败时不能当作首次快照处理，否则会静默丢弃已有基线。
+        :param storage: 存储名称
+        :return: (快照数据或None, 是否读取成功)
+        """
+        try:
+            cache_key = f"{storage}_snapshot"
+            snapshot_data = self._cache.get(cache_key, region="snapshots")
+            if not snapshot_data and self._legacy_cache is not None:
+                snapshot_data = self._legacy_cache.get(cache_key, region="snapshots")
+                if snapshot_data:
+                    logger.info(f"从 Redis 读取升级前的快照，下次保存后迁移到本地文件: {storage}")
+            if snapshot_data:
+                data = json.loads(snapshot_data.decode('utf-8'))
+                logger.debug(f"成功加载快照: {storage}, 包含 {len(data.get('snapshot', {}))} 个文件")
+                return data, True
+            logger.debug(f"快照文件不存在: {storage}")
+            return None, True
+        except Exception as e:
+            logger.error(f"加载快照失败: {e}")
+            return None, False
+
+    def load(self, storage: str) -> Optional[dict[str, Any]]:
+        """
+        从文件缓存加载快照。
+        :param storage: 存储名称
+        :return: 快照数据或None
+        """
+        data, _ = self.load_checked(storage)
+        return data
+
+    def reset(self, storage: str) -> bool:
+        """
+        重置快照，强制下次扫描时重新建立基准。
+        :param storage: 存储名称
+        :return: 是否成功
+        """
+        try:
+            cache_key = f"{storage}_snapshot"
+            legacy_exists = self._drop_legacy(cache_key)
+            if self._cache.exists(cache_key, region="snapshots") or legacy_exists:
+                self._cache.delete(cache_key, region="snapshots")
+                logger.info(f"快照已重置: {storage}")
+                return True
+            logger.debug(f"快照文件不存在，无需重置: {storage}")
+            return True
+        except Exception as e:
+            logger.error(f"重置快照失败: {storage} - {e}")
+            return False
+
+    def _drop_legacy(self, cache_key: str) -> bool:
+        """
+        删除 Redis 中升级前遗留的快照键。
+
+        仅在 Redis 模式下生效；删除失败只记录日志，不影响本地快照的保存与重置。
+        :param cache_key: 快照缓存键
+        :return: 删除前旧键是否存在
+        """
+        if self._legacy_cache is None or cache_key in self._legacy_dropped:
+            return False
+        try:
+            existed = self._legacy_cache.exists(cache_key, region="snapshots")
+            if existed:
+                self._legacy_cache.delete(cache_key, region="snapshots")
+            self._legacy_dropped.add(cache_key)
+            return existed
+        except Exception as err:
+            logger.warning(f"删除 Redis 中的旧快照失败: {cache_key} - {err}")
+            return False
+
+    @staticmethod
+    def compare(
+        old_snapshot: dict[str, object], new_snapshot: dict[str, object]
+    ) -> dict[str, list[str]]:
+        """
+        比对快照，找出变化的文件（只处理新增和修改，不处理删除）。
+        :param old_snapshot: 旧快照
+        :param new_snapshot: 新快照
+        :return: 变化信息
+        """
+        changes: dict[str, list[str]] = {
+            'added': [],
+            'modified': []
+        }
+
+        old_files = set(old_snapshot.keys())
+        new_files = set(new_snapshot.keys())
+
+        # 新增文件
+        changes['added'] = list(new_files - old_files)
+
+        # 修改文件（大小或时间变化）
+        for file_path in old_files & new_files:
+            old_info = old_snapshot[file_path]
+            new_info = new_snapshot[file_path]
+
+            # 检查文件大小变化
+            old_size = old_info.get('size', 0) if isinstance(old_info, dict) else old_info
+            new_size = new_info.get('size', 0) if isinstance(new_info, dict) else new_info
+
+            # 检查修改时间变化（如果有的话）
+            old_time = old_info.get('modify_time', 0) if isinstance(old_info, dict) else 0
+            new_time = new_info.get('modify_time', 0) if isinstance(new_info, dict) else 0
+
+            # 支持文件唯一标识的存储器可用它识别同大小且修改时间未变化的替换文件。
+            # 旧快照缺少 fileid 时保持保守，避免升级后首次补齐元数据触发全量重整。
+            old_fileid = old_info.get('fileid') if isinstance(old_info, dict) else None
+            new_fileid = new_info.get('fileid') if isinstance(new_info, dict) else None
+
+            if (
+                    old_size != new_size
+                    or (old_time and new_time and old_time != new_time)
+                    or (old_fileid and new_fileid and old_fileid != new_fileid)
+            ):
+                changes['modified'].append(file_path)
+
+        return changes
+
+    @staticmethod
+    def adjust_interval(file_count: int) -> int:
+        """
+        根据文件数量动态调整监控间隔。
+        :param file_count: 文件数量
+        :return: 监控间隔（分钟）
+        """
+        if file_count < 100:
+            return 5
+        elif file_count < 500:
+            return 10
+        elif file_count < 1000:
+            return 15
+        else:
+            return 30

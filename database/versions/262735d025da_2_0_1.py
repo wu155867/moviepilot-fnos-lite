@@ -1,0 +1,82 @@
+"""
+2.0.1 通知路由尚未配置时写入各业务类型的默认收件范围。
+
+版本标识： 262735d025da
+前置版本： 294b007932ef
+创建时间： 2024-09-11 08:07:02.753307
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+# Alembic 使用以下标识连接迁移版本链。
+revision = '262735d025da'
+down_revision = '294b007932ef'
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    """
+    通知路由尚未配置时写入各业务类型的默认收件范围。
+    """
+    systemconfig = sa.table(
+        "systemconfig",
+        sa.column("key", sa.String()),
+        sa.column("value", sa.JSON()),
+    )
+    connection = op.get_bind()
+    key = "NotificationSwitchs"
+    row = connection.execute(
+        sa.select(systemconfig.c.value).where(systemconfig.c.key == key)
+    ).first()
+    if not row or not row[0]:
+        value = [
+            {
+                'type': '资源下载',
+                'action': 'all',
+            },
+            {
+                'type': '整理入库',
+                'action': 'all',
+            },
+            {
+                'type': '订阅',
+                'action': 'all',
+            },
+            {
+                'type': '站点',
+                'action': 'admin',
+            },
+            {
+                'type': '媒体服务器',
+                'action': 'admin',
+            },
+            {
+                'type': '手动处理',
+                'action': 'admin',
+            },
+            {
+                'type': '插件',
+                'action': 'admin',
+            },
+            {
+                'type': '其它',
+                'action': 'admin',
+            },
+        ]
+        if row:
+            connection.execute(
+                systemconfig.update().where(systemconfig.c.key == key).values(
+                    value=value
+                )
+            )
+        else:
+            connection.execute(systemconfig.insert().values(key=key, value=value))
+
+
+def downgrade() -> None:
+    """
+    本版本不执行回退操作，保留升级后的结构与数据。
+    """
+    pass

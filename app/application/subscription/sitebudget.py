@@ -1,0 +1,397 @@
+"""
+订阅兜底搜索的站点级容量、间隔与冷却治理。
+"""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional, Protocol
+
+from app.application.site.observation import SiteSearchObservation
+from app.runtime.stop import StopState
+
+
+class SubscriptionSearchCancelled(RuntimeError):
+    """
+    表示订阅搜索在可取消预算等待点终止。
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionSiteBudgetDeferral:
+    """
+    记录一次站点预算冲突及该站点最早可再次尝试的时间。
+
+    :param site_id: 站点配置的数据库主键
+    :param retry_at: 该站点最早可再次尝试的时间文本
+    :param wait_reason: 等待原因，例如在途占用、冷却或时间片耗尽
+    """
+
+    site_id: int
+    retry_at: str
+    wait_reason: Optional[str] = None
+
+
+class SubscriptionSearchDeferred(RuntimeError):
+    """
+    表示订阅搜索未失败，而是应在站点预算可用后重新入队。
+    """
+
+    def __init__(
+        self, *, retry_at: str, site_ids: tuple[int, ...], wait_reason: Optional[str] = None,
+    ) -> None:
+        """
+        保存队列恢复所需的时间和站点，避免把临时等待写成错误。
+        """
+        messages = {"slice": "分页进度已保存，等待下一时间片", "cooldown": "站点冷却中"}
+        super().__init__(messages.get(wait_reason or "", "等待站点"))
+        self.retry_at = retry_at
+        self.site_ids = site_ids
+        self.wait_reason = wait_reason
+
+
+class SubscriptionSiteBudgetUnavailable(RuntimeError):
+    """
+    表示站点暂时不可用，调用方应记录为等待而非失败。
+    """
+
+    def __init__(
+        self,
+        *,
+        site_id: int,
+        retry_at: str,
+        wait_reason: Optional[str] = None,
+    ) -> None:
+        """
+        保存站点和下一次可尝试时间，供订阅队列恢复。
+        """
+        message = "站点正在处理其他搜索，稍后会自动继续" if wait_reason == "busy" else "站点暂时不可用，稍后会自动重试"
+        super().__init__(message)
+        self.site_id = site_id
+        self.retry_at = retry_at
+        self.wait_reason = wait_reason
+
+
+@dataclass(frozen=True, slots=True)
+class SiteBudgetClaim:
+    """
+    一次站点预算认领结果或下一次可尝试时间。
+
+    :param site_id: 站点配置的数据库主键
+    :param acquired: 是否成功取得该站点的唯一在途租约
+    :param retry_at: 该站点最早可再次尝试的时间文本
+    :param consecutive_failures: 该站点连续失败次数，用于计算后续冷却
+    :param lease_token: 当前认领者的租约令牌；未取得租约时为 None
+    :param wait_reason: 等待原因，例如在途占用、冷却或时间片耗尽
+    """
+
+    site_id: int
+    acquired: bool
+    retry_at: str
+    consecutive_failures: int
+    lease_token: Optional[str] = None
+    wait_reason: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionSiteBudgetMetricsSnapshot:
+    """
+    一次订阅搜索轮次内的站点预算观测快照。
+
+    :param site_count: 本轮涉及的不同站点数量
+    :param request_count: 实际发往站点的搜索请求次数
+    :param candidate_count: 本轮看到的候选资源数量
+    :param failure_count: 站点搜索失败的次数，不包含成功或跳过
+    :param cooldown_skip_count: 因在途占用或冷却而未发出的请求次数
+    :param release_failure_count: 站点租约释放失败的次数
+    :param cooldown_seconds: 本轮失败累计产生的冷却时长，单位为秒
+    """
+
+    site_count: int
+    request_count: int
+    candidate_count: int
+    failure_count: int
+    cooldown_skip_count: int
+    release_failure_count: int
+    cooldown_seconds: float
+
+
+class SubscriptionSiteBudgetMetrics:
+    """
+    线程安全聚合站点请求、失败、冷却与租约收口结果。
+    """
+
+    def __init__(self) -> None:
+        """
+        初始化一次搜索轮次共享的计数器。
+        """
+        self._lock = threading.Lock()
+        self._site_ids: set[int] = set()
+        self._request_count = 0
+        self._candidate_count = 0
+        self._failure_count = 0
+        self._cooldown_skip_count = 0
+        self._release_failure_count = 0
+        self._cooldown_seconds = 0.0
+
+    def record_unavailable(self, site_id: int) -> None:
+        """
+        记录因在途租约或错误冷却而未发出的站点请求。
+        """
+        with self._lock:
+            self._site_ids.add(site_id)
+            self._cooldown_skip_count += 1
+
+    def record_request(self, site_id: int, candidate_count: int) -> None:
+        """
+        记录一个真实站点请求及其返回候选数。
+        """
+        with self._lock:
+            self._site_ids.add(site_id)
+            self._request_count += 1
+            self._candidate_count += max(0, candidate_count)
+
+    def record_finish(self, *, outcome: str, delay: float, released: bool) -> None:
+        """
+        记录外站结果、错误冷却时间和租约释放结果。
+        """
+        with self._lock:
+            if outcome not in {"success", "skipped"}:
+                self._failure_count += 1
+                self._cooldown_seconds += max(0.0, delay)
+            if not released:
+                self._release_failure_count += 1
+
+    def record_release_failure(self) -> None:
+        """
+        记录未进入正常结果收口的站点租约释放失败。
+        """
+        with self._lock:
+            self._release_failure_count += 1
+
+    def snapshot(self) -> SubscriptionSiteBudgetMetricsSnapshot:
+        """
+        返回可安全跨线程读取的不可变观测结果。
+        """
+        with self._lock:
+            return SubscriptionSiteBudgetMetricsSnapshot(
+                site_count=len(self._site_ids),
+                request_count=self._request_count,
+                candidate_count=self._candidate_count,
+                failure_count=self._failure_count,
+                cooldown_skip_count=self._cooldown_skip_count,
+                release_failure_count=self._release_failure_count,
+                cooldown_seconds=round(self._cooldown_seconds, 3),
+            )
+
+
+class SubscriptionSiteBudgetRepository(Protocol):
+    """
+    站点预算租约和冷却状态的持久化端口。
+    """
+
+    def claim_site(
+        self,
+        *,
+        site_id: int,
+        owner: str,
+        lease_seconds: int,
+        minimum_interval: float = 0,
+    ) -> SiteBudgetClaim:
+        """
+        认领站点唯一在途租约，未就绪时返回重试时间。
+
+        :param site_id: 目标站点配置的主键
+        :param owner: 本次认领者的稳定标识
+        :param lease_seconds: 租约有效时长，单位为秒
+        :param minimum_interval: 两次站点请求的最小间隔，单位为秒，默认 0 不加额外间隔
+        :return: 包含认领结果、当前租约或等待原因与重试时间的快照
+        """
+        ...
+
+    def finish_site(
+        self,
+        *,
+        site_id: int,
+        lease_token: str,
+        outcome: str,
+        next_allowed_at: str,
+        error: Optional[str] = None,
+    ) -> bool:
+        """
+        收口当前站点租约并持久化下次允许时间。
+
+        :param site_id: 目标站点配置的主键
+        :param lease_token: 认领时取得的租约令牌，防止旧执行者覆盖新状态
+        :param outcome: 本次站点请求的结果分类，用于决定失败累计和冷却
+        :param next_allowed_at: 站点下一次允许请求的 UTC 时间文本
+        :param error: 可展示的失败摘要；无错误时为 None
+        :return: 租约仍匹配且完成释放时返回 True，否则返回 False
+        """
+        ...
+
+
+def _utc_now() -> datetime:
+    """
+    返回带时区的 UTC 当前时间。
+    """
+    return datetime.now(timezone.utc)
+
+
+class SubscriptionSiteBudget:
+    """
+    以非阻塞认领保护站点租约，并持久化外站错误冷却。
+    """
+
+    def __init__(
+        self,
+        *,
+        repository: SubscriptionSiteBudgetRepository,
+        owner: str,
+        cancelled: Callable[[], bool],
+        stop_state: StopState,
+        lease_seconds: int = 900,
+        clock: Callable[[], datetime] = _utc_now,
+        phase_changed: Optional[Callable[[str, Optional[int]], None]] = None,
+        metrics: Optional[SubscriptionSiteBudgetMetrics] = None,
+        pending_site_ids: Optional[tuple[int, ...]] = None,
+    ) -> None:
+        """
+        保存站点预算及恢复范围；首次搜索的 pending_site_ids 为 None。
+        """
+        self.pending_site_ids = pending_site_ids
+        self._repository = repository
+        self._owner = owner
+        self._cancelled = cancelled
+        self._stop_state = stop_state
+        self._lease_seconds = max(1, lease_seconds)
+        self._clock = clock
+        self._phase_changed = phase_changed
+        self._metrics = metrics
+        self._outcome_lock = threading.Lock()
+        self._successful_site_ids: set[int] = set()
+        # 带最小请求间隔认领的租约；释放时下次允许时间不早于认领时预留的开始间隔。
+        self._paced_leases: set[str] = set()
+
+    def acquire(self, site_id: int, *, minimum_interval: float = 0) -> SiteBudgetClaim:
+        """
+        只认领一次指定站点，未就绪时留待下一次正常调度；分页搜索传入请求开始间隔。
+        """
+        self._raise_if_cancelled()
+        if minimum_interval:
+            claim = self._repository.claim_site(site_id=site_id, owner=self._owner,
+                                                lease_seconds=self._lease_seconds,
+                                                minimum_interval=minimum_interval)
+        else:
+            claim = self._repository.claim_site(site_id=site_id, owner=self._owner,
+                                                lease_seconds=self._lease_seconds)
+        if claim.acquired:
+            if minimum_interval and claim.lease_token:
+                with self._outcome_lock:
+                    self._paced_leases.add(claim.lease_token)
+            self._report_phase("searching", site_id)
+            return claim
+        if self._metrics:
+            self._metrics.record_unavailable(site_id)
+        # 单站点不可用不代表整条订阅已等待；其它站点可能仍在搜索。
+        # 由任务所有者在全部请求收口并持久化续跑时间后发布等待阶段。
+        raise SubscriptionSiteBudgetUnavailable(
+            site_id=site_id,
+            retry_at=claim.retry_at,
+            wait_reason=claim.wait_reason,
+        )
+
+    def _report_phase(self, phase: str, site_id: Optional[int]) -> None:
+        """
+        向任务所有者报告不改变预算语义的业务阶段。
+        """
+        if self._phase_changed:
+            self._phase_changed(phase, site_id)
+
+    def record_request(self, site_id: int, candidate_count: int) -> None:
+        """
+        把真实请求及返回候选数写入轮次聚合器。
+        """
+        if self._metrics:
+            self._metrics.record_request(site_id, candidate_count)
+
+    def record_success(self, site_id: int) -> None:
+        """
+        记录一个已正常完成真实请求的站点。
+        """
+        with self._outcome_lock:
+            self._successful_site_ids.add(site_id)
+
+    def has_successful_site(self) -> bool:
+        """
+        判断本轮是否至少有一个站点正常完成真实请求。
+        """
+        with self._outcome_lock:
+            return bool(self._successful_site_ids)
+
+    def record_release_failure(self) -> None:
+        """
+        把站点租约释放异常写入轮次聚合器。
+        """
+        if self._metrics:
+            self._metrics.record_release_failure()
+
+    def finish(self, claim: SiteBudgetClaim, observation: SiteSearchObservation,
+               *, deferral_seconds: float = 0) -> bool:
+        """
+        正常结果立即释放站点，错误结果按类别写入冷却，本地流控按站点窗口退避。
+        """
+        if not claim.lease_token:
+            self.record_release_failure()
+            return False
+        if observation.outcome == "deferred":
+            # 本地限流没有发出请求，不累计失败；只按站点窗口写入冷却供其它订阅共享退避。
+            outcome = "deferred"
+            delay = max(0.0, deferral_seconds)
+        else:
+            outcome = observation.outcome if observation.attempted else "skipped"
+            delay = self._next_delay(outcome, claim.consecutive_failures)
+        next_allowed_at = (self._clock() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        with self._outcome_lock:
+            paced = claim.lease_token in self._paced_leases
+            self._paced_leases.discard(claim.lease_token)
+        if paced and claim.retry_at:
+            next_allowed_at = max(next_allowed_at, claim.retry_at)
+        released = self._repository.finish_site(
+            site_id=claim.site_id,
+            lease_token=claim.lease_token,
+            outcome=outcome,
+            next_allowed_at=next_allowed_at,
+            error=observation.error,
+        )
+        if self._metrics:
+            self._metrics.record_finish(
+                outcome=outcome,
+                delay=delay,
+                released=released,
+            )
+        return released
+
+    def _next_delay(self, outcome: str, consecutive_failures: int) -> float:
+        """
+        正常或本地跳过立即恢复，错误按连续失败次数退避。
+        """
+        if outcome in {"success", "skipped"}:
+            return 0.0
+        exponent = min(max(consecutive_failures, 0), 5)
+        base, ceiling = {
+            "rate_limited": (900.0, 21600.0),
+            "forbidden": (900.0, 21600.0),
+            "login_invalid": (900.0, 21600.0),
+            "timeout": (300.0, 7200.0),
+        }.get(outcome, (180.0, 3600.0))
+        return float(min(base * (2**exponent), ceiling))
+
+    def _raise_if_cancelled(self) -> None:
+        """
+        在创建站点租约前传播取消或停机。
+        """
+        if self._stop_state.is_system_stopped or self._cancelled():
+            raise SubscriptionSearchCancelled("搜索已停止")

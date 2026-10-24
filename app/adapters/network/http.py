@@ -1,0 +1,2215 @@
+"""
+提供同步和异步 HTTP 请求、Cookie 解析与共享连接池生命周期管理。
+"""
+
+import asyncio
+import collections
+import re
+import ssl
+import sys
+import threading
+import time
+import types
+import weakref
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, Iterator, Literal, Optional, Tuple, Union, cast, overload
+
+import chardet
+import httpx
+import httpx2
+import requests
+import urllib3
+from requests import Response, Session
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
+
+from app.runtime.correlation import with_correlation_header
+from app.runtime.log import logger
+from app.runtime.tasks import get_task_registry
+
+urllib3.disable_warnings(InsecureRequestWarning)
+
+# 业务模块只依赖网络适配器暴露的异常边界，不直接导入具体 transport。
+HttpRequestError = requests.exceptions.RequestException
+AsyncHttpRequestError = httpx2.RequestError
+
+_default_user_agent: Optional[str] = None
+
+_VerifySetting = Union[bool, str, ssl.SSLContext]
+
+
+def configure_default_user_agent(user_agent: str) -> None:
+    """
+    注册宿主 User-Agent，用于识别并标记来自插件的请求。
+    """
+    global _default_user_agent
+    _default_user_agent = user_agent
+
+
+_ASYNC_STALE_CONNECTION_ERRORS = (
+    httpx2.RemoteProtocolError,
+    httpx2.ReadError,
+    httpx2.WriteError,
+)
+
+# 代理 CONNECT 隧道在 TLS 协商阶段断开时，HTTPX 会把错误归类为这些连接层异常。
+# 超时类异常不在此列：重试同一条拥塞链路只会延长请求等待时间。
+_ASYNC_PROXY_TLS_FALLBACK_ERRORS = (
+    httpx2.ConnectError,
+    httpx2.RemoteProtocolError,
+    httpx2.ReadError,
+    httpx2.WriteError,
+)
+
+
+def _proxy_configured(proxies: Any) -> bool:
+    """
+    判断是否存在非空代理配置。
+    """
+    if isinstance(proxies, str):
+        return bool(proxies.strip())
+    if isinstance(proxies, dict):
+        return any(isinstance(value, str) and value.strip() for value in proxies.values())
+    return bool(proxies)
+
+
+def _can_retry_proxy_tls12(url: str, proxies: Any, method: str) -> bool:
+    """
+    仅为代理下的 HTTPS 幂等请求启用 TLS 1.2 回退。
+    """
+    return (
+        _proxy_configured(proxies)
+        and url.lower().startswith("https://")
+        and method.upper() in _REQUESTS_RETRY_IDEMPOTENT_METHODS
+    )
+
+
+def _build_tls12_context(verify: Union[bool, str]) -> ssl.SSLContext:
+    """
+    复制证书校验策略并把单次回退请求限制为 TLS 1.2。
+    """
+    if isinstance(verify, str):
+        context = ssl.create_default_context(cafile=verify)
+    else:
+        context = ssl.create_default_context()
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
+# HTTPAdapter 的第三方类型信息不完整，保留既有继承类型豁免。
+class _TLS12HttpAdapter(HTTPAdapter):  # type: ignore[misc]
+    """
+    为 requests 的一次性回退会话注入 TLS 1.2 SSLContext。
+    """
+
+    def __init__(
+        self,
+        ssl_context: ssl.SSLContext,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """
+        保存本次回退会话专用的 SSLContext 并初始化 HTTP 适配器。
+        """
+        self._ssl_context = ssl_context
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(
+        self,
+        connections: int,
+        maxsize: int,
+        block: bool = False,
+        **pool_kwargs: Any,
+    ) -> None:
+        """
+        为直连连接池注入限制到 TLS 1.2 的 SSLContext。
+        """
+        pool_kwargs["ssl_context"] = self._ssl_context
+        super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        """
+        为代理连接池注入同一回退 SSLContext。
+        """
+        proxy_kwargs["ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+class _NonClosingTransportProxy:
+    """
+    包装共享传输对象，转发请求但不转发局部关闭调用。
+
+    每次请求创建的 AsyncClient 退出时保留底层连接池；连接池最终由
+    aclose_shared_async_transports 统一关闭；连续取池超时的旧池在借用结束后释放。
+    """
+
+    __slots__ = ("_wrapped", "_recovery")
+
+    def __init__(self, wrapped: httpx2.AsyncBaseTransport) -> None:
+        """
+        保存由进程统一管理生命周期的底层传输对象。
+        """
+        self._wrapped = wrapped
+        with _shared_async_transports_lock:
+            self._recovery = _shared_transport_recovery.get(wrapped)
+
+    async def __aenter__(self) -> "_NonClosingTransportProxy":
+        """
+        进入局部上下文时继续复用共享传输对象。
+        """
+        if self._recovery is not None:
+            self._recovery.users += 1
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Any,
+    ) -> None:
+        """
+        退出局部上下文时保留由进程统一管理的连接池。
+        """
+        if self._recovery is not None:
+            self._recovery.users -= 1
+            if self._recovery.retired and self._recovery.users == 0:
+                _schedule_retired_transport_close(self._wrapped)
+
+    async def aclose(self) -> None:
+        """
+        忽略局部关闭请求，保留共享连接池。
+        """
+        # 故意 no-op：调用方显式 aclose 也不影响共享池
+        return None
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        """
+        将异步请求转发给共享底层传输。
+        """
+        try:
+            response = await self._wrapped.handle_async_request(request)
+        except httpx2.PoolTimeout:
+            if self._recovery is not None:
+                _record_shared_pool_timeout(self._wrapped, self._recovery)
+            raise
+        except httpx2.RequestError:
+            if self._recovery is not None:
+                self._recovery.failures = 0
+            raise
+        if self._recovery is not None:
+            self._recovery.failures = 0
+        return response
+
+
+_SharedTransportKey = Tuple[
+    # 代理地址
+    Optional[str],
+    # 证书校验设置
+    _VerifySetting,
+    # 是否启用 HTTP/2
+    bool,
+    # 是否读取环境代理配置
+    bool,
+    # 最大空闲长连接数
+    int,
+    # 最大连接数
+    int,
+    # 空闲连接有效期，单位为秒
+    int,
+]
+
+# 共享底层 transport 桶，按事件循环和配置区分，支持 LRU 淘汰
+_shared_async_transports: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, collections.OrderedDict[_SharedTransportKey, httpx2.AsyncHTTPTransport]] = weakref.WeakKeyDictionary()
+# 不同线程各自驱动的事件循环并发首次写入外层弱字典时，需要互斥保护
+_shared_async_transports_lock = threading.Lock()
+# 连续三次取池超时才更换池，普通连接/读取超时不触发恢复。
+_SHARED_POOL_TIMEOUT_THRESHOLD = 3
+
+
+class _SharedTransportRecovery:
+    """
+    记录单个共享池的失败与借用状态，退役后等局部客户端退出再关闭。
+    """
+
+    def __init__(self, key: _SharedTransportKey) -> None:
+        """
+        初始化池状态，以配置键约束最多两代在途连接池。
+
+        :param key: 当前池配置，用于识别同配置下仍未关闭的退役池
+        """
+        self.key = key
+        self.users = 0
+        self.failures = 0
+        self.retired = False
+        self.closing = False
+        self.closed = False
+
+
+_shared_transport_recovery: weakref.WeakKeyDictionary[httpx2.AsyncBaseTransport, _SharedTransportRecovery] = weakref.WeakKeyDictionary()
+_retired_async_transports: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, set[httpx2.AsyncBaseTransport]] = weakref.WeakKeyDictionary()
+# 每个事件循环允许的最大共享 transport 桶数；超出后按 LRU 淘汰最久未用桶。
+_MAX_SHARED_TRANSPORTS_PER_LOOP = 32
+# 默认的最大 keep-alive 连接数
+_DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+# 默认的最大连接数（包括 keep-alive 和非 keep-alive 连接）
+_DEFAULT_MAX_CONNECTIONS = 40
+# 默认的 keep-alive 连接过期时间（秒）
+_DEFAULT_KEEPALIVE_EXPIRY = 30
+# 同步 requests.Session 复用连接时，遇到对端或代理关闭 keep-alive 后允许重试的方法
+_REQUESTS_RETRY_IDEMPOTENT_METHODS = ("GET", "HEAD", "OPTIONS")
+
+# 代理走 CONNECT 隧道时，HTTP/2 多路复用会把并发请求叠加到极少数隧道上；
+# 隧道被代理节点切换或空闲回收打断后，复用其上的所有请求会同时失败。按 (proxy, host) 熔断：
+# 命中一次连接层失败就记录下次允许再尝试 h2 的时间戳（time.monotonic 基准），冷却期内该
+# (proxy, host) 的请求直接退化为 http1.1；冷却期结束后自动恢复尝试 h2。
+# 30 分钟
+_H2_PROXY_BREAKER_COOLDOWN = 1800
+_h2_proxy_breaker_lock = threading.Lock()
+_h2_proxy_retry_at: Dict[Tuple[str, str], float] = {}
+# 只有这些错误是"h2 隧道被打断"的特征（对应实测日志里的 SEND_HEADERS in CLOSED、
+# EndOfStream 等）；超时、连接失败、代理不可达等错误换 h1 一样会发生，
+# 不应触发熔断，也不值得付出一次注定同样失败的 h1 重试
+_H2_TUNNEL_BREAK_ERRORS = (
+    httpx2.RemoteProtocolError,
+    httpx2.LocalProtocolError,
+    httpx2.ReadError,
+    httpx2.WriteError,
+    httpx2.CloseError,
+)
+
+
+def _h2_proxy_breaker_key(proxy: str, url: str) -> Tuple[str, str]:
+    """
+    按代理与目标主机隔离 HTTP/2 熔断状态，解析失败保留原 URL 作为键。
+    """
+    try:
+        host = httpx2.URL(url).host or ""
+    except Exception:
+        host = url
+    return proxy, host
+
+
+def _h2_proxy_allowed(proxy: Optional[str], url: str) -> bool:
+    """
+    判断给定代理 + 目标 host 当前是否允许尝试 h2（未处于熔断冷却期）
+    """
+    if not proxy:
+        return True
+    with _h2_proxy_breaker_lock:
+        retry_at = _h2_proxy_retry_at.get(_h2_proxy_breaker_key(proxy, url), 0.0)
+    return time.monotonic() >= retry_at
+
+
+def _trip_h2_proxy_breaker(proxy: str, url: str) -> None:
+    """
+    记录一次 h2 连接层失败，熔断该 (proxy, host) 冷却期内的 h2 尝试
+    """
+    now = time.monotonic()
+    with _h2_proxy_breaker_lock:
+        # 顺手清掉已过冷却期的条目，防止长期运行下字典无限增长
+        for key in [k for k, retry_at in _h2_proxy_retry_at.items() if now >= retry_at]:
+            del _h2_proxy_retry_at[key]
+        _h2_proxy_retry_at[_h2_proxy_breaker_key(proxy, url)] = now + _H2_PROXY_BREAKER_COOLDOWN
+
+
+# 持有 LRU 淘汰后正在异步关闭的 transport task，避免 fire-and-forget 被 GC 警告
+_pending_eviction_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _discard_pending_eviction_task(task: asyncio.Task[Any]) -> None:
+    """
+    从跨线程共享集合移除已完成的 transport 关闭任务。
+    """
+    with _shared_async_transports_lock:
+        _pending_eviction_tasks.discard(task)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logger.warning(f"共享 HTTP 连接池关闭失败：{type(error).__name__}")
+
+
+def _create_shared_async_transport(
+    key: _SharedTransportKey,
+) -> httpx2.AsyncHTTPTransport:
+    """
+    按已有配置创建新池，不复用故障池的内部连接或请求队列。
+    """
+    proxy, verify, http2, trust_env, max_keepalive, max_connections, expiry = key
+    transport = httpx2.AsyncHTTPTransport(
+        http2=http2, proxy=proxy, verify=verify, trust_env=trust_env,
+        limits=httpx2.Limits(
+            max_keepalive_connections=max_keepalive,
+            max_connections=max_connections,
+            keepalive_expiry=expiry,
+        ),
+    )
+    with _shared_async_transports_lock:
+        _shared_transport_recovery[transport] = _SharedTransportRecovery(key)
+    return transport
+
+
+async def _close_retired_async_transport(transport: httpx2.AsyncBaseTransport) -> None:
+    """
+    关闭退役池并释放恢复状态；关闭异常仍由托管任务收集。
+    """
+    try:
+        await transport.aclose()
+    except BaseException:
+        with _shared_async_transports_lock:
+            _shared_transport_recovery[transport].closing = False
+        raise
+    else:
+        with _shared_async_transports_lock:
+            recovery = _shared_transport_recovery.get(transport)
+            if recovery is not None:
+                recovery.closed = True
+            retired = _retired_async_transports.get(asyncio.get_running_loop())
+            if retired is not None:
+                retired.discard(transport)
+
+
+def _schedule_retired_transport_close(transport: httpx2.AsyncBaseTransport) -> None:
+    """
+    将退役池关闭任务交给已有淘汰任务集合持有，避免取消调用方中断释放。
+    """
+    with _shared_async_transports_lock:
+        recovery = _shared_transport_recovery[transport]
+        if recovery.closing or recovery.closed:
+            return
+        recovery.closing = True
+        try:
+            task = get_task_registry().create(
+                _close_retired_async_transport(transport),
+                owner="http.transport.retire",
+                cancel_on_shutdown=False,
+            )
+        except RuntimeError:
+            recovery.closing = False
+            logger.warning("后台任务登记器已停止，退役 HTTP 连接池保留至宿主关闭时回收")
+            return
+        _pending_eviction_tasks.add(task)
+    task.add_done_callback(_discard_pending_eviction_task)
+
+
+def _record_shared_pool_timeout(
+    transport: httpx2.AsyncBaseTransport, recovery: _SharedTransportRecovery,
+) -> None:
+    """
+    连续取池失败时只替换仍为当前代的池；旧代请求退出前不重复轮换。
+
+    不重放当前请求，因此非幂等请求仍只发送一次。
+    """
+    recovery.failures += 1
+    if recovery.retired or recovery.failures < _SHARED_POOL_TIMEOUT_THRESHOLD:
+        return
+    loop = asyncio.get_running_loop()
+    with _shared_async_transports_lock:
+        per_loop = _shared_async_transports.get(loop)
+        if any(
+            _shared_transport_recovery[old].key == recovery.key
+            for old in _retired_async_transports.get(loop, ())
+        ):
+            return
+    if per_loop is None:
+        return
+    for key, current in per_loop.items():
+        if current is transport:
+            replacement = _create_shared_async_transport(key)
+            per_loop[key] = replacement
+            recovery.retired = True
+            with _shared_async_transports_lock:
+                _retired_async_transports.setdefault(loop, set()).add(transport)
+            logger.warning(
+                f"共享 HTTP 连接池连续 {recovery.failures} 次 PoolTimeout，"
+                f"后续请求切换新池，旧池等待 {recovery.users} 个在途客户端退出后关闭"
+            )
+            return
+
+
+def _get_shared_async_transport(
+    proxy: Optional[str],
+    verify: _VerifySetting,
+    http2: bool,
+    max_keepalive_connections: int,
+    max_connections: int,
+    keepalive_expiry: int,
+    trust_env: bool = True,
+) -> Optional[httpx2.AsyncHTTPTransport]:
+    """
+    返回与当前事件循环绑定的共享 AsyncHTTPTransport（底层连接池）；首次按需创建。
+    没有运行中的事件循环或循环已关闭时返回 None，由调用方走临时客户端兜底。
+
+    Transport 只持有连接池、SSL、代理；cookies/timeout/follow_redirects 等
+    会话级状态由调用方在外层 AsyncClient(transport=...) 实例化时单独配置，
+    每次调用用完即销毁，因此天然无 jar 累积串扰。
+    """
+    # 规范化代理：拒绝空字符串等非法值，防止客户端解析空代理地址失败
+    if proxy is not None and (not proxy or not proxy.strip()):
+        proxy = None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if loop.is_closed():
+        return None
+
+    with _shared_async_transports_lock:
+        per_loop = _shared_async_transports.get(loop)
+        if per_loop is None:
+            per_loop = collections.OrderedDict()
+            _shared_async_transports[loop] = per_loop
+
+    key: _SharedTransportKey = (
+        proxy,
+        verify,
+        http2,
+        trust_env,
+        max_keepalive_connections,
+        max_connections,
+        keepalive_expiry,
+    )
+    transport = per_loop.get(key)
+    if transport is not None:
+        # 更新最近使用顺序
+        per_loop.move_to_end(key)
+        return transport
+
+    # 首次见到这个配置，创建新的共享 transport 桶
+    transport = _create_shared_async_transport(key)
+    per_loop[key] = transport
+
+    # LRU 淘汰：超出上限时关闭并移除最久未用桶
+    while len(per_loop) > _MAX_SHARED_TRANSPORTS_PER_LOOP:
+        evicted_key, evicted_transport = per_loop.popitem(last=False)
+        try:
+            task = loop.create_task(evicted_transport.aclose())
+            # 强引用避免 task 仅被 loop 弱持有而触发 "Task was destroyed but pending"
+            with _shared_async_transports_lock:
+                _pending_eviction_tasks.add(task)
+            task.add_done_callback(_discard_pending_eviction_task)
+        # 防御性
+        except Exception:  # pragma: no cover
+            pass
+
+    return transport
+
+
+async def aclose_shared_async_transports() -> None:
+    """
+    关闭当前事件循环下所有共享 AsyncHTTPTransport，释放底层连接池。
+    建议在应用关闭流程（如 FastAPI shutdown 事件）中调用，避免 ResourceWarning。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    # 弹出而非 get+clear，避免外层 dict 残留空 OrderedDict 占位
+    with _shared_async_transports_lock:
+        per_loop = _shared_async_transports.pop(loop, None)
+        retired = _retired_async_transports.get(loop, set())
+        pending_evictions = [
+            task
+            for task in _pending_eviction_tasks
+            if task.get_loop() is loop
+        ]
+        retiring = [
+            transport for transport in retired
+            if not _shared_transport_recovery[transport].closing
+        ]
+        for transport in retiring:
+            _shared_transport_recovery[transport].closing = True
+    transports = list(per_loop.values()) if per_loop else []
+    if per_loop:
+        per_loop.clear()
+    if not transports and not pending_evictions and not retiring:
+        return
+    # 并行关闭：每个 transport 的 TLS close_notify 各占一个 RTT，
+    # 顺序等待会线性放大 shutdown 耗时；return_exceptions 让单点失败
+    # 不影响其他 transport 的释放
+    await asyncio.gather(
+        *pending_evictions,
+        *(t.aclose() for t in transports),
+        *(_close_retired_async_transport(t) for t in retiring),
+        return_exceptions=True,
+    )
+    with _shared_async_transports_lock:
+        _pending_eviction_tasks.difference_update(pending_evictions)
+
+
+def cookie_parse(
+    cookies_str: str, array: bool = False
+) -> Union[list[dict[str, str]], dict[str, str]]:
+    """
+    将 Cookie 请求头字符串解析为字典或浏览器 Cookie 数组。
+
+    Cookie 值属于不透明数据，百分号编码可能是签名的一部分，必须保持浏览器原值。
+
+    :param cookies_str: cookie字符串
+    :param array: 是否转化为数组
+    :return: 字典或者数组
+    """
+    if not cookies_str:
+        return {}
+
+    cookie_dict = {}
+    cookies = cookies_str.split(";")
+    for cookie in cookies:
+        # 只分割第一个=，因为value可能包含=
+        cstr = cookie.split("=", 1)
+        if len(cstr) > 1:
+            cookie_dict[cstr[0].strip()] = cstr[1].strip()
+    if array:
+        return [{"name": k, "value": v} for k, v in cookie_dict.items()]
+    return cookie_dict
+
+
+def get_caller() -> Optional[str]:
+    """
+    获取调用者的名称，识别是否为插件调用
+    """
+    # 调用者名称
+    caller_name: Optional[str] = None
+
+    try:
+        # 调用栈识别需要读取解释器帧，保留既有检查豁免。
+        frame: Optional[types.FrameType] = sys._getframe(3)  # noqa
+    except (AttributeError, ValueError):
+        return None
+
+    while frame:
+        filepath = Path(frame.f_code.co_filename)
+        parts = filepath.parts
+        if "app" in parts:
+            if not caller_name and "plugins" in parts:
+                try:
+                    plugins_index = parts.index("plugins")
+                    if plugins_index + 1 < len(parts):
+                        plugin_candidate = parts[plugins_index + 1]
+                        if plugin_candidate != "__init__.py":
+                            caller_name = plugin_candidate
+                        break
+                except ValueError:
+                    pass
+            if "main.py" in parts:
+                break
+        elif len(parts) != 1:
+            break
+        try:
+            frame = frame.f_back
+        except AttributeError:
+            break
+    return caller_name
+
+
+class RequestUtils:
+    """
+    HTTP请求工具类，提供同步HTTP请求的基本功能
+    """
+
+    def __init__(
+        self,
+        headers: Optional[dict[str, Any]] = None,
+        ua: Optional[str] = None,
+        cookies: Optional[Union[str, dict[str, Any]]] = None,
+        proxies: Optional[dict[str, Any]] = None,
+        session: Optional[Session] = None,
+        use_session: bool = False,
+        timeout: Optional[float] = None,
+        verify: Union[bool, str] = False,
+        referer: Optional[str] = None,
+        content_type: Optional[str] = None,
+        accept_type: Optional[str] = None,
+    ):
+        """
+        配置同步 HTTP 客户端，并按需创建由本实例管理的持久会话。
+
+        :param headers: 请求头部信息
+        :param ua: User-Agent字符串
+        :param cookies: Cookie字符串或字典
+        :param proxies: 代理设置
+        :param session: 调用方自管的 requests.Session 兼容入口
+        :param use_session: 是否由 RequestUtils 内部创建并管理持久会话
+        :param timeout: 请求超时时间，默认为20秒
+        :param verify: 是否校验证书，默认保留旧宿主兼容行为
+        :param referer: Referer头部信息
+        :param content_type: 请求的Content-Type，默认为 "application/x-www-form-urlencoded; charset=UTF-8"
+        :param accept_type: Accept头部信息，默认为 "application/json"
+        """
+        self._proxies = proxies
+        self._session = session or (requests.Session() if use_session else None)
+        self._owns_session = session is None and use_session
+        self._fallback_session: Optional[Session] = None
+        self._timeout = timeout or 20
+        self._verify = verify
+        if not content_type:
+            content_type = "application/x-www-form-urlencoded; charset=UTF-8"
+        if headers:
+            self._headers = headers
+        else:
+            if ua and ua == _default_user_agent:
+                caller_name = get_caller()
+                if caller_name:
+                    ua = f"{_default_user_agent} Plugin/{caller_name}"
+            self._headers = {
+                "User-Agent": ua,
+                "Content-Type": content_type,
+                "Accept": accept_type,
+                "referer": referer,
+            }
+        self._cookies: Optional[dict[str, Any]]
+        if cookies:
+            if isinstance(cookies, str):
+                parsed_cookies = cookie_parse(cookies)
+                self._cookies = (
+                    parsed_cookies if isinstance(parsed_cookies, dict) else None
+                )
+            else:
+                self._cookies = cookies
+        else:
+            self._cookies = None
+
+    def update_headers(self, headers: dict[str, Any]) -> None:
+        """
+        更新后续请求使用的持久请求头。
+        """
+        self._headers.update(headers)
+
+    def update_cookies(self, cookies: dict[str, Any]) -> None:
+        """
+        更新持久会话 Cookie；无持久会话时更新实例默认 Cookie。
+        """
+        if self._session is not None:
+            self._session.cookies.update(cookies)
+            return
+        if self._cookies is None:
+            self._cookies = {}
+        self._cookies.update(cookies)
+
+    def get_cookies(self) -> dict[str, Any]:
+        """
+        返回当前持久 Cookie 的独立字典快照。
+        """
+        if self._session is not None:
+            return dict(self._session.cookies.get_dict())
+        return dict(self._cookies or {})
+
+    def close(self) -> None:
+        """
+        关闭由该工具持有的同步会话并释放连接池。
+        """
+        if self._session is not None and self._owns_session:
+            self._session.close()
+            self._session = None
+            self._owns_session = False
+        self._close_fallback_session()
+
+    def _close_fallback_session(self) -> None:
+        """
+        关闭流式 TLS 回退会话，避免临时连接池泄漏。
+        """
+        if self._fallback_session is not None:
+            self._fallback_session.close()
+            self._fallback_session = None
+
+    def _request_with_tls12(self, method: str, url: str, kwargs: dict[str, Any]) -> Response:
+        """
+        使用一次性 TLS 1.2 会话重试代理下的幂等 HTTPS 请求。
+        """
+        stream = bool(kwargs.get("stream"))
+        if stream:
+            self._close_fallback_session()
+            fallback_session = requests.Session()
+            self._fallback_session = fallback_session
+        else:
+            fallback_session = requests.Session()
+
+        fallback_session.mount(
+            "https://",
+            _TLS12HttpAdapter(_build_tls12_context(self._verify)),
+        )
+        try:
+            response = fallback_session.request(method, url, **kwargs)
+        except requests.exceptions.RequestException:
+            if stream:
+                self._close_fallback_session()
+            else:
+                fallback_session.close()
+            raise
+
+        if not stream:
+            # stream=False 已经把响应体读入 Response，连接池可以立即释放。
+            fallback_session.close()
+        return response
+
+    @contextmanager
+    def response_manager(
+        self, method: str, url: str, **kwargs: Any
+    ) -> Iterator[Optional[Response]]:
+        """
+        响应管理器上下文管理器，确保响应对象被正确关闭
+
+        :param method: HTTP方法
+        :param url: 请求的URL
+        :param kwargs: 其他请求参数
+        """
+        response = None
+        try:
+            response = self.request(method=method, url=url, **kwargs)
+            yield response
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def request(
+        self, method: str, url: str, raise_exception: bool = False, **kwargs: Any
+    ) -> Optional[Response]:
+        """
+        发起HTTP请求
+
+        :param method: HTTP方法，如 get, post, put 等
+        :param url: 请求的URL
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers、cookies（字符串或字典）、proxies等
+        :return: HTTP响应对象
+        :raises requests.exceptions.RequestException: 请求失败且 raise_exception=True
+        """
+        if self._session is None:
+            req_method = requests.request
+        else:
+            req_method = self._session.request
+        kwargs["headers"] = with_correlation_header(
+            kwargs.get("headers", self._headers)
+        )
+        request_cookies = kwargs.get("cookies")
+        if isinstance(request_cookies, str):
+            # requests 的请求准备阶段仅支持字典或 CookieJar，站点配置仍以字符串保存。
+            kwargs["cookies"] = cookie_parse(request_cookies)
+        else:
+            kwargs.setdefault("cookies", self._cookies)
+        kwargs.setdefault("proxies", self._proxies)
+        kwargs.setdefault("timeout", self._timeout)
+        kwargs.setdefault("verify", self._verify)
+        kwargs.setdefault("stream", False)
+        method_upper = method.upper()
+        try:
+            return req_method(method, url, **kwargs)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+        ) as error:
+            if (
+                self._session is None
+                and isinstance(error, requests.exceptions.ConnectionError)
+                and _can_retry_proxy_tls12(url, self._proxies, method_upper)
+            ):
+                try:
+                    return self._request_with_tls12(method, url, kwargs)
+                except requests.exceptions.RequestException:
+                    if raise_exception:
+                        raise
+                    return None
+            if (
+                self._session is not None
+                and method_upper in _REQUESTS_RETRY_IDEMPOTENT_METHODS
+            ):
+                try:
+                    self._session.close()
+                    return req_method(method, url, **kwargs)
+                except requests.exceptions.RequestException:
+                    if raise_exception:
+                        raise
+                    return None
+            if raise_exception:
+                raise
+            return None
+        except requests.exceptions.RequestException:
+            if raise_exception:
+                raise
+            return None
+
+    def get(self, url: str, params: Optional[dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+        """
+        发送GET请求
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: 响应的内容，若发生RequestException则返回None
+        """
+        response = self.request(method="get", url=url, params=params, **kwargs)
+        try:
+            if response:
+                try:
+                    content = str(response.content, "utf-8")
+                    return content
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                response.close()
+            self._close_fallback_session()
+
+    def post(
+        self, url: str, data: Any = None, json: Optional[dict[str, Any]] = None, **kwargs: Any
+    ) -> Optional[Response]:
+        """
+        发送POST请求
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        """
+        return self.request(method="post", url=url, data=data, json=json, **kwargs)
+
+    def put(self, url: str, data: Any = None, **kwargs: Any) -> Optional[Response]:
+        """
+        发送PUT请求
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        """
+        return self.request(method="put", url=url, data=data, **kwargs)
+
+    def get_res(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        data: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[Response]:
+        """
+        发送GET请求并返回响应对象
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param allow_redirects: 是否允许重定向
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        :raises requests.exceptions.RequestException: 请求失败且 raise_exception=True
+        """
+        return self.request(
+            method="get",
+            url=url,
+            params=params,
+            data=data,
+            json=json,
+            allow_redirects=allow_redirects,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    @contextmanager
+    def get_stream(self, url: str, params: Optional[dict[str, Any]] = None, **kwargs: Any) -> Iterator[Optional[Response]]:
+        """
+        获取流式响应的上下文管理器，适用于大文件下载
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param kwargs: 其他请求参数
+        """
+        kwargs["stream"] = True
+        response = self.request(method="get", url=url, params=params, **kwargs)
+        try:
+            yield response
+        finally:
+            if response is not None:
+                response.close()
+            self._close_fallback_session()
+
+    def post_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[Response]:
+        """
+        发送POST请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param files: 请求的文件
+        :param json: 请求的JSON数据
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        :raises requests.exceptions.RequestException: 请求失败且 raise_exception=True
+        """
+        return self.request(
+            method="post",
+            url=url,
+            data=data,
+            params=params,
+            allow_redirects=allow_redirects,
+            files=files,
+            json=json,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    def put_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[Response]:
+        """
+        发送PUT请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param files: 请求的文件
+        :param json: 请求的JSON数据
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        :raises requests.exceptions.RequestException: 请求失败且 raise_exception=True
+        """
+        return self.request(
+            method="put",
+            url=url,
+            data=data,
+            params=params,
+            allow_redirects=allow_redirects,
+            files=files,
+            json=json,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    def delete_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[Response]:
+        """
+        发送DELETE请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestException则返回None
+        :raises requests.exceptions.RequestException: 请求失败且 raise_exception=True
+        """
+        return self.request(
+            method="delete",
+            url=url,
+            data=data,
+            params=params,
+            allow_redirects=allow_redirects,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    def get_json(self, url: str, params: Optional[dict[str, Any]] = None, **kwargs: Any) -> Optional[dict[str, Any]]:
+        """
+        发送GET请求并返回JSON数据，自动关闭连接
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param kwargs: 其他请求参数
+        :return: JSON数据，若发生异常则返回None
+        """
+        response = self.request(method="get", url=url, params=params, **kwargs)
+        try:
+            if response:
+                try:
+                    data = response.json()
+                    return cast(dict[str, Any], data)
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                response.close()
+
+    def post_json(
+        self, url: str, data: Any = None, json: Optional[dict[str, Any]] = None, **kwargs: Any
+    ) -> Optional[dict[str, Any]]:
+        """
+        发送POST请求并返回JSON数据，自动关闭连接
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param kwargs: 其他请求参数
+        :return: JSON数据，若发生异常则返回None
+        """
+        if json is None:
+            json = {}
+        response = self.request(method="post", url=url, data=data, json=json, **kwargs)
+        try:
+            if response:
+                try:
+                    data = response.json()
+                    return cast(dict[str, Any], data)
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                response.close()
+
+    @staticmethod
+    def parse_cache_control(header: str) -> Tuple[str, Optional[int]]:
+        """
+        解析 Cache-Control 头，返回 cache_directive 和 max_age
+
+        :param header: Cache-Control 头部的字符串
+        :return: cache_directive 和 max_age
+        """
+        cache_directive = ""
+        max_age = None
+
+        if not header:
+            return cache_directive, max_age
+
+        directives = [directive.strip() for directive in header.split(",")]
+        for directive in directives:
+            if directive.startswith("max-age"):
+                try:
+                    max_age = int(directive.split("=")[1])
+                except Exception:
+                    pass
+            elif directive in {
+                "no-cache",
+                "private",
+                "public",
+                "no-store",
+                "must-revalidate",
+            }:
+                cache_directive = directive
+
+        return cache_directive, max_age
+
+    @staticmethod
+    def generate_cache_headers(
+        etag: Optional[str],
+        cache_control: Optional[str] = "public",
+        max_age: Optional[int] = 86400,
+    ) -> dict[str, str]:
+        """
+        生成 HTTP 响应的 ETag 和 Cache-Control 头
+
+        :param etag: 响应的 ETag 值。如果为 None，则不添加 ETag 头部。
+        :param cache_control: Cache-Control 指令，例如 "public"、"private" 等。默认为 "public"
+        :param max_age: Cache-Control 的 max-age 值（秒）。默认为 86400 秒（1天）
+        :return: HTTP 头部的字典
+        """
+        cache_headers = {}
+
+        if etag:
+            cache_headers["ETag"] = etag
+
+        if cache_control and max_age is not None:
+            cache_headers["Cache-Control"] = f"{cache_control}, max-age={max_age}"
+        elif cache_control:
+            cache_headers["Cache-Control"] = cache_control
+        elif max_age is not None:
+            cache_headers["Cache-Control"] = f"max-age={max_age}"
+
+        return cache_headers
+
+    @staticmethod
+    def detect_encoding_from_html_response(
+        response: Response,
+        performance_mode: bool = False,
+        confidence_threshold: float = 0.8,
+    ) -> Optional[str]:
+        """
+        根据HTML响应内容探测编码信息
+
+        :param response: HTTP 响应对象
+        :param performance_mode: 是否使用性能模式，默认为 False (兼容模式)
+        :param confidence_threshold: chardet 检测置信度阈值，默认为 0.8
+        :return: 解析得到的字符编码
+        """
+        fallback_encoding = None
+        try:
+            if not performance_mode:
+                # 兼容模式：使用chardet分析后，再处理 BOM 和 meta 信息
+                # 1. 使用 chardet 库进一步分析内容
+                detection = chardet.detect(response.content)
+                if detection["confidence"] > confidence_threshold:
+                    return cast(Optional[str], detection.get("encoding"))
+                # 保存 chardet 的结果备用
+                fallback_encoding = detection.get("encoding")
+
+                # 2. 检查响应体中的 BOM 标记（例如 UTF-8 BOM）
+                # UTF-8 字节顺序标记
+                if response.content[:3] == b"\xef\xbb\xbf":
+                    return "utf-8"
+
+                # 3. 如果是 HTML 响应体，检查其中的 <meta charset="..."> 标签
+                if re.search(
+                    r"charset=[\"']?utf-8[\"']?", response.text, re.IGNORECASE
+                ):
+                    return "utf-8"
+
+                # 4. 尝试从 response headers 中获取编码信息
+                content_type = response.headers.get("Content-Type", "")
+                if re.search(r"charset=[\"']?utf-8[\"']?", content_type, re.IGNORECASE):
+                    return "utf-8"
+
+            else:
+                # 性能模式：优先从 headers 和 BOM 标记获取，最后使用 chardet 分析
+                # 1. 尝试从 response headers 中获取编码信息
+                content_type = response.headers.get("Content-Type", "")
+                if re.search(r"charset=[\"']?utf-8[\"']?", content_type, re.IGNORECASE):
+                    return "utf-8"
+                # 2. 检查响应体中的 BOM 标记（例如 UTF-8 BOM）
+                if response.content[:3] == b"\xef\xbb\xbf":
+                    return "utf-8"
+
+                # 3. 如果是 HTML 响应体，检查其中的 <meta charset="..."> 标签
+                if re.search(
+                    r"charset=[\"']?utf-8[\"']?", response.text, re.IGNORECASE
+                ):
+                    return "utf-8"
+                # 4. 使用 chardet 库进一步分析内容
+                detection = chardet.detect(response.content)
+                if detection.get("confidence", 0) > confidence_threshold:
+                    return cast(Optional[str], detection.get("encoding"))
+                # 保存 chardet 的结果备用
+                fallback_encoding = detection.get("encoding")
+
+            # 5. 如果上述方法都无法确定，信任 chardet 的结果（即使置信度较低），否则返回默认字符集
+            return fallback_encoding or "utf-8"
+        except Exception:
+            return fallback_encoding or "utf-8"
+
+    @staticmethod
+    def detect_xml_declared_encoding(raw_data: bytes) -> Optional[str]:
+        """
+        从 XML 声明中读取字符集，适用于 RSS/Atom 等 XML 响应的 bytes 级解码。
+        """
+        if not raw_data:
+            return None
+        xml_head = raw_data[:512].decode("ascii", errors="ignore")
+        match = re.search(
+            r"^\s*(?:\ufeff)?<\?xml[^>]*encoding\s*=\s*[\"']([^\"']+)[\"']",
+            xml_head,
+            re.IGNORECASE,
+        )
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def is_low_confidence_http_encoding(encoding: Optional[str]) -> bool:
+        """
+        判断 HTTP 客户端默认编码是否低可信，避免 latin1 类默认值吞掉 UTF-8 内容。
+        """
+        if not encoding:
+            return False
+        normalized = encoding.strip().lower().replace("_", "-")
+        return normalized in {"iso-8859-1", "latin-1", "latin1"}
+
+    @staticmethod
+    def get_decoded_xml_content(
+        response: Response,
+        performance_mode: bool = False,
+        confidence_threshold: float = 0.8,
+    ) -> str:
+        """
+        获取 XML 响应的解码文本内容，优先尊重 XML 声明并避免低可信 HTTP 默认编码。
+
+        :param response: HTTP 响应对象
+        :param performance_mode: 是否优先使用轻量规则，默认为 False (兼容模式)
+        :param confidence_threshold: chardet 检测置信度阈值，默认为 0.8
+        :return: 解码后的 XML 文本
+        """
+        if not response:
+            return ""
+        raw_data = cast(Optional[bytes], getattr(response, "content", None))
+        if not raw_data:
+            return cast(str, getattr(response, "text", "") or "")
+
+        def _try_decode(encodings: list[Optional[str]]) -> Optional[str]:
+            """
+            依次尝试去重后的候选编码，全部无法解码时返回空。
+            """
+            seen_encodings = set()
+            for encoding in encodings:
+                if not encoding:
+                    continue
+                normalized = str(encoding).strip()
+                if not normalized or normalized.lower() in seen_encodings:
+                    continue
+                seen_encodings.add(normalized.lower())
+                try:
+                    return raw_data.decode(normalized)
+                except (LookupError, UnicodeDecodeError):
+                    continue
+            return None
+
+        xml_encoding = RequestUtils.detect_xml_declared_encoding(raw_data)
+        if xml_encoding:
+            decoded = _try_decode([xml_encoding])
+            if decoded is not None:
+                return decoded
+
+        response_encoding = getattr(response, "encoding", None)
+        trusted_response_encoding = (
+            response_encoding
+            if not RequestUtils.is_low_confidence_http_encoding(response_encoding)
+            else None
+        )
+        apparent_encoding = getattr(response, "apparent_encoding", None)
+        trusted_apparent_encoding = (
+            apparent_encoding
+            if not RequestUtils.is_low_confidence_http_encoding(apparent_encoding)
+            else None
+        )
+
+        fallback_encoding = None
+        try:
+            if performance_mode:
+                decoded = _try_decode(["utf-8", trusted_response_encoding, trusted_apparent_encoding])
+                if decoded is not None:
+                    return decoded
+
+            detection = chardet.detect(raw_data)
+            if detection.get("confidence", 0) > confidence_threshold:
+                decoded = _try_decode([detection.get("encoding")])
+                if decoded is not None:
+                    return decoded
+            fallback_encoding = detection.get("encoding")
+
+            if not performance_mode:
+                decoded = _try_decode(["utf-8", trusted_response_encoding, trusted_apparent_encoding])
+                if decoded is not None:
+                    return decoded
+
+            decoded = _try_decode([fallback_encoding, "utf-8", apparent_encoding, response_encoding])
+            if decoded is not None:
+                return decoded
+        except Exception:
+            pass
+
+        return raw_data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def get_decoded_html_content(
+        response: Response,
+        performance_mode: bool = False,
+        confidence_threshold: float = 0.8,
+    ) -> str:
+        """
+        获取HTML响应的解码文本内容
+
+        :param response: HTTP 响应对象
+        :param performance_mode: 是否使用性能模式，默认为 False (兼容模式)
+        :param confidence_threshold: chardet 检测置信度阈值，默认为 0.8
+        :return: 解码后的响应文本内容
+        """
+        try:
+            if not response:
+                return ""
+            if response.content:
+                # 1. 获取编码信息
+                encoding = (
+                    RequestUtils.detect_encoding_from_html_response(
+                        response, performance_mode, confidence_threshold
+                    )
+                    or response.apparent_encoding
+                )
+                # 2. 根据解析得到的编码进行解码
+                try:
+                    # 尝试用推测的编码解码
+                    return cast(str, response.content.decode(encoding))
+                except Exception:
+                    # 如果解码失败，尝试 fallback 使用 apparent_encoding
+                    response.encoding = response.apparent_encoding
+                    return cast(str, response.text)
+            else:
+                return cast(str, response.text)
+        except Exception:
+            return cast(str, response.text)
+
+
+class AsyncRequestUtils:
+    """
+    异步HTTP请求工具类，提供异步HTTP请求的基本功能
+    """
+
+    def __init__(
+        self,
+        headers: Optional[dict[str, Any]] = None,
+        ua: Optional[str] = None,
+        cookies: Optional[Union[str, dict[str, Any]]] = None,
+        proxies: Optional[Union[str, dict[str, str]]] = None,
+        client: Optional[httpx2.AsyncClient] = None,
+        timeout: Optional[float] = None,
+        referer: Optional[str] = None,
+        content_type: Optional[str] = None,
+        accept_type: Optional[str] = None,
+        verify: Union[bool, str] = False,
+        follow_redirects: bool = True,
+        http2: bool = True,
+        trust_env: bool = True,
+        max_keepalive_connections: int = _DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        max_connections: int = _DEFAULT_MAX_CONNECTIONS,
+        keepalive_expiry: int = _DEFAULT_KEEPALIVE_EXPIRY,
+    ):
+        """
+        配置异步 HTTP 客户端选项，外部传入的客户端由调用方管理。
+
+        :param headers: 请求头部信息
+        :param ua: User-Agent字符串
+        :param cookies: Cookie字符串或字典
+        :param proxies: 代理设置
+        :param client: 调用方自管的 HTTPX2 AsyncClient；为空时使用宿主客户端
+        :param timeout: 请求超时时间，默认为20秒
+        :param referer: Referer头部信息
+        :param content_type: 请求的Content-Type，默认为 "application/x-www-form-urlencoded; charset=UTF-8"
+        :param accept_type: Accept头部信息，默认为 "application/json"
+        :param verify: 是否校验证书
+        :param follow_redirects: 客户端默认是否跟随重定向
+        :param http2: 是否启用 HTTP/2（默认 True）。基于 TLS ALPN 协商：服务端
+            支持 h2 时复用流多路复用，不支持（含明文 HTTP、老 nginx/Apache）
+            自动透明回落 HTTP/1.1。如遇个别站点 h2 实现异常，可显式传
+            http2=False 单独关闭。
+
+        :param trust_env: 是否读取进程环境中的代理和证书配置
+        :param max_keepalive_connections: 共享 AsyncHTTPTransport 的最大 keep-alive 连接数
+        :param max_connections: 共享 AsyncHTTPTransport 的最大连接数
+        :param keepalive_expiry: 共享 AsyncHTTPTransport 的 keep-alive 连接过期时间（秒）
+        """
+        self._proxies = self._convert_proxies_for_httpx(proxies)
+        self._client = client
+        self._timeout = timeout or 20
+        self._verify = verify
+        self._follow_redirects = follow_redirects
+        self._http2 = http2
+        self._trust_env = trust_env
+        self._max_keepalive_connections = max_keepalive_connections
+        self._max_connections = max_connections
+        self._keepalive_expiry = keepalive_expiry
+        if not content_type:
+            content_type = "application/x-www-form-urlencoded; charset=UTF-8"
+        if headers:
+            # 过滤掉None值的headers
+            self._headers = {k: v for k, v in headers.items() if v is not None}
+        else:
+            if ua and ua == _default_user_agent:
+                caller_name = get_caller()
+                if caller_name:
+                    ua = f"{_default_user_agent} Plugin/{caller_name}"
+            self._headers = {}
+            if ua:
+                self._headers["User-Agent"] = ua
+            if content_type:
+                self._headers["Content-Type"] = content_type
+            if accept_type:
+                self._headers["Accept"] = accept_type
+            if referer:
+                self._headers["referer"] = referer
+        self._cookies: Optional[dict[str, Any]]
+        if cookies:
+            if isinstance(cookies, str):
+                self._cookies = cast(dict[str, Any], cookie_parse(cookies))
+            else:
+                self._cookies = cookies
+        else:
+            self._cookies = None
+
+    def update_headers(self, headers: dict[str, Any]) -> None:
+        """
+        更新实例请求头，保持与同步请求工具相同的显式覆盖入口。
+        """
+        self._headers.update(headers)
+
+    @staticmethod
+    def build_sdk_client_args(
+        proxy: Optional[str] = None,
+        timeout: float = 20.0,
+        connect_timeout: Optional[float] = None,
+        trust_env: bool = False,
+    ) -> dict[str, Any]:
+        """
+        构造第三方异步 SDK 共用的 HTTP 客户端参数。
+
+        SDK 仍负责协议语义，代理参数名和超时对象等 transport 细节集中留在网络适配器。
+        """
+        client_timeout: Union[float, httpx.Timeout] = timeout
+        if connect_timeout is not None:
+            client_timeout = httpx.Timeout(timeout, connect=connect_timeout)
+        kwargs: dict[str, Any] = {
+            "timeout": client_timeout,
+            "trust_env": trust_env,
+        }
+        if proxy:
+            params = httpx.AsyncClient.__init__.__code__.co_varnames
+            kwargs["proxy" if "proxy" in params else "proxies"] = proxy
+        return kwargs
+
+    @staticmethod
+    def create_sdk_client(
+        proxy: Optional[str] = None,
+        timeout: float = 20.0,
+        connect_timeout: Optional[float] = None,
+        trust_env: bool = False,
+    ) -> httpx.AsyncClient:
+        """
+        创建供第三方异步 SDK 注入且由 SDK 调用方关闭的 HTTP 客户端。
+        """
+        kwargs = AsyncRequestUtils.build_sdk_client_args(
+            proxy=proxy,
+            timeout=timeout,
+            connect_timeout=connect_timeout,
+            trust_env=trust_env,
+        )
+        return httpx.AsyncClient(**kwargs)
+
+    @staticmethod
+    def _convert_proxies_for_httpx(
+        proxies: Optional[Union[str, dict[str, str]]],
+    ) -> Optional[str]:
+        """
+        将requests格式的代理配置转换为httpx兼容的格式
+
+        :param proxies: requests格式的代理配置 {"http": "http://proxy:port", "https": "http://proxy:port"}
+        :return: httpx兼容的代理字符串或None
+        """
+        if not proxies:
+            return None
+
+        # 如果已经是字符串格式，直接返回
+        if isinstance(proxies, str):
+            return proxies.strip() or None
+
+        # 如果是字典格式，提取http或https代理
+        if isinstance(proxies, dict):
+            # 优先使用https代理，如果没有则使用http代理
+            # 先各自 strip，避免空白字符串阻断裂合取或回退到 http 代理
+            https_proxy = proxies.get("https")
+            http_proxy = proxies.get("http")
+            https_proxy = https_proxy.strip() if isinstance(https_proxy, str) else None
+            http_proxy = http_proxy.strip() if isinstance(http_proxy, str) else None
+            proxy_url = https_proxy or http_proxy
+            if proxy_url:
+                return proxy_url
+
+        return None
+
+    @asynccontextmanager
+    async def response_manager(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[Optional[httpx2.Response]]:
+        """
+        异步响应管理器上下文管理器，确保响应对象被正确关闭
+
+        :param method: HTTP方法
+        :param url: 请求的URL
+        :param kwargs: 其他请求参数
+        """
+        response = None
+        try:
+            response = await self.request(method=method, url=url, **kwargs)
+            yield response
+        finally:
+            if response is not None:
+                try:
+                    await response.aclose()
+                except Exception:
+                    pass
+
+    async def request(
+        self, method: str, url: str, raise_exception: bool = False, **kwargs: Any
+    ) -> Optional[httpx2.Response]:
+        """
+        发起异步HTTP请求
+
+        :param method: HTTP方法，如 get, post, put 等
+        :param url: 请求的URL
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象
+        :raises httpx2.RequestError: 请求失败且 raise_exception=True
+        """
+        # 运行时 self._cookies 只能是 dict | None（cookie_parse 默认 array=False 返回 dict）
+        cookies_dict: Optional[dict[str, Any]] = self._cookies if isinstance(self._cookies, dict) else None
+
+        if self._client is not None:
+            # 用户自管 client 时，把实例级 cookies 注入到本次 per-request kwargs，
+            # 既能复用用户 client，又不让 instance cookies 被静默丢弃。
+            # 调用方若显式传 kwargs["cookies"]，则以其为准（setdefault 不覆盖）。
+            if cookies_dict is not None:
+                kwargs.setdefault("cookies", cookies_dict)
+            return await self._make_request(
+                self._client, method, url, raise_exception, **kwargs
+            )
+
+        # 代理走 CONNECT 隧道时 h2 多路复用容易被隧道打断放大成批量失败（见
+        # _h2_proxy_allowed 处注释）；仅对幂等方法做"h2 失败就地降级 h1 重试"，
+        # 避免非幂等请求在服务端可能已收到数据的情况下重复产生副作用
+        http2 = self._http2 and _h2_proxy_allowed(self._proxies, url)
+        proxy_tls_fallback = _can_retry_proxy_tls12(url, self._proxies, method)
+        if not (http2 and self._proxies and method.upper() in _REQUESTS_RETRY_IDEMPOTENT_METHODS):
+            if proxy_tls_fallback:
+                try:
+                    return await self._dispatch_request(
+                        http2,
+                        cookies_dict,
+                        method,
+                        url,
+                        True,
+                        **kwargs,
+                    )
+                except _ASYNC_PROXY_TLS_FALLBACK_ERRORS:
+                    return await self._dispatch_with_tls12(
+                        http2,
+                        cookies_dict,
+                        method,
+                        url,
+                        raise_exception,
+                        **kwargs,
+                    )
+            return await self._dispatch_request(
+                http2, cookies_dict, method, url, raise_exception, **kwargs
+            )
+
+        try:
+            return await self._dispatch_request(
+                True, cookies_dict, method, url, True, **kwargs
+            )
+        except _H2_TUNNEL_BREAK_ERRORS:
+            _trip_h2_proxy_breaker(self._proxies, url)
+            try:
+                return await self._dispatch_request(
+                    False,
+                    cookies_dict,
+                    method,
+                    url,
+                    True if proxy_tls_fallback else raise_exception,
+                    **kwargs,
+                )
+            except httpx2.RequestError as error:
+                if proxy_tls_fallback and isinstance(error, _ASYNC_PROXY_TLS_FALLBACK_ERRORS):
+                    return await self._dispatch_with_tls12(
+                        False,
+                        cookies_dict,
+                        method,
+                        url,
+                        raise_exception,
+                        **kwargs,
+                    )
+                if raise_exception:
+                    raise
+                return None
+        except _ASYNC_PROXY_TLS_FALLBACK_ERRORS:
+            if proxy_tls_fallback:
+                return await self._dispatch_with_tls12(
+                    True,
+                    cookies_dict,
+                    method,
+                    url,
+                    raise_exception,
+                    **kwargs,
+                )
+            if raise_exception:
+                raise
+            return None
+        except httpx2.RequestError:
+            # 与 h2 隧道无关的失败（超时、连接失败等）：不熔断也不重试，
+            # 恢复调用方原本的 raise_exception 语义
+            if raise_exception:
+                raise
+            return None
+
+    async def _dispatch_request(
+        self, http2: bool, cookies_dict: Optional[dict[str, Any]], method: str, url: str,
+        raise_exception: bool, verify: Optional[_VerifySetting] = None, **kwargs: Any
+    ) -> Optional[httpx2.Response]:
+        """
+        按给定 http2 开关构建/复用底层连接并发起请求，供 request() 的 h2/h1 熔断切换复用
+        """
+        # 共享底层 transport（连接池+TLS 复用），每次请求创建轻量 AsyncClient。
+        # AsyncClient 持有的 cookie jar 仅存活于本次请求 lifecycle，
+        # 既复用握手又彻底避免 jar 跨调用累积。
+        request_verify = self._verify if verify is None else verify
+        transport = _get_shared_async_transport(
+            proxy=self._proxies,
+            verify=request_verify,
+            http2=http2,
+            trust_env=self._trust_env,
+            max_keepalive_connections=self._max_keepalive_connections,
+            max_connections=self._max_connections,
+            keepalive_expiry=self._keepalive_expiry,
+        )
+        if transport is not None:
+            # 用 _NonClosingTransportProxy 包装共享 transport，吞掉 AsyncClient.__aexit__
+            # 传播下来的 transport.__aexit__，避免每次 async with 退出都把共享连接池清空。
+            async with httpx2.AsyncClient(
+                transport=_NonClosingTransportProxy(transport),
+                timeout=httpx2.Timeout(self._timeout),
+                follow_redirects=self._follow_redirects,
+                cookies=cookies_dict,
+            ) as client:
+                return await self._make_request(
+                    client, method, url, raise_exception, **kwargs
+                )
+
+        # 兜底：没有运行中的事件循环时，临时客户端走完即关
+        async with httpx2.AsyncClient(
+            http2=http2,
+            proxy=self._proxies,
+            timeout=self._timeout,
+            verify=request_verify,
+            trust_env=self._trust_env,
+            follow_redirects=self._follow_redirects,
+            cookies=cookies_dict,
+        ) as client:
+            return await self._make_request(
+                client, method, url, raise_exception, **kwargs
+            )
+
+    async def _dispatch_with_tls12(
+        self,
+        http2: bool,
+        cookies_dict: Optional[dict[str, Any]],
+        method: str,
+        url: str,
+        raise_exception: bool,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        在代理握手失败后以 TLS 1.2 重试一次幂等请求。
+        """
+        try:
+            return await self._dispatch_request(
+                http2,
+                cookies_dict,
+                method,
+                url,
+                True,
+                verify=_build_tls12_context(self._verify),
+                **kwargs,
+            )
+        except httpx2.RequestError:
+            if raise_exception:
+                raise
+            return None
+
+    async def _make_request(
+        self,
+        client: httpx2.AsyncClient,
+        method: str,
+        url: str,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        执行实际的异步请求
+        """
+        kwargs["headers"] = with_correlation_header(
+            kwargs.get("headers", self._headers)
+        )
+        # 共享池下 client 自带默认 timeout，这里用每请求 timeout 覆盖以尊重实例配置
+        kwargs.setdefault("timeout", self._timeout)
+        # Cookie 在 request() 入口已按 path 处理：
+        # - path A（用户自管 client）：kwargs["cookies"] 已注入
+        # - path B/C（新建 AsyncClient）：构造时已绑定 cookies
+        # 这里不重复 setdefault，避免覆盖各 path 的设定
+
+        method_upper = method.upper()
+        # 仅对幂等方法做 stale-pool 竞态重试：复用了刚被对端 FIN 的 keep-alive 连接时，
+        # 实际请求通常未到服务端，httpx 自身不重试，这里兜底一次。
+        is_idempotent = method_upper in ("GET", "HEAD", "OPTIONS")
+        try:
+            return await client.request(method, url, **kwargs)
+        except _ASYNC_STALE_CONNECTION_ERRORS:
+            if is_idempotent:
+                try:
+                    return await client.request(method, url, **kwargs)
+                except httpx2.RequestError:
+                    if raise_exception:
+                        raise
+                    return None
+            # 非幂等方法（POST/PUT/PATCH/DELETE 等）不重试以避免重复副作用，
+            # 直接恢复调用方原本的 raise_exception 语义。
+            if raise_exception:
+                raise
+            return None
+        except httpx2.RequestError:
+            if raise_exception:
+                raise
+            return None
+
+    async def get(self, url: str, params: Optional[dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+        """
+        发送异步GET请求
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: 响应的内容，若发生RequestError则返回None
+        """
+        response = await self.request(method="get", url=url, params=params, **kwargs)
+        try:
+            if response:
+                try:
+                    content = response.text
+                    return cast(str, content)
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    async def post(
+        self, url: str, data: Any = None, json: Optional[dict[str, Any]] = None, **kwargs: Any
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步POST请求
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        """
+        return await self.request(
+            method="post", url=url, data=data, json=json, **kwargs
+        )
+
+    async def put(
+        self, url: str, data: Any = None, **kwargs: Any
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步PUT请求
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        """
+        return await self.request(method="put", url=url, data=data, **kwargs)
+
+    @overload
+    async def get_res(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        data: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        *,
+        raise_exception: Literal[True],
+        **kwargs: Any,
+    ) -> httpx2.Response:
+        """
+        声明开启异常透传时，异步 GET 一定返回响应或抛出错误。
+        """
+        ...
+
+    @overload
+    async def get_res(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        data: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        声明默认异步 GET 会把请求错误转换为空响应。
+        """
+        ...
+
+    async def get_res(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        data: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步GET请求并返回响应对象
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param allow_redirects: 是否允许重定向
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        :raises httpx2.RequestError: 请求失败且 raise_exception=True
+        """
+        return await self.request(
+            method="get",
+            url=url,
+            params=params,
+            data=data,
+            json=json,
+            follow_redirects=allow_redirects,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    @asynccontextmanager
+    async def get_stream(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[Optional[httpx2.Response]]:
+        """
+        获取异步流式响应的上下文管理器，适用于大文件下载。
+        使用 AsyncClient.stream() 标准流式 API，避免把响应体一次性读入内存。
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param raise_exception: 是否在发生异常时抛出，否则吞掉并 yield None
+        :param kwargs: 其他请求参数（headers, cookies 等）
+        :return: 上下文管理器，进入后返回响应对象（出错时返回 None）
+        """
+        cookies_dict: Optional[dict[str, Any]] = self._cookies if isinstance(self._cookies, dict) else None
+        kwargs["headers"] = with_correlation_header(
+            kwargs.get("headers", self._headers)
+        )
+
+        # 与 _make_request 保持一致：复用 keep-alive 时偶遇对端 FIN 的连接，
+        # 流式 GET 是幂等的，单次重试即可
+        async with AsyncExitStack() as stack:
+            proxy_tls_fallback = (
+                self._client is None
+                and _can_retry_proxy_tls12(url, self._proxies, "GET")
+            )
+            http2 = self._http2 and _h2_proxy_allowed(self._proxies, url)
+
+            async def _open_stream(
+                verify: _VerifySetting,
+                use_http2: bool,
+            ) -> httpx2.Response:
+                """
+                按给定 TLS/HTTP2 配置创建并托管一个流式响应。
+                """
+                if self._client is not None:
+                    client = self._client
+                    if cookies_dict is not None:
+                        kwargs.setdefault("cookies", cookies_dict)
+                else:
+                    transport = _get_shared_async_transport(
+                        proxy=self._proxies,
+                        verify=verify,
+                        http2=use_http2,
+                        trust_env=self._trust_env,
+                        max_keepalive_connections=self._max_keepalive_connections,
+                        max_connections=self._max_connections,
+                        keepalive_expiry=self._keepalive_expiry,
+                    )
+                    if transport is not None:
+                        client = await stack.enter_async_context(
+                            httpx2.AsyncClient(
+                                transport=_NonClosingTransportProxy(transport),
+                                timeout=httpx2.Timeout(self._timeout),
+                                follow_redirects=self._follow_redirects,
+                                cookies=cookies_dict,
+                            )
+                        )
+                    else:
+                        client = await stack.enter_async_context(
+                            httpx2.AsyncClient(
+                                http2=use_http2,
+                                proxy=self._proxies,
+                                timeout=self._timeout,
+                                verify=verify,
+                                trust_env=self._trust_env,
+                                follow_redirects=self._follow_redirects,
+                                cookies=cookies_dict,
+                            )
+                        )
+                return await stack.enter_async_context(
+                    client.stream("GET", url, params=params, **kwargs)
+                )
+
+            try:
+                response = await _open_stream(self._verify, http2)
+            except _ASYNC_STALE_CONNECTION_ERRORS:
+                try:
+                    response = await _open_stream(self._verify, http2)
+                except _ASYNC_PROXY_TLS_FALLBACK_ERRORS:
+                    if proxy_tls_fallback:
+                        try:
+                            response = await _open_stream(
+                                _build_tls12_context(self._verify),
+                                http2,
+                            )
+                        except httpx2.RequestError:
+                            if raise_exception:
+                                raise
+                            yield None
+                            return
+                    elif raise_exception:
+                        raise
+                    else:
+                        yield None
+                        return
+                except httpx2.RequestError:
+                    if raise_exception:
+                        raise
+                    yield None
+                    return
+            except _ASYNC_PROXY_TLS_FALLBACK_ERRORS:
+                if proxy_tls_fallback:
+                    try:
+                        response = await _open_stream(
+                            _build_tls12_context(self._verify),
+                            http2,
+                        )
+                    except httpx2.RequestError:
+                        if raise_exception:
+                            raise
+                        yield None
+                        return
+                elif raise_exception:
+                    raise
+                else:
+                    yield None
+                    return
+            except httpx2.RequestError:
+                if raise_exception:
+                    raise
+                yield None
+                return
+
+            # AsyncExitStack 反向 unwind：先关 stream，再关 owned client；
+            # yield 体内的异常由标准 async with 协议透传给各 __aexit__
+            yield response
+
+    @overload
+    async def post_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        *,
+        raise_exception: Literal[True],
+        **kwargs: Any,
+    ) -> httpx2.Response:
+        """
+        声明开启异常透传时，异步 POST 一定返回响应或抛出错误。
+        """
+        ...
+
+    @overload
+    async def post_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        声明默认异步 POST 会把请求错误转换为空响应。
+        """
+        ...
+
+    async def post_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步POST请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param files: 请求的文件
+        :param json: 请求的JSON数据
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        :raises httpx2.RequestError: 请求失败且 raise_exception=True
+        """
+        return await self.request(
+            method="post",
+            url=url,
+            data=data,
+            params=params,
+            follow_redirects=allow_redirects,
+            files=files,
+            json=json,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    async def put_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        files: Any = None,
+        json: Optional[dict[str, Any]] = None,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步PUT请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param files: 请求的文件
+        :param json: 请求的JSON数据
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        :raises httpx2.RequestError: 请求失败且 raise_exception=True
+        """
+        return await self.request(
+            method="put",
+            url=url,
+            data=data,
+            params=params,
+            follow_redirects=allow_redirects,
+            files=files,
+            json=json,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    async def delete_res(
+        self,
+        url: str,
+        data: Any = None,
+        params: Optional[dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        raise_exception: bool = False,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        发送异步DELETE请求并返回响应对象
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param params: 请求的参数
+        :param allow_redirects: 是否允许重定向
+        :param raise_exception: 是否在发生异常时抛出异常，否则默认拦截异常返回None
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        :return: HTTP响应对象，若发生RequestError则返回None
+        :raises httpx2.RequestError: 请求失败且 raise_exception=True
+        """
+        return await self.request(
+            method="delete",
+            url=url,
+            data=data,
+            params=params,
+            follow_redirects=allow_redirects,
+            raise_exception=raise_exception,
+            **kwargs,
+        )
+
+    async def get_json(self, url: str, params: Optional[dict[str, Any]] = None, **kwargs: Any) -> Optional[dict[str, Any]]:
+        """
+        发送异步GET请求并返回JSON数据，自动关闭连接
+
+        :param url: 请求的URL
+        :param params: 请求的参数
+        :param kwargs: 其他请求参数
+        :return: JSON数据，若发生异常则返回None
+        """
+        response = await self.request(method="get", url=url, params=params, **kwargs)
+        try:
+            if response:
+                try:
+                    data = response.json()
+                    return cast(dict[str, Any], data)
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    async def post_json(
+        self, url: str, data: Any = None, json: Optional[dict[str, Any]] = None, **kwargs: Any
+    ) -> Optional[dict[str, Any]]:
+        """
+        发送异步POST请求并返回JSON数据，自动关闭连接
+
+        :param url: 请求的URL
+        :param data: 请求的数据
+        :param json: 请求的JSON数据
+        :param kwargs: 其他请求参数
+        :return: JSON数据，若发生异常则返回None
+        """
+        if json is None:
+            json = {}
+        response = await self.request(
+            method="post", url=url, data=data, json=json, **kwargs
+        )
+        try:
+            if response:
+                try:
+                    data = response.json()
+                    return cast(dict[str, Any], data)
+                except Exception:
+                    return None
+            return None
+        finally:
+            if response is not None:
+                await response.aclose()

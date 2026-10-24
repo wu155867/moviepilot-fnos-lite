@@ -1,0 +1,59 @@
+"""
+Agent 与消息查询依赖。
+"""
+
+from typing import cast
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.context import (
+    get_agent_chat_repository,
+    get_agent_chat_runtime,
+    get_agent_chat_transaction,
+    get_async_session,
+    get_host_runtime,
+)
+from app.application.messaging.chat import (
+    AgentChatPersistenceService,
+    AgentChatService,
+    AsyncAgentChatRepository,
+    AsyncUnitOfWork,
+)
+from app.application.messaging.message import (
+    AsyncMessageQueryRepository,
+    MessageQueryService,
+)
+from app.startup.composition.context import AgentChatRuntime, HostRuntime
+
+
+def get_agent_chat_service(
+    chat_repository: AsyncAgentChatRepository = Depends(get_agent_chat_repository),
+    unit_of_work: AsyncUnitOfWork = Depends(get_agent_chat_transaction),
+    runtime: HostRuntime = Depends(get_host_runtime),
+) -> AgentChatService:
+    """
+    组装类型化 Agent 会话历史查询和删除服务。
+    """
+    return AgentChatService(chat_repository, unit_of_work, recall=runtime.agent.recall)
+
+
+def get_agent_chat_persistence(
+    runtime: AgentChatRuntime = Depends(get_agent_chat_runtime),
+) -> AgentChatPersistenceService:
+    """
+    从类型化 Agent 运行时获取有界会话写入端口。
+    """
+    return runtime.persistence
+
+
+def get_message_query_service(
+    db: AsyncSession = Depends(get_async_session),
+    runtime: HostRuntime = Depends(get_host_runtime),
+) -> MessageQueryService:
+    """
+    组装消息历史异步查询服务。
+    """
+    return MessageQueryService(
+        repository=cast(AsyncMessageQueryRepository, runtime.messaging.repository(db)),
+    )

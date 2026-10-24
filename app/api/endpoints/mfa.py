@@ -1,0 +1,554 @@
+"""
+MFA (Multi-Factor Authentication) API 端点
+包含 OTP 和 PassKey 相关功能
+"""
+
+import json
+from typing import Annotated, Any, Optional
+
+from fastapi import Body, Depends, HTTPException, Request, Response
+from pydantic import BaseModel as _SchemaBaseModel
+from pydantic import Field as _Field
+
+from app.adapters.web.security.access import set_or_refresh_resource_token_cookie
+from app.api.dependencies.auth import (
+    get_current_active_user,
+    get_current_active_user_async,
+    get_passkey_service,
+    get_user_service,
+)
+from app.api.principal import ApiPrincipal
+from app.api.response import (
+    COLLECTION_TOTAL_HEADER,
+    COLLECTION_TOTAL_OPENAPI_KEY,
+    RAW_RESPONSE_OPENAPI_KEY,
+    CompatibleCountParam,
+    CompatiblePageParam,
+    ResponseAPIRouter,
+    resolve_compatible_pagination,
+)
+from app.application.security.auth import get_configured_auth_service
+from app.application.security.otp import OtpUtils
+from app.application.security.passkey import (
+    PasskeyChallengeStore,
+    PassKeyHelper,
+    PassKeyRegistrationOriginMismatchError,
+    PassKeyRegistrationVerificationError,
+    PasskeyService,
+)
+from app.application.security.user import (
+    UserService,
+    get_configured_user_id_lookup,
+    get_configured_user_name_lookup,
+)
+from app.runtime.log import logger
+from app.schemas.common import JsonData as _SchemaJsonData
+from app.schemas.mfa import OtpGenerateData as _SchemaOtpGenerateData
+from app.schemas.mfa import PasskeyInfo as _SchemaPasskeyInfo
+from app.schemas.mfa import PasskeyStartData as _SchemaPasskeyStartData
+from app.schemas.response import Response as _SchemaResponse
+from app.schemas.token import Token as _SchemaToken
+from app.schemas.token import TokenPayload as _SchemaTokenPayload
+
+router = ResponseAPIRouter()
+
+# 辅助函数
+def _build_credential_list(passkeys: list[Any]) -> list[dict[str, Any]]:
+    """
+    构建凭证列表
+
+    :param passkeys: PassKey 列表
+    :return: 凭证字典列表
+    """
+    return (
+        [
+            {"credential_id": pk.credential_id, "transports": pk.transports}
+            for pk in passkeys
+        ]
+        if passkeys
+        else []
+    )
+
+
+def _extract_and_standardize_credential_id(credential: dict[str, _SchemaJsonData]) -> str:
+    """
+    从凭证中提取并标准化 credential_id
+
+    :param credential: 凭证字典
+    :return: 标准化后的 credential_id
+    :raises ValueError: 如果凭证无效
+    """
+    credential_id_raw = credential.get("id") or credential.get("rawId")
+    if not isinstance(credential_id_raw, str) or not credential_id_raw:
+        raise ValueError("无效的凭证")
+    return PassKeyHelper.standardize_credential_id(credential_id_raw)
+
+
+def _verify_passkey_and_update(
+    credential: dict[str, _SchemaJsonData],
+    challenge: str,
+    passkey: Any,
+    service: PasskeyService,
+) -> tuple[bool, int]:
+    """
+    验证 PassKey 并更新使用时间和签名计数
+
+    :param credential: 凭证字典
+    :param challenge: 挑战值
+    :param passkey: PassKey 对象
+    :return: (验证是否成功, 新的签名计数)
+    """
+    success, new_sign_count = PassKeyHelper.verify_authentication_response(
+        credential=credential,
+        expected_challenge=challenge,
+        credential_public_key=passkey.public_key,
+        credential_current_sign_count=passkey.sign_count,
+    )
+
+    if success:
+        success = service.compare_and_update_sign_count(
+            passkey_id=passkey.id,
+            expected_sign_count=int(passkey.sign_count or 0),
+            sign_count=new_sign_count,
+        )
+
+    return success, new_sign_count
+
+
+# 请求模型
+class OtpVerifyRequest(_SchemaBaseModel):
+    """
+    OTP验证请求
+    """
+
+    uri: str = _Field(description="待绑定的 OTP 密钥 URI，包含用于本次校验和保存的密钥")
+    otpPassword: str = _Field(description="用户输入的动态验证码")
+
+
+class OtpDisableRequest(_SchemaBaseModel):
+    """
+    OTP禁用请求
+    """
+
+    password: str = _Field(description="当前用户的登录密码，用于确认关闭 OTP")
+
+
+class PassKeyDeleteRequest(_SchemaBaseModel):
+    """
+    PassKey删除请求
+    """
+
+    passkey_id: int = _Field(description="要删除的通行密钥记录主键")
+    password: str = _Field(description="当前用户的登录密码，用于确认删除")
+
+
+# OTP 相关接口
+@router.post(
+    "/otp/generate",
+    summary="生成 OTP 验证 URI",
+    response_model=_SchemaResponse[_SchemaOtpGenerateData],
+)
+def otp_generate(
+    current_user: Annotated[ApiPrincipal, Depends(get_current_active_user)],
+) -> Any:
+    """
+    生成 OTP 密钥及对应的 URI
+    """
+    secret, uri = OtpUtils.generate_secret_key(current_user.name)
+    return _SchemaResponse(success=secret != "", data={"secret": secret, "uri": uri})
+
+
+@router.post("/otp/verify", summary="绑定并验证 OTP", response_model=_SchemaResponse[None])
+async def otp_verify(
+    data: OtpVerifyRequest,
+    service: UserService = Depends(get_user_service),
+    current_user: ApiPrincipal = Depends(get_current_active_user_async),
+) -> Any:
+    """
+    验证用户输入的 OTP 码，验证通过后正式开启 OTP 验证
+    """
+    if not OtpUtils.is_legal(data.uri, data.otpPassword):
+        return _SchemaResponse(success=False, message="验证码错误")
+    await service.update_otp(
+        current_user.name,
+        True,
+        OtpUtils.get_secret(data.uri),
+    )
+    return _SchemaResponse(success=True)
+
+
+@router.post(
+    "/otp/disable",
+    summary="关闭当前用户的 OTP 验证",
+    response_model=_SchemaResponse[None],
+)
+async def otp_disable(
+    data: OtpDisableRequest,
+    service: UserService = Depends(get_user_service),
+    current_user: ApiPrincipal = Depends(get_current_active_user_async),
+) -> Any:
+    """
+    关闭当前用户的 OTP 验证功能
+    """
+    # 验证密码
+    if not await service.verify_password(current_user.id, data.password):
+        return _SchemaResponse(success=False, message="密码错误")
+    await service.update_otp(current_user.name, False, "")
+    return _SchemaResponse(success=True)
+
+
+# PassKey 相关接口
+class PassKeyRegistrationStart(_SchemaBaseModel):
+    """
+    PassKey注册开始请求
+    """
+
+    name: str = _Field(default="通行密钥", description="待注册通行密钥的显示名称，默认通行密钥")
+
+
+class PassKeyRegistrationFinish(_SchemaBaseModel):
+    """
+    PassKey注册完成请求
+    """
+
+    credential: dict[str, _SchemaJsonData] = _Field(description="浏览器返回的 WebAuthn 注册凭据对象")
+    transaction_token: str = _Field(description="注册开始时签发的挑战事务令牌")
+    name: str = _Field(default="通行密钥", description="注册成功后保存的通行密钥显示名称，默认通行密钥")
+
+
+class PassKeyAuthenticationStart(_SchemaBaseModel):
+    """
+    PassKey认证开始请求
+    """
+
+    username: Optional[str] = _Field(default=None, description="要登录的账号名称；None 或空字符串表示使用可发现凭据进行无用户名认证")
+
+
+class PassKeyAuthenticationFinish(_SchemaBaseModel):
+    """
+    PassKey认证完成请求
+    """
+
+    credential: dict[str, _SchemaJsonData] = _Field(description="浏览器返回的 WebAuthn 认证断言对象")
+    transaction_token: str = _Field(description="认证开始时签发的挑战事务令牌")
+
+
+@router.post(
+    "/passkey/register/start",
+    summary="开始注册 PassKey",
+    response_model=_SchemaResponse[_SchemaPasskeyStartData],
+)
+def passkey_register_start(
+    current_user: Annotated[ApiPrincipal, Depends(get_current_active_user)],
+    service: PasskeyService = Depends(get_passkey_service),
+) -> Any:
+    """
+    开始注册 PassKey - 生成注册选项
+    """
+    try:
+        # 获取用户已有的PassKey
+        existing_passkeys = service.list_by_user_id(current_user.id)
+        existing_credentials = (
+            _build_credential_list(existing_passkeys) if existing_passkeys else None
+        )
+
+        # 生成注册选项
+        options_json, challenge = PassKeyHelper.generate_registration_options(
+            user_id=current_user.id,
+            username=current_user.name,
+            display_name=getattr(current_user, "settings", {}).get("nickname")
+            if getattr(current_user, "settings", None)
+            else None,
+            existing_credentials=existing_credentials,
+        )
+
+        transaction_token = PasskeyChallengeStore.issue(
+            challenge=challenge,
+            purpose="registration",
+            user_id=current_user.id,
+        )
+        return _SchemaResponse(
+            success=True,
+            data={
+                "options": json.loads(options_json),
+                "transaction_token": transaction_token,
+            },
+        )
+    except Exception as e:
+        logger.error(f"生成PassKey注册选项失败: {e}")
+        return _SchemaResponse(success=False, message=f"生成注册选项失败: {str(e)}")
+
+
+@router.post(
+    "/passkey/register/finish",
+    summary="完成注册 PassKey",
+    response_model=_SchemaResponse[None],
+)
+def passkey_register_finish(
+    passkey_req: PassKeyRegistrationFinish,
+    current_user: Annotated[ApiPrincipal, Depends(get_current_active_user)],
+    service: PasskeyService = Depends(get_passkey_service),
+) -> Any:
+    """
+    完成注册 PassKey - 验证并保存凭证
+    """
+    try:
+        challenge_state = PasskeyChallengeStore.consume(
+            transaction_token=passkey_req.transaction_token,
+            purpose="registration",
+        )
+        if not challenge_state or challenge_state.user_id != current_user.id:
+            return _SchemaResponse(
+                success=False,
+                message="注册请求已失效，请重新发起注册",
+            )
+
+        # 验证注册响应
+        credential_id, public_key, sign_count, aaguid = (
+            PassKeyHelper.verify_registration_response(
+                credential=passkey_req.credential,
+                expected_challenge=challenge_state.challenge,
+            )
+        )
+
+        # 提取transports
+        transports = None
+        response_data = passkey_req.credential.get("response")
+        if isinstance(response_data, dict):
+            transport_data = response_data.get("transports")
+            if isinstance(transport_data, list):
+                transport_values = [item for item in transport_data if isinstance(item, str)]
+                if len(transport_values) == len(transport_data):
+                    transports = ",".join(transport_values)
+
+        # 保存到数据库
+        service.create({
+            "user_id": current_user.id,
+            "credential_id": credential_id,
+            "public_key": public_key,
+            "sign_count": sign_count,
+            "name": passkey_req.name or "通行密钥",
+            "aaguid": aaguid,
+            "transports": transports,
+        })
+
+        logger.info(f"用户 {current_user.name} 成功注册PassKey: {passkey_req.name}")
+
+        return _SchemaResponse(success=True, message="通行密钥注册成功")
+    except PassKeyRegistrationOriginMismatchError:
+        return _SchemaResponse(
+            success=False,
+            message="访问域名与系统配置不一致，请使用配置的域名重试",
+        )
+    except PassKeyRegistrationVerificationError:
+        return _SchemaResponse(
+            success=False,
+            message="通行密钥注册验证失败，请重新发起注册后重试",
+        )
+    except Exception as e:
+        logger.error(f"注册PassKey失败: {e}")
+        return _SchemaResponse(success=False, message="通行密钥注册失败，请稍后重试")
+
+
+@router.post(
+    "/passkey/authenticate/start",
+    summary="开始 PassKey 认证",
+    response_model=_SchemaResponse[_SchemaPasskeyStartData],
+)
+def passkey_authenticate_start(
+    passkey_req: PassKeyAuthenticationStart = Body(...),
+    service: PasskeyService = Depends(get_passkey_service),
+) -> Any:
+    """
+    开始 PassKey 认证 - 生成认证选项
+    """
+    try:
+        existing_credentials = None
+        user_id = None
+
+        # 如果指定了用户名，只允许该用户的PassKey
+        if passkey_req.username:
+            user = get_configured_user_name_lookup()(passkey_req.username)
+            existing_passkeys = (
+                service.list_by_user_id(user.id) if user else None
+            )
+
+            if not user or not existing_passkeys:
+                return _SchemaResponse(success=False, message="认证失败")
+
+            existing_credentials = _build_credential_list(existing_passkeys)
+            user_id = user.id
+
+        # 生成认证选项
+        options_json, challenge = PassKeyHelper.generate_authentication_options(
+            existing_credentials=existing_credentials
+        )
+
+        transaction_token = PasskeyChallengeStore.issue(
+            challenge=challenge,
+            purpose="authentication",
+            user_id=user_id,
+        )
+        return _SchemaResponse(
+            success=True,
+            data={
+                "options": json.loads(options_json),
+                "transaction_token": transaction_token,
+            },
+        )
+    except Exception as e:
+        logger.error(f"生成PassKey认证选项失败: {e}")
+        return _SchemaResponse(success=False, message="认证失败")
+
+
+@router.post(
+    "/passkey/authenticate/finish",
+    summary="完成 PassKey 认证",
+    response_model=_SchemaToken,
+    openapi_extra={RAW_RESPONSE_OPENAPI_KEY: True},
+)
+def passkey_authenticate_finish(
+    request: Request,
+    response: Response,
+    passkey_req: PassKeyAuthenticationFinish,
+    service: PasskeyService = Depends(get_passkey_service),
+) -> Any:
+    """
+    完成 PassKey 认证 - 验证凭证并返回 token
+    """
+    try:
+        challenge_state = PasskeyChallengeStore.consume(
+            transaction_token=passkey_req.transaction_token,
+            purpose="authentication",
+        )
+        if not challenge_state:
+            raise HTTPException(status_code=401, detail="认证请求已失效")
+
+        # 提取并标准化凭证ID
+        try:
+            credential_id = _extract_and_standardize_credential_id(
+                passkey_req.credential
+            )
+        except ValueError as e:
+            logger.warning(f"PassKey认证失败，提供的凭证无效: {e}")
+            raise HTTPException(status_code=401, detail="认证失败")
+
+        # 查找PassKey并获取用户
+        passkey = service.get_by_credential_id(credential_id)
+        user = get_configured_user_id_lookup()(passkey.user_id) if passkey else None
+        if not passkey or not user or not user.is_active:
+            raise HTTPException(status_code=401, detail="认证失败")
+        if challenge_state.user_id is not None and challenge_state.user_id != user.id:
+            raise HTTPException(status_code=401, detail="认证失败")
+
+        # 验证认证响应并更新
+        success, _ = _verify_passkey_and_update(
+            credential=passkey_req.credential,
+            challenge=challenge_state.challenge,
+            passkey=passkey,
+            service=service,
+        )
+
+        if not success:
+            raise HTTPException(status_code=401, detail="认证失败")
+
+        logger.info(f"用户 {user.name} 通过PassKey认证成功")
+
+        # 生成token
+        token = get_configured_auth_service().build_token_response(user)
+        set_or_refresh_resource_token_cookie(
+            request,
+            response,
+            _SchemaTokenPayload(
+                sub=user.id,
+                username=user.name,
+                super_user=user.is_superuser,
+                level=token.level,
+                purpose="authentication",
+            ),
+        )
+        return token
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PassKey认证失败: {e}")
+        raise HTTPException(status_code=401, detail="认证失败")
+
+
+@router.get(
+    "/passkey/list",
+    summary="获取当前用户的 PassKey 列表",
+    response_model=_SchemaResponse[list[_SchemaPasskeyInfo]],
+    openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True},
+)
+def passkey_list(
+    current_user: Annotated[ApiPrincipal, Depends(get_current_active_user)],
+    response: Response = None,  # type: ignore[assignment]
+    service: PasskeyService = Depends(get_passkey_service),
+    page: CompatiblePageParam = None,
+    count: CompatibleCountParam = None,
+) -> Any:
+    """
+    获取当前用户的所有 PassKey
+    """
+    try:
+        page, count = resolve_compatible_pagination(page, count)
+        passkeys = service.list_by_user_id(current_user.id, page=page, count=count)
+        if response is not None:
+            response.headers[COLLECTION_TOTAL_HEADER] = str(
+                service.count_by_user_id(current_user.id)
+            )
+
+        key_list = (
+            [
+                {
+                    "id": pk.id,
+                    "name": pk.name,
+                    "created_at": pk.created_at.isoformat() if pk.created_at else None,
+                    "last_used_at": pk.last_used_at.isoformat()
+                    if pk.last_used_at
+                    else None,
+                    "aaguid": pk.aaguid,
+                    "transports": pk.transports,
+                }
+                for pk in passkeys
+            ]
+            if passkeys
+            else []
+        )
+
+        return _SchemaResponse(success=True, data=key_list)
+    except Exception as e:
+        logger.error(f"获取PassKey列表失败: {e}")
+        return _SchemaResponse(success=False, message=f"获取列表失败: {str(e)}")
+
+
+@router.post(
+    "/passkey/delete",
+    summary="删除 PassKey",
+    response_model=_SchemaResponse[None],
+)
+async def passkey_delete(
+    data: PassKeyDeleteRequest,
+    current_user: ApiPrincipal = Depends(get_current_active_user_async),
+    service: PasskeyService = Depends(get_passkey_service),
+    user_service: UserService = Depends(get_user_service),
+) -> Any:
+    """
+    删除指定的 PassKey
+    """
+    try:
+        # 验证密码
+        if not await user_service.verify_password(current_user.id, data.password):
+            return _SchemaResponse(success=False, message="密码错误")
+
+        success = service.delete_by_id(data.passkey_id, current_user.id)
+
+        if success:
+            logger.info(f"用户 {current_user.name} 删除了PassKey: {data.passkey_id}")
+            return _SchemaResponse(success=True, message="通行密钥已删除")
+        else:
+            return _SchemaResponse(success=False, message="通行密钥不存在或无权删除")
+    except Exception as e:
+        logger.error(f"删除PassKey失败: {e}")
+        return _SchemaResponse(success=False, message=f"删除失败: {str(e)}")

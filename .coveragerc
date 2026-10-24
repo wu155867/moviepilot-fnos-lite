@@ -1,0 +1,26 @@
+[run]
+branch = True
+source = app
+omit =
+    app/plugins/*
+
+[report]
+show_missing = True
+skip_empty = False
+precision = 2
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    pass
+    ^[ \t]*\.\.\.[ \t]*$
+
+[html]
+directory = htmlcov
+
+[xml]
+output = coverage.xml
+
+[json]
+output = coverage.json

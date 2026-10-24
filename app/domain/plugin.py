@@ -1,0 +1,332 @@
+"""
+插件来源、代际与安装计划的纯领域规则。
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+
+LOCAL_PLUGIN_SOURCE_PREFIX = "local://"
+PLUGIN_SYSTEM_VERSION_FIELD = "system_version"
+# 无全局解释器锁运行时（v3t）专用的插件声明字段；缺省视为兼容，只有显式 false 才拒绝
+PLUGIN_FREE_THREADED_FIELD = "v3t"
+_PHYSICAL_PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+PLUGIN_GENERATION_COMPATIBILITY: dict[str, tuple[str, ...]] = {
+    "v3": ("v2",),
+}
+
+
+def normalize_plugin_market_repo_url(repo_url: str) -> str | None:
+    """
+    规范化 GitHub 插件市场地址，便于配置读取和请求去重。
+    """
+    value = str(repo_url or "").strip().rstrip("/")
+    if not value:
+        return None
+    value = value.removesuffix(".git")
+    try:
+        parsed_url = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed_url.scheme not in {"http", "https"}:
+        return None
+    if (parsed_url.hostname or "").lower() != "github.com":
+        return None
+    parts = [item for item in parsed_url.path.split("/") if item]
+    if len(parts) < 2:
+        return None
+    return f"https://github.com/{parts[0]}/{parts[1]}"
+
+
+def split_plugin_market_repo_urls(value: str | None) -> list[str]:
+    """
+    拆分插件市场配置并按大小写不敏感规则保持顺序去重。
+    """
+    repos: list[str] = []
+    seen_repos: set[str] = set()
+    for item in re.split(r"[\n,，]+", value or ""):
+        normalized_repo = normalize_plugin_market_repo_url(item)
+        if not normalized_repo or normalized_repo.lower() in seen_repos:
+            continue
+        repos.append(normalized_repo)
+        seen_repos.add(normalized_repo.lower())
+    return repos
+
+
+@dataclass(frozen=True, slots=True)
+class PluginReleaseInstallPlan:
+    """
+    描述远端插件内容准备模式，不持有同步或异步 I/O 实现。
+
+    :param release_tag: 拟下载的发行标签；未选择发行包时为 None
+    :param fallback_to_filelist: 是否允许退回逐文件下载插件内容
+    """
+
+    release_tag: str | None
+    fallback_to_filelist: bool
+
+
+def is_physical_plugin_id(plugin_id: object) -> bool:
+    """
+    判断值是否符合物理插件在市场、目录和来源身份中共用的 ID 规则。
+    """
+    return bool(
+        isinstance(plugin_id, str)
+        and plugin_id == plugin_id.strip()
+        and _PHYSICAL_PLUGIN_ID_PATTERN.fullmatch(plugin_id)
+    )
+
+
+def is_local_plugin_source(repo_url: str | None) -> bool:
+    """
+    判断插件来源是否为宿主定义的不透明本地仓库标识。
+    """
+    return bool(repo_url and repo_url.startswith(LOCAL_PLUGIN_SOURCE_PREFIX))
+
+
+def build_local_plugin_source(
+    plugin_id: str,
+    *,
+    repo_path: str | None = None,
+    package_generation: str | None = None,
+) -> str:
+    """
+    生成本地插件来源标识，不解释或访问其中的宿主路径。
+    """
+    repo_url = f"{LOCAL_PLUGIN_SOURCE_PREFIX}{quote(plugin_id, safe='')}"
+    parameters: list[str] = []
+    if repo_path:
+        parameters.append(f"path={quote(repo_path, safe='/:~')}")
+    if package_generation:
+        parameters.append(f"version={quote(package_generation, safe='')}")
+    return f"{repo_url}?{'&'.join(parameters)}" if parameters else repo_url
+
+
+def parse_local_plugin_reference(repo_url: str) -> str | None:
+    """
+    从不透明本地来源标识中提取插件 ID。
+    """
+    if not is_local_plugin_source(repo_url):
+        return None
+    try:
+        parsed = urlsplit(repo_url)
+        plugin_id = unquote(parsed.netloc or parsed.path.strip("/"))
+    except (TypeError, ValueError):
+        return None
+    return plugin_id or None
+
+
+def parse_local_plugin_path(repo_url: str) -> str | None:
+    """
+    从本地来源标识中提取未解释的仓库路径字符串。
+    """
+    if not is_local_plugin_source(repo_url):
+        return None
+    try:
+        values = parse_qs(urlsplit(repo_url).query).get("path")
+    except (TypeError, ValueError):
+        return None
+    return values[0] if values else None
+
+
+def parse_local_plugin_generation(repo_url: str) -> str | None:
+    """
+    从本地来源标识中提取 package 代际。
+    """
+    if not is_local_plugin_source(repo_url):
+        return None
+    try:
+        values = parse_qs(urlsplit(repo_url).query).get("version")
+    except (TypeError, ValueError):
+        return None
+    return values[0] if values else None
+
+
+def compatible_plugin_generations(current_generation: str | None) -> tuple[str, ...]:
+    """
+    返回当前宿主允许读取的插件代际，按优先级去重。
+    """
+    if not current_generation:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (
+                current_generation,
+                *PLUGIN_GENERATION_COMPATIBILITY.get(current_generation, ()),
+            )
+        )
+    )
+
+
+def plugin_generation_candidates(
+    requested_generation: str | None,
+    *,
+    current_generation: str | None,
+) -> tuple[str, ...]:
+    """
+    返回安装读取唯一的代际候选顺序，并把基础索引固定在末尾。
+    """
+    preferred_generation = requested_generation or current_generation
+    candidates = [preferred_generation]
+    candidates.extend(
+        PLUGIN_GENERATION_COMPATIBILITY.get(preferred_generation or "", ())
+    )
+    candidates.append("")
+    return tuple(dict.fromkeys(candidate or "" for candidate in candidates))
+
+
+def is_plugin_generation_compatible(
+    plugin_info: object,
+    package_generation: str | None,
+    *,
+    current_generation: str | None,
+) -> bool:
+    """
+    按当前代际、兼容代际和基础索引规则判断一个市场条目。
+
+    只回答代际问题。无全局解释器锁运行时兼容性由
+    :func:`check_plugin_runtime_compatibility` 单独判断并标注给前端，
+    不在这里把条目从目录里剔除——用户需要看到插件和不可用的原因，
+    而不是插件凭空消失。
+    """
+    if not isinstance(plugin_info, Mapping):
+        return False
+    if not current_generation:
+        return not package_generation
+    if plugin_info.get(current_generation) is False:
+        return False
+    if package_generation == current_generation:
+        return True
+    if package_generation in PLUGIN_GENERATION_COMPATIBILITY.get(
+        current_generation, ()
+    ):
+        return plugin_info.get(current_generation) is not False
+    if package_generation:
+        return False
+    if plugin_info.get(current_generation) is True:
+        return True
+    return any(
+        plugin_info.get(generation) is True
+        for generation in PLUGIN_GENERATION_COMPATIBILITY.get(
+            current_generation, ()
+        )
+    )
+
+
+def check_plugin_runtime_compatibility(
+    plugin_info: object,
+    *,
+    free_threaded: bool,
+) -> tuple[bool, str]:
+    """
+    检查插件声明与当前解释器运行时是否兼容，返回兼容状态和用户可读原因。
+
+    公开可调用：市场标注、安装准入和运行目录加载共用这一条判据，避免三处各写一份
+    规则后出现"市场说能装、准入放行、加载又跳过"的分裂。当前只有 free-threaded
+    一个维度，未声明该字段的插件一律保持兼容。
+
+    :param plugin_info: 插件 package 条目
+    :param free_threaded: 当前是否运行在 free-threaded 解释器上
+    """
+    if not isinstance(plugin_info, Mapping):
+        return True, ""
+    if free_threaded and plugin_info.get(PLUGIN_FREE_THREADED_FIELD) is False:
+        return False, (
+            "插件声明不支持 free-threaded 运行时（v3t），"
+            "请改用同版本标准 V3 镜像安装"
+        )
+    return True, ""
+
+
+def check_plugin_system_version(
+    plugin_info: object,
+    *,
+    current_version: str,
+) -> tuple[bool, str]:
+    """
+    检查插件声明的 MoviePilot PEP 440 版本范围。
+    """
+    if not isinstance(plugin_info, Mapping):
+        return True, ""
+    raw_specifier = plugin_info.get(PLUGIN_SYSTEM_VERSION_FIELD)
+    if raw_specifier is None or raw_specifier == "":
+        return True, ""
+    if not isinstance(raw_specifier, str):
+        return False, (
+            f"插件限定的系统版本范围 {PLUGIN_SYSTEM_VERSION_FIELD} 必须是字符串，"
+            f"请使用 PEP 440 版本范围格式，例如 >=2.12.0,<3"
+        )
+    try:
+        system_version = Version(current_version)
+    except InvalidVersion:
+        return False, (
+            f"当前 MoviePilot 版本 {current_version} 无法解析，"
+            f"已拒绝安装带版本限制的插件"
+        )
+    try:
+        specifier_set = SpecifierSet(raw_specifier)
+    except InvalidSpecifier:
+        return False, (
+            f"插件限定的系统版本范围格式不正确：{raw_specifier}，"
+            f"请使用 PEP 440 版本范围格式，例如 >=2.12.0,<3"
+        )
+    if specifier_set.contains(system_version, prereleases=True):
+        return True, ""
+    return False, (
+        f"插件要求 MoviePilot 版本 {raw_specifier}，当前版本 {current_version} 不满足，"
+        f"已拒绝安装"
+    )
+
+
+def build_plugin_release_install_plan(
+    *,
+    plugin_id: str,
+    metadata: Mapping[str, Any],
+    release_version: str | None,
+    release_items: Sequence[Mapping[str, Any]],
+    current_version: str,
+) -> tuple[PluginReleaseInstallPlan | None, str]:
+    """
+    统一选择指定 Release、可回退当前 Release 或文件列表安装模式。
+    """
+    is_release = metadata.get("release")
+    plugin_version = metadata.get("version")
+    if release_version:
+        if not is_release:
+            return None, f"{plugin_id} 未声明 Release 安装，无法安装指定版本"
+        selected_release = next((item for item in release_items if item.get("version") == release_version), None)
+        if selected_release is None:
+            return None, f"{plugin_id} 未找到可安装的 Release 版本：{release_version}"
+        compatible, message = check_plugin_system_version(
+            metadata if release_version == plugin_version else selected_release,
+            current_version=current_version,
+        )
+        if not compatible:
+            return None, message
+        return PluginReleaseInstallPlan(
+            release_tag=f"{plugin_id}_v{release_version}",
+            fallback_to_filelist=False,
+        ), ""
+    compatible, message = check_plugin_system_version(
+        metadata,
+        current_version=current_version,
+    )
+    if not compatible:
+        return None, message
+    if not is_release:
+        return PluginReleaseInstallPlan(None, False), ""
+    if not plugin_version:
+        return None, (
+            f"未在插件清单中找到 {plugin_id} 的版本号，无法进行 Release 安装"
+        )
+    return PluginReleaseInstallPlan(
+        release_tag=f"{plugin_id}_v{plugin_version}",
+        fallback_to_filelist=True,
+    ), ""

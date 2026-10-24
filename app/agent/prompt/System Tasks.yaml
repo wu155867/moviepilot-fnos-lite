@@ -1,0 +1,131 @@
+version: 2
+shared_rules:
+  - This is a background system task, NOT a user conversation.
+  - Your final response will be consumed by the system. Keep it concise and task-focused.
+  - Do NOT include greetings, explanations, or conversational text.
+  - Follow the configured output language policy from the Agent system prompt.
+task_types:
+  heartbeat:
+    header: "[System Heartbeat]"
+    objective: "Check all jobs in your jobs directory and process pending tasks."
+    steps_title: "Follow these steps"
+    steps:
+      - "List all jobs with status 'pending' or 'in_progress'."
+      - "For 'recurring' jobs, check 'last_run' to determine if it's time to run again."
+      - "For 'once' jobs with status 'pending', execute them now."
+      - "After executing each job, update its status, 'last_run' time, and execution log in the JOB.md file."
+      - "If any job was executed, use the `send_message` tool to send a concise execution report to the user through configured notification channels."
+    empty_result: "If no jobs were executed, output nothing."
+    task_rules:
+      - "After sending the execution report with `send_message`, do not repeat the report in your final response."
+      - "Your final response for heartbeat must be empty; reporting is handled only through the `send_message` tool."
+  health_check:
+    header: "[System Health Check]"
+    objective: "Verify that the agent execution pipeline is alive."
+    steps_title: "Follow these steps"
+    steps:
+      - "Verify that runtime config, tools, and jobs can all be accessed normally."
+      - "If a real issue is detected, report the failing subsystem and the immediate blocking reason."
+    empty_result: "If there is nothing meaningful to report, output OK only."
+  transfer_failed_retry:
+    header: "[System Task - Transfer Failed Retry]"
+    objective: "Analyze and correct the failed transfer using the `transfer-failed-retry` skill."
+    context_title: "Task context"
+    context_lines:
+      - "Failed transfer history record IDs: {history_ids_csv}"
+      - "Total failed records: {history_count}"
+    steps_title: "Required workflow"
+    steps:
+      - "Read the exact record with `transfer.history`, verify source availability, and analyze the failure before any write."
+      - "Verify the media identity and season/episode with `media.recognize`, `media.search`, `media.detail`, or `media.seasons`; do not blindly reuse the failed recognition."
+      - "Use `transfer.history.replan` following the skill's durable workflow. Never delete a durable history, task, target, or retry evidence to bypass recovery checks. If task ownership is unknown, treat it as durable."
+      - "Stop for missing sources, storage/permission/configuration failures, manual review, uncertain effects, exhausted budget, or uncertain media identity. Report the blocker."
+  batch_transfer_failed_retry:
+    header: "[System Task - Batch Transfer Failed Retry]"
+    objective: "Analyze failed records using the `transfer-failed-retry` skill; group only records with a verified shared media identity."
+    context_title: "Task context"
+    context_lines:
+      - "Failed transfer history record IDs: {history_ids_csv}"
+      - "Total failed records: {history_count}"
+    steps_title: "Required workflow"
+    steps:
+      - "Read the exact records and verify source availability and failure context before any write."
+      - "Identify each verified group once, but verify each file's season/episode independently. Same directory alone does not prove a shared identity."
+      - "Use `transfer.history.replan` following the skill's durable workflow for each record. Never delete durable tasks, history, targets, or retry evidence."
+      - "Report accepted replans separately from completed transfers and blocked records."
+  manual_transfer_redo:
+    header: "[System Task - AI Transfer Re-Organize]"
+    objective: "Analyze and safely repair this transfer history using the `transfer-failed-retry` skill."
+    context_title: "Transfer history record"
+    context_lines:
+      - "- History ID: {history_id}"
+      - "- Durable task: {durable_task_id}"
+      - "- Settlement revision: {settlement_revision}"
+      - "- Current status: {current_status}"
+      - "- Current recognized title: {recognized_title}"
+      - "- Media type: {media_type}"
+      - "- Category: {category}"
+      - "- Year: {year}"
+      - "- Season/Episode: {season_episode}"
+      - "- Source path: {source_path}"
+      - "- Source storage: {source_storage}"
+      - "- Destination path: {destination_path}"
+      - "- Destination storage: {destination_storage}"
+      - "- Transfer mode: {transfer_mode}"
+      - "- Current media source: {media_source}"
+      - "- Current source-native ID: {media_id}"
+      - "- Music entity type: {music_type}"
+      - "- Expected album tracks: {total_tracks}"
+      - "- Error message: {error_message}"
+    steps_title: "Required workflow"
+    steps:
+      - "Inspect the exact history and verify source availability. Stop for missing files, storage/permission/configuration faults, manual review, uncertain effects, or exhausted retry budget."
+      - "Analyze filename and failure details, then verify the correct source-native identity using `media.recognize` or `media.search`. A wrong recognition must not be retried unchanged."
+      - "For TV, verify the season and episode using filename evidence plus `media.detail` or `media.seasons`; for example Season 2 - 03 means S02E03, not an assumed S01. Stop if ambiguous."
+      - "Preview with `transfer.file` and preview=true using the verified identity, season/episode, and original source, destination and mode. Inspect the preview; do not change persistent recognition rules just to force a match."
+      - "For a durable task, submit the verified correction through `transfer.history.replan` with history_id={history_id}, task_id={durable_task_id}, settlement_revision={settlement_revision}, media_source, media_id, media_type (movie/tv), and optional season/episode. This preserves the same task and evidence and only permits zero-file-effect planning rejections."
+      - "If replan is rejected, stop and report the exact blocker. Never fall back to deletion, ordinary redo, a new non-preview transfer, or target cleanup for a durable task."
+      - "Only when Durable task explicitly says legacy may the skill's legacy history deletion and direct transfer workflow be used. Music artist results are browse-only."
+      - "Report what was verified, the correction submitted, and the exact outcome. Accepted/queued means waiting for background execution, not transfer success."
+    task_rules:
+      - "Use only the supplied record and current tool evidence; do not rely on previous chat context."
+      - "Never delete a durable task, history, target, or retry evidence; never reset its retry budget."
+      - "If the record is already correct, report no change. Keep the final response short."
+  batch_manual_transfer_redo:
+    header: "[System Task - Batch AI Transfer Re-Organize]"
+    objective: "Analyze and safely repair the selected records using the `transfer-failed-retry` skill."
+    context_title: "Selected transfer history records"
+    context_lines:
+      - "- History IDs: {history_ids_csv}"
+      - "- Total records: {history_count}"
+      - "{records_context}"
+    steps_title: "Required workflow"
+    steps:
+      - "Inspect each exact record and verify source availability and failure context. Group only verified shared identities; check each file's season/episode independently."
+      - "Use `media.recognize`, `media.search`, `media.detail`, or `media.seasons` to correct wrong identity/season/episode before retrying. Stop for uncertainty."
+      - "Preview verified corrections with `transfer.file` and preview=true using the original source, destination and mode."
+      - "For durable records, call `transfer.history.replan` with each history_id, original task_id and settlement_revision from the supplied context, and verified movie/tv identity and optional season/episode. Stop on rejection; never delete durable tasks, history, targets, or retry evidence, and never fall back to ordinary retry or a new transfer."
+      - "Only explicitly legacy records may use the skill's confirmed history deletion and direct transfer workflow."
+      - "Skip missing sources, storage/permission/configuration faults, manual review, uncertain effects, and exhausted budgets. Do not reset budgets or alter global recognition rules."
+      - "Report accepted replans, completed transfers, skipped records, and remaining blockers separately. Queued is not completed."
+    task_rules:
+      - "Process each selected record once. Reuse identification only within a verified group."
+      - "Final response must be plain text only: one concise sentence or paragraph in the configured output language describing the aggregate result."
+      - "Do NOT include any title/header, bullet list, numbered list, bold text, code block, table, or other Markdown formatting."
+  search_recommend:
+    header: "[System Task - Search Results Recommendation]"
+    objective: "Analyze the provided search results and select the best matching items based on user preferences."
+    context_title: "Task context"
+    context_lines:
+      - "{search_results}"
+    steps_title: "Follow these steps"
+    steps:
+      - "Review all search result items carefully."
+      - "Evaluate each item based on the user preference criteria."
+      - "Select the top items that best match the preferences."
+      - "Return ONLY a JSON array of item indices."
+    task_rules:
+      - "Return ONLY a JSON array of index numbers, e.g., [0, 3, 1]."
+      - "Do NOT include any explanations, markdown formatting, conversational text, or other content."
+      - "Do NOT call any tools. Simply analyze and return the JSON result directly."
+      - "Respond in JSON format only."

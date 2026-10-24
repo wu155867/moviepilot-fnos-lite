@@ -1,0 +1,562 @@
+"""
+模块生命周期、配置化服务实例和消息路由的公共基类。
+"""
+
+import threading
+from abc import ABCMeta, abstractmethod
+from pathlib import Path
+from typing import Any, Callable, Dict, Generic, Mapping, Optional, Protocol, Tuple, Type, TypeVar, Union
+
+from app.runtime.extensions.service import ServiceConfigHelper
+from app.runtime.log import logger
+from app.runtime.reload import ConfigReloadMixin
+from app.schemas.message import Message
+from app.schemas.system import DownloaderConf, MediaServerConf, NotificationConf
+from app.schemas.types import (
+    DownloaderType,
+    MediaRecognizeType,
+    MediaServerType,
+    ModuleType,
+    NotificationChannel,
+    OtherModulesType,
+    StorageSchema,
+    SystemConfigKey,
+)
+
+
+class _ModuleBase(ConfigReloadMixin, metaclass=ABCMeta):
+    """
+    模块调用与生命周期的公共约定。
+
+    链路调用返回 None 表示本模块未处理，由调度方继续尝试后续模块。
+    输入与输出结构相同或没有返回值的能力，可由多个模块依次执行。
+    """
+
+    # 宿主模块的配置事件由统一适配器协调，避免同一配置版本被重复重载。
+    CONFIG_RELOAD_MANAGED_EXTERNALLY = True
+
+    def __init__(self) -> None:
+        """
+        初始化模块生命周期锁。
+        """
+        super().__init__()
+        self._reload_lock = threading.RLock()
+
+    def on_config_changed(self) -> None:
+        """
+        串行停止旧资源并按最新配置重新初始化模块。
+        """
+        with self._reload_lock:
+            try:
+                self.stop()
+            except Exception as err:
+                logger.error(
+                    f"停止 {self.get_reload_name()} 旧资源失败，继续按最新配置初始化：{err}"
+                )
+            self.init_module()
+
+    def get_reload_name(self) -> Optional[str]:
+        """
+        返回模块声明的日志名称，未实现元数据方法时保留 None。
+        """
+        return self.get_name()
+
+    @abstractmethod
+    def init_module(self) -> None:
+        """
+        模块初始化。
+        """
+        pass
+
+    @abstractmethod
+    def init_setting(self) -> Optional[Tuple[str, Union[str, bool]]]:
+        """
+        声明决定模块是否启用的配置项。
+
+        配置值为 True 时按设置是否有值判断启用；多个选择值可使用逗号分隔。
+
+        :return: 配置键与匹配值；返回 None 表示没有独立开关
+        """
+        pass
+
+    @staticmethod
+    def get_name() -> Optional[str]:
+        """
+        获取模块名称。
+        """
+        pass
+
+    @staticmethod
+    def get_type() -> Optional[ModuleType]:
+        """
+        获取模块类型。
+        """
+        pass
+
+    @staticmethod
+    def get_subtype() -> Union[
+        DownloaderType,
+        MediaServerType,
+        NotificationChannel,
+        StorageSchema,
+        OtherModulesType,
+        MediaRecognizeType,
+        None,
+    ]:
+        """
+        获取模块子类型（下载器、媒体服务器、消息通道、存储类型、其他杂项模块类型）。
+        """
+        pass
+
+    @staticmethod
+    def get_priority() -> Optional[int]:
+        """
+        获取模块优先级，数字越小优先级越高，只有同一接口下优先级才生效。
+        """
+        pass
+
+    @abstractmethod
+    def stop(self) -> Optional[bool]:
+        """
+        释放模块持有的服务与后台资源。
+
+        :return: False 表示资源尚未停止；None 或 True 表示本次停止完成
+        """
+        pass
+
+    @abstractmethod
+    def test(self) -> Optional[Tuple[bool, str]]:
+        """
+        检查模块配置或外部服务是否可用。
+
+        :return: 是否通过及失败说明；模块未启用或不提供检查时返回 None
+        """
+        pass
+
+
+class _ServiceConfig(Protocol):
+    """
+    服务配置提供的名称与构造参数；保留现有模型允许的空配置。
+    """
+
+    @property
+    def name(self) -> Optional[str]:
+        """
+        读取服务配置的名称。
+
+        :return: 配置名称；尚未命名时返回 None
+        """
+        ...
+
+    @property
+    def config(self) -> Optional[Mapping[str, object]]:
+        """
+        读取服务构造参数。
+
+        :return: 原始参数映射；空配置仍返回 None，由实例化入口报告错误
+        """
+        ...
+
+
+# 定义泛型，用于表示具体的服务类型和配置类型
+TService = TypeVar("TService", bound=object)
+TConf = TypeVar("TConf", bound=_ServiceConfig)
+
+
+class ServiceBase(Generic[TService, TConf], metaclass=ABCMeta):
+    """
+    抽象服务基类，负责服务的初始化、获取实例和配置管理。
+    """
+
+    def __init__(self) -> None:
+        """
+        建立尚未绑定服务类型的配置和实例容器。
+        """
+        self._configs: Optional[Dict[Optional[str], TConf]] = None
+        self._instances: Optional[Dict[Optional[str], TService]] = None
+        self._service_name: Optional[str] = None
+
+    def init_service(self, service_name: str,
+                     service_type: Optional[Union[Type[TService], Callable[..., TService]]] = None) -> None:
+        """
+        按服务类型读取配置并创建实例。
+
+        传入类时按配置展开关键字参数；传入工厂时把整个配置对象作为参数。
+        重新初始化会替换本对象的实例映射，旧资源应由调用方提前停止。
+
+        :param service_name: 匹配配置中 type 的服务类型名称，不接受空值
+        :param service_type: 服务类或接收配置对象的工厂；为空时只读取配置
+        :raises Exception: 服务名称为空
+        :raises TypeError: 通过类构造服务时配置参数为空
+        """
+        if not service_name:
+            raise Exception("service_name is null")
+        self._service_name = service_name
+        configs = self.get_configs()
+        if configs is None:
+            return
+        self._configs = configs
+        self._instances = {}
+        if not service_type:
+            return
+        for conf in self._configs.values():
+            # 通过服务类型或工厂函数来创建实例
+            if isinstance(service_type, type):
+                # 如果传入的是类类型，调用构造函数实例化
+                self._instances[conf.name] = service_type(
+                    **self._service_kwargs(conf)
+                )
+            else:
+                # 如果传入的是工厂函数，直接调用工厂函数
+                self._instances[conf.name] = service_type(conf)
+
+    def _service_kwargs(self, conf: TConf) -> Dict[str, Any]:
+        """
+        构建类服务实例参数，允许具体模块传递稳定配置身份。
+        """
+        name = conf.name
+        config = conf.config
+        if config is None:
+            # 保留原字典解包对空配置的 TypeError，不能静默实例化默认连接。
+            raise TypeError("'NoneType' object is not a mapping")
+        return {"name": name, **config}
+
+    def get_instances(self) -> Dict[Optional[str], TService]:
+        """
+        读取已创建的服务实例。
+
+        :return: 按配置名称索引的实例映射；尚未初始化或没有实例时返回空字典
+        """
+        return self._instances or {}
+
+    def get_instance(self, name: Optional[str] = None) -> Optional[TService]:
+        """
+        获取指定名称的服务实例。
+
+        :param name: 实例名称，可选。如果为 None，则返回默认实例
+        :return: 返回符合条件的服务实例，若不存在则返回 None
+        """
+        if not self._instances:
+            return None
+        if name:
+            return self._instances.get(name)
+        name = self.get_default_config_name()
+        return self._instances.get(name) if name else None
+
+    @abstractmethod
+    def get_configs(self) -> Dict[Optional[str], TConf]:
+        """
+        获取已启用的服务配置字典。
+
+        :return: 返回配置字典
+        """
+        pass
+
+    def get_config(self, name: Optional[str] = None) -> Optional[TConf]:
+        """
+        获取指定名称的服务配置。
+
+        :param name: 配置名称，可选。如果为 None，则返回默认服务配置
+        :return: 返回符合条件的配置，若不存在则返回 None
+        """
+        if not self._configs:
+            return None
+        if name:
+            return self._configs.get(name)
+        name = self.get_default_config_name()
+        return self._configs.get(name) if name else None
+
+    def get_default_config_name(self) -> Optional[str]:
+        """
+        获取默认服务配置的名称。
+
+        优先返回被显式标记为默认的配置。只有在没有任何配置带标记时，才退回到第一个配置——
+        配置的先后来自读取顺序，用户既看不见也控制不了，删掉一个配置会让「默认」静默改指
+        另一个，因此它只能作为无标记时的兜底，不能盖过用户的显式选择。
+
+        :return: 默认配置的名称，无配置时为 None
+        """
+        configs = self._configs
+        if configs is None:
+            return None
+        marked = next(
+            (conf for conf in configs.values() if getattr(conf, "default", False)),
+            None,
+        )
+        if marked:
+            return marked.name
+        first_conf = next(iter(configs.values()), None)
+        return first_conf.name if first_conf else None
+
+
+class _MessageBase(ServiceBase[TService, NotificationConf]):
+    """
+    消息基类。
+    """
+    CONFIG_WATCH = {SystemConfigKey.Notifications.value}
+    # 当前用户个人信息中允许用于定向投递的渠道绑定键。
+    _notification_user_target_keys: tuple[str, ...] = ()
+    # 管理员未绑定个人 ID 时可作为管理员默认目标的渠道配置键。
+    _notification_admin_default_config_keys: tuple[str, ...] = ()
+
+    def __init__(self) -> None:
+        """
+        初始化消息基类，并设置消息通道。
+        """
+        super().__init__()
+        self._channel: Optional[NotificationChannel] = None
+
+    def get_configs(self) -> Dict[Optional[str], NotificationConf]:
+        """
+        获取已启用的消息通知渠道的配置字典。
+
+        :return: 返回消息通知的配置字典
+        """
+        configs = ServiceConfigHelper.get_notification_configs()
+        if not self._service_name:
+            return {}
+        return {conf.name: conf for conf in configs if conf.type == self._service_name and conf.enabled}
+
+    def check_message(self, message: Message, source: Optional[str] = None) -> bool:
+        """
+        检查消息渠道及消息类型，判断是否处理消息。
+
+        :param message: 要检查的通知消息
+        :param source: 消息来源，可选
+        :return: 返回布尔值，表示是否处理该消息
+        """
+        # 检查消息渠道
+        if message.channel and message.channel != self._channel:
+            return False
+        # 检查消息来源
+        if message.source and message.source != source:
+            return False
+        route_scope = message.notification_route_scope
+        if route_scope == "user":
+            if not self._has_notification_target(message):
+                return False
+        elif route_scope == "admin":
+            if not self._has_notification_target(message):
+                config = self.get_config(source)
+                if not self._has_admin_default(config):
+                    return False
+        # 没有类型且没有显式目标时不得进入渠道的默认广播路径。
+        if route_scope is None and not message.userid and not message.mtype:
+            return bool(message.targets)
+        # 不是定向发送时，检查消息类型开关
+        if not message.userid and message.mtype:
+            conf = self.get_config(source)
+            if conf:
+                switchs = conf.switchs or []
+                if message.mtype.value not in switchs:
+                    return False
+        return True
+
+    def _has_notification_target(self, message: Message) -> bool:
+        """
+        判断消息是否包含当前渠道允许使用的明确用户目标。
+        """
+        if message.userid:
+            return True
+        targets = message.targets or {}
+        return any(
+            str(targets.get(key) or "").strip()
+            for key in self._notification_user_target_keys
+        )
+
+    def get_notification_targets(self, message: Message) -> Optional[dict[str, Any]]:
+        """
+        返回渠道可用的通知目标，管理员范围缺少个人目标时启用渠道默认目标。
+
+        :param message: 已确定路由范围和用户绑定目标的通知
+        :return: 渠道目标映射；管理员范围没有个人目标时返回 None，允许使用渠道默认目标
+        """
+        if (
+            message.notification_route_scope == "admin"
+            and not self._has_notification_target(message)
+        ):
+            return None
+        return message.targets
+
+    def get_notification_userid(
+        self,
+        message: Message,
+        *target_keys: str,
+    ) -> Optional[str]:
+        """
+        按消息路由范围解析当前渠道的用户 ID，缺少时返回 None 以使用渠道默认目标。
+
+        :param message: 带显式用户标识或渠道目标映射的通知
+        :param target_keys: 按优先级查找的渠道绑定键
+        :return: 首个有效用户标识；未找到时返回 None
+        """
+        if message.userid:
+            return str(message.userid)
+        targets = self.get_notification_targets(message) or {}
+        for key in target_keys:
+            value = str(targets.get(key) or "").strip()
+            if value:
+                return value
+        return None
+
+    def _has_admin_default(self, config: Optional[NotificationConf]) -> bool:
+        """
+        判断渠道配置是否维护了可供管理员范围使用的默认目标。
+        """
+        if not config:
+            return False
+        values = config.config or {}
+        return any(
+            str(values.get(key) or "").strip()
+            for key in self._notification_admin_default_config_keys
+        )
+
+
+class _DownloaderBase(ServiceBase[TService, DownloaderConf]):
+    """
+    下载器基类。
+    """
+    CONFIG_WATCH = {SystemConfigKey.Downloaders.value}
+
+    def __init__(self) -> None:
+        """
+        初始化下载器基类。
+        """
+        super().__init__()
+        self._default_config_name: Optional[str] = None
+
+    def init_service(self, service_name: str,
+                     service_type: Optional[Union[Type[TService], Callable[..., TService]]] = None) -> None:
+        """
+        初始化服务，获取配置并实例化对应服务。
+
+        :param service_name: 服务名称，作为配置匹配的依据
+        :param service_type: 服务的类型，可以是类类型（Type[TService]）、工厂函数（Callable）或 None 来跳过实例化
+        """
+        # 重置默认配置名称
+        self.reset_default_config_name()
+        # 初始化服务
+        super().init_service(service_name, service_type)
+
+    def get_default_config_name(self) -> Optional[str]:
+        """
+        获取默认服务配置的名称。
+
+        :return: 优先从所有下载器中查找配置了默认的下载器，如果没有配置，则获取第一个下载器名称
+        """
+        # 优先查找默认配置
+        if self._default_config_name:
+            return self._default_config_name
+
+        configs = ServiceConfigHelper.get_downloader_configs()
+        for conf in configs:
+            if conf.default:
+                self._default_config_name = conf.name
+                return self._default_config_name
+        # 如果没有默认配置，返回第一个配置的名称
+        first_conf = next(iter(configs), None)
+        self._default_config_name = first_conf.name if first_conf else None
+        return self._default_config_name
+
+    def get_configs(self) -> Dict[Optional[str], DownloaderConf]:
+        """
+        获取已启用的下载器的配置字典。
+
+        :return: 返回下载器配置字典
+        """
+        configs = ServiceConfigHelper.get_downloader_configs()
+        if not self._service_name:
+            return {}
+        return {conf.name: conf for conf in configs if conf.type == self._service_name and conf.enabled}
+
+    def reset_default_config_name(self) -> None:
+        """
+        重置默认配置名称。
+        """
+        self._default_config_name = None
+
+    @staticmethod
+    def __replace_path_prefix(path: Union[Path, str], source: str, target: str) -> Optional[str]:
+        """
+        按完整路径段替换路径前缀，避免 /media 误匹配 /media2 这类相邻目录。
+        """
+        if not source or not source.strip() or not target or not target.strip():
+            return None
+
+        path_text = Path(path).as_posix()
+        source_path = Path(source.strip()).as_posix()
+        target_path = Path(target.strip()).as_posix()
+        if path_text == source_path:
+            return target_path
+
+        source_prefix = f"{source_path.rstrip('/')}/"
+        if path_text.startswith(source_prefix):
+            suffix = path_text[len(source_prefix):]
+            return (Path(target_path) / suffix).as_posix()
+        return None
+
+    @staticmethod
+    def __strip_storage_prefix(path: str) -> str:
+        """
+        去掉存储协议前缀，下载器无法识别本地存储协议。
+        """
+        for s in StorageSchema:
+            prefix = f"{s.value}:"
+            if path.startswith(prefix):
+                return path[len(prefix):]
+        return path
+
+    def normalize_path(self, path: Path, downloader: Optional[str]) -> str:
+        """
+        根据下载器配置和路径映射，规范化下载路径。
+
+        :param path: 存储路径
+        :param downloader: 下载器名称
+        :return: 规范化后发送给下载器的路径
+        """
+        normalized_path = path.as_posix()
+        conf = self.get_config(downloader)
+        if conf and conf.path_mapping:
+            for (storage_path, download_path) in conf.path_mapping:
+                mapped_path = self.__replace_path_prefix(normalized_path, storage_path, download_path)
+                if mapped_path:
+                    normalized_path = mapped_path
+                    break
+        return self.__strip_storage_prefix(normalized_path)
+
+    def normalize_return_path(self, path: Path, downloader: Optional[str]) -> str:
+        """
+        将下载器路径反向映射为存储 URI，远程前缀用于选择实际文件访问接口。
+
+        :param path: 下载器返回的路径
+        :param downloader: 下载器名称
+        :return: 本地路径或带存储前缀的远程 URI；不能对远程 URI 调用本地文件接口
+        """
+        normalized_path = path.as_posix()
+        conf = self.get_config(downloader)
+        if conf and conf.path_mapping:
+            for (storage_path, download_path) in conf.path_mapping:
+                mapped_path = self.__replace_path_prefix(normalized_path, download_path, storage_path)
+                if mapped_path:
+                    normalized_path = mapped_path
+                    break
+        # 下发下载器时才移除远程前缀；返回时必须保留，否则整理会误查本地同名路径。
+        return normalized_path.removeprefix("local:")
+
+
+class _MediaServerBase(ServiceBase[TService, MediaServerConf]):
+    """
+    媒体服务器基类。
+    """
+    CONFIG_WATCH = {SystemConfigKey.MediaServers.value}
+
+    def get_configs(self) -> Dict[Optional[str], MediaServerConf]:
+        """
+        获取已启用的媒体服务器的配置字典。
+
+        :return: 返回媒体服务器配置字典
+        """
+        configs = ServiceConfigHelper.get_mediaserver_configs()
+        if not self._service_name:
+            return {}
+        return {conf.name: conf for conf in configs if conf.type == self._service_name and conf.enabled}

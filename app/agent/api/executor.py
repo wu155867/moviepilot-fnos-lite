@@ -1,0 +1,272 @@
+"""
+通过固定宿主 API 路由执行 Agent 业务操作。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Mapping
+from urllib.parse import quote
+
+from app.adapters.network.http import AsyncHttpRequestError, AsyncRequestUtils
+from app.agent.policy.api import (
+    API_UNBOUND_READ_OPERATIONS,
+    ApiOperationRoute,
+    resolve_api_operation,
+    resolve_api_route,
+)
+from app.agent.policy.contracts import ActionEffect
+from app.agent.policy.sanitizer import stable_type_name
+from app.application.security.token import create_access_token
+from app.runtime.log import logger
+from app.runtime.priority import PRIORITY_HEADER, interactive_key
+from app.runtime.settings import get_runtime_setting
+
+_DEFAULT_API_REQUEST_TIMEOUT_SECONDS = 30
+_SEARCH_TORRENTS_REQUEST_TIMEOUT_SECONDS = 290
+
+
+class ApiExecutionError(RuntimeError):
+    """
+    固定 API 路由无法构造或请求失败。
+    """
+
+    def __init__(self, message: str, *, external_may_continue: bool = False) -> None:
+        """
+        区分调用前拒绝和请求发出后无法确认的外部副作用。
+        """
+        super().__init__(message)
+        self.external_may_continue = external_may_continue
+
+
+@dataclass(frozen=True)
+class ApiExecutionContext:
+    """
+    API 请求使用的 Agent 身份和会话上下文。
+
+    :param user_id: 可信入口解析的调用用户标识
+    :param username: 用于签发 API 身份的用户名；未提供时为 None
+    :param is_admin: 调用身份是否具有管理员权限
+    :param session_id: 关联的 Agent 会话标识；无会话时为 None
+    :param channel: 调用所属消息渠道；直接 API 调用可为 None
+    :param source: 渠道内的消息来源标识；没有来源时为 None
+    :param public_read_only: 是否仅允许使用宿主身份查询公共资料；不能复用于其他操作
+    """
+
+    user_id: str
+    username: str | None
+    is_admin: bool
+    session_id: str | None = None
+    channel: str | None = None
+    source: str | None = None
+    public_read_only: bool = False
+
+
+class MoviePilotApiExecutor:
+    """
+    把 operation ID 转换为受控的 MoviePilot REST API 请求。
+    """
+
+    _ALLOWED_SOURCES = frozenset({"tmdb", "douban", "bangumi", "anilist"})
+    _ALLOWED_DOWNLOAD_ACTIONS = frozenset({"start", "stop"})
+    _COLLECTION_HEADERS = {
+        "x-result-count": "result_count",
+        "x-total-count": "total_count",
+        "x-page": "page",
+        "x-page-size": "count",
+    }
+
+    def __init__(
+        self,
+        *,
+        context: ApiExecutionContext,
+        request_factory: type[AsyncRequestUtils] = AsyncRequestUtils,
+    ) -> None:
+        """
+        绑定调用身份和 HTTP 传输工厂。
+        """
+        self._context = context
+        self._request_factory = request_factory
+
+    @staticmethod
+    def _resolve_base_url() -> str:
+        """
+        按后端监听地址直连本机 API，不依赖对外域名和反向代理。
+        """
+        host = str(get_runtime_setting("HOST", "127.0.0.1") or "127.0.0.1").strip("[]")
+        # 通配监听地址按相同地址族回环，兼容只监听 IPv6 的部署。
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        if ":" in host:
+            host = f"[{host}]"
+        port = int(get_runtime_setting("PORT", 3001))
+        return f"http://{host}:{port}"
+
+    @classmethod
+    def _render_path(
+        cls,
+        route: ApiOperationRoute,
+        path_params: Mapping[str, Any],
+    ) -> str:
+        """
+        替换固定路由占位符并校验具有枚举约束的路径参数。
+        """
+        rendered = route.path
+        required = []
+        cursor = 0
+        while True:
+            start = rendered.find("{", cursor)
+            if start < 0:
+                break
+            end = rendered.find("}", start)
+            if end < 0:
+                raise ApiExecutionError("API 路由占位符格式无效")
+            required.append(rendered[start + 1 : end])
+            cursor = end + 1
+        for name in required:
+            value = path_params.get(name)
+            if value in (None, ""):
+                raise ApiExecutionError(f"缺少 API 路径参数: {name}")
+            if name == "source" and str(value).lower() not in cls._ALLOWED_SOURCES:
+                raise ApiExecutionError("媒体来源不在 API 白名单内")
+            if name == "action" and str(value).lower() not in cls._ALLOWED_DOWNLOAD_ACTIONS:
+                raise ApiExecutionError("下载动作不在 API 白名单内")
+            rendered = rendered.replace("{" + name + "}", quote(str(value), safe=""))
+        return rendered
+
+    def _build_headers(self) -> dict[str, str]:
+        """
+        构造宿主令牌和请求上下文头，并确保头值符合 ASCII 约束。
+        """
+        user_id = str(self._context.user_id or "")
+        if not user_id.isdigit():
+            raise ApiExecutionError("当前 Agent 身份没有可用于 API 鉴权的用户 ID")
+        token = create_access_token(
+            userid=int(user_id),
+            username=self._context.username or user_id,
+            super_user=self._context.is_admin,
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        if self._context.session_id:
+            headers["X-MoviePilot-Agent-Session"] = self._context.session_id
+        if self._context.channel:
+            # 渠道值来自通知渠道枚举，也可能来自插件扩展；统一 URL 编码可兼容两者。
+            headers["X-MoviePilot-Agent-Channel"] = quote(self._context.channel, safe="")
+        if self._context.source:
+            headers["X-MoviePilot-Agent-Source"] = quote(self._context.source, safe="")
+        execution_key = interactive_key()
+        if execution_key:
+            headers[PRIORITY_HEADER] = execution_key
+        return headers
+
+    @classmethod
+    def _attach_collection_metadata(
+        cls,
+        payload: Any,
+        headers: Mapping[str, Any],
+    ) -> Any:
+        """
+        把 REST 数量响应头投影为 Agent 可直接读取的附加集合元数据。
+        """
+        if not isinstance(payload, Mapping):
+            return payload
+        normalized_headers = {
+            str(name).lower(): value
+            for name, value in headers.items()
+        }
+        collection = {}
+        for header_name, field_name in cls._COLLECTION_HEADERS.items():
+            raw_value = normalized_headers.get(header_name)
+            if raw_value is None:
+                continue
+            try:
+                collection[field_name] = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+        if not collection:
+            return payload
+        # 集合数据可能触发通用工具结果截断；把元数据放在 data 前面，确保预览仍保留精确总数。
+        result = {"collection": collection}
+        for key, value in payload.items():
+            if key != "collection":
+                result[key] = value
+        return result
+
+    async def execute(
+        self,
+        operation_id: str,
+        *,
+        path_params: Mapping[str, Any] | None = None,
+        query: Mapping[str, Any] | None = None,
+        body: Any = None,
+    ) -> str:
+        """
+        执行白名单 operation，并把响应转换为稳定 JSON 文本。
+        """
+        if self._context.public_read_only and operation_id not in API_UNBOUND_READ_OPERATIONS:
+            raise ApiExecutionError("公共查询执行器不允许访问个人数据或执行其他操作")
+        route = resolve_api_route(operation_id)
+        if route is None:
+            raise ApiExecutionError(f"未注册 API 路由: {operation_id}")
+        path = self._render_path(route, path_params or {})
+        url = f"{self._resolve_base_url()}{path}"
+        query_data = dict(query or {})
+        body_data = dict(body) if isinstance(body, Mapping) else body
+        if route.method == "GET" and body_data is not None:
+            if not isinstance(body_data, Mapping):
+                raise ApiExecutionError("GET operation 的 body 必须是 JSON 对象")
+            query_data.update(body_data)
+            body_data = None
+        request_timeout = (
+            _SEARCH_TORRENTS_REQUEST_TIMEOUT_SECONDS
+            if operation_id == "search.torrents"
+            else _DEFAULT_API_REQUEST_TIMEOUT_SECONDS
+        )
+        request = self._request_factory(
+            headers=self._build_headers(),
+            timeout=request_timeout,
+            verify=False,
+            trust_env=False,
+        )
+        spec = resolve_api_operation(operation_id)
+        may_change_state = spec is None or spec.effect not in {ActionEffect.SAFE_READ, ActionEffect.SENSITIVE_READ}
+        status_code: int | None = None
+        try:
+            response = await request.request(
+                method=route.method,
+                url=url,
+                params=query_data or None,
+                json=body_data,
+                raise_exception=True,
+            )
+            if response is None:
+                raise ApiExecutionError("MoviePilot API 没有返回响应", external_may_continue=may_change_state)
+            try:
+                status_code = response.status_code
+                payload = response.json()
+                response_headers = dict(response.headers)
+            finally:
+                await response.aclose()
+        except ApiExecutionError:
+            raise
+        except Exception as error:
+            logger.warning(f"Agent API 请求失败: operation={operation_id} error_type={stable_type_name(error)}")
+            transport_failed = isinstance(error, (AsyncHttpRequestError, ConnectionError, TimeoutError))
+            response_unreadable = status_code is not None and status_code < 400
+            raise ApiExecutionError(
+                f"MoviePilot API 请求失败: {operation_id}",
+                external_may_continue=may_change_state and (transport_failed or response_unreadable),
+            ) from error
+        if status_code >= 400:
+            return json.dumps(
+                {"success": False, "error": "api_error", "status_code": status_code, "data": payload},
+                ensure_ascii=False,
+            )
+        payload = self._attach_collection_metadata(payload, response_headers)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+__all__ = ["ApiExecutionContext", "ApiExecutionError", "MoviePilotApiExecutor"]

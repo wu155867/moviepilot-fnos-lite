@@ -1,0 +1,647 @@
+"""
+统一媒体名称与路径解析入口，协调可选加速器和 Python 回退解析。
+"""
+
+import hashlib
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, List, Mapping, Optional, Tuple
+
+import regex as re
+
+from app.domain.meta.customization import CustomizationMatcher, get_customization
+from app.domain.meta.infopath import (
+    clear_parsed_title_for_parent_merge,
+    should_use_parent_title_for_file_stem,
+)
+from app.domain.meta.metaanime import MetaAnime
+from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metamusic import MetaMusic, infer_audio_lossless, normalize_audio_format
+from app.domain.meta.metavideo import MetaVideo
+from app.domain.meta.releasegroup import ReleaseGroupsMatcher
+from app.domain.meta.runtime import (
+    get_audio_extensions,
+    get_media_extensions,
+    get_metainfo_accelerator,
+)
+from app.domain.meta.words import WordsMatcher, get_custom_words
+from app.schemas.media import normalize_media_source, resolve_media_identity
+from app.schemas.types import MediaSource, MediaType
+
+# 分辨率标签中的 p/i 不是集数或罗马数字证据，不能仅凭后续方括号进入动漫解析。
+_ANIME_BRACKET_RE = re.compile(r'【(?!\d+[PI]】)[+0-9XVPI-]+】\s*【', re.IGNORECASE)
+_ANIME_DASH_EPISODE_RE = re.compile(r'\s+-\s+[\dv]{1,4}\s+', re.IGNORECASE)
+_VIDEO_SEASON_EPISODE_RE = re.compile(
+    r"S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|"
+    r"EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}",
+    re.IGNORECASE,
+)
+_ANIME_SQUARE_BRACKET_RE = re.compile(r'\[(?!\d+[PI]])[+0-9XVPI-]+]\s*\[', re.IGNORECASE)
+
+_BRACED_METAINFO_RE = re.compile(r'(?<={\[)[\W\w]+(?=]})')
+_BRACED_TMDBID_RE = re.compile(r'(?<=tmdbid=)\d+')
+_BRACED_DOUBANID_RE = re.compile(r'(?<=doubanid=)\d+')
+_BRACED_BANGUMIID_RE = re.compile(r'(?<=bangumiid=)\d+')
+_BRACED_ANILISTID_RE = re.compile(r'(?<=anilistid=)\d+')
+_BRACED_TYPE_RE = re.compile(r'(?<=type=)\w+')
+_BRACED_EPISODE_GROUP_RE = re.compile(r'(?:^|;)g=([0-9a-fA-F]+)(?=;|$)')
+_BRACED_BEGIN_SEASON_RE = re.compile(r'(?<=s=)\d+')
+_BRACED_END_SEASON_RE = re.compile(r'(?<=s=\d+-)\d+')
+_BRACED_BEGIN_EPISODE_RE = re.compile(r'(?<=e=)\d+')
+_BRACED_END_EPISODE_RE = re.compile(r'(?<=e=\d+-)\d+')
+_EMBY_TMDB_RE_LIST = (
+    re.compile(r'\[tmdbid[=\-](\d+)\]'),
+    re.compile(r'\[tmdb[=\-](\d+)\]'),
+    re.compile(r'\{tmdbid[=\-](\d+)\}'),
+    re.compile(r'\{tmdb[=\-](\d+)\}'),
+    re.compile(r'\(tmdbid[=\-]\s*(\d+)\s*\)', re.IGNORECASE),
+    re.compile(r'\(tmdb[=\-]\s*(\d+)\s*\)', re.IGNORECASE),
+)
+_PARENTHESIZED_TMDB_RE = re.compile(
+    r'\(tmdb(?:id)?[=\-]\s*\d+\s*\)',
+    re.IGNORECASE,
+)
+_EXTENDED_MEDIA_ID_RE_LIST = {
+    "bangumi": (
+        re.compile(r'\[bangumiid[=\-](\d+)\]'),
+        re.compile(r'\[bangumi[=\-](\d+)\]'),
+        re.compile(r'\{bangumiid[=\-](\d+)\}'),
+        re.compile(r'\{bangumi[=\-](\d+)\}'),
+    ),
+    "anilist": (
+        re.compile(r'\[anilistid[=\-](\d+)\]'),
+        re.compile(r'\[anilist[=\-](\d+)\]'),
+        re.compile(r'\{anilistid[=\-](\d+)\}'),
+        re.compile(r'\{anilist[=\-](\d+)\}'),
+    ),
+}
+_EXTENDED_MEDIA_ID_TAG_RE = re.compile(
+    r'(?:bangumi(?:id)?|anilist(?:id)?)[=\-]\d+',
+    re.IGNORECASE,
+)
+_GENERIC_MEDIA_ID_TAG_RE = re.compile(r'(?:^|[;\[])media_(?:source|id)=', re.IGNORECASE)
+_RUST_PARSE_OPTIONS_CACHE_KEY = "_cache_key"
+logger = logging.getLogger(__name__)
+
+_LEGACY_BRACED_ID_PATTERNS = (
+    (MediaSource.TMDB, _BRACED_TMDBID_RE),
+    (MediaSource.Douban, _BRACED_DOUBANID_RE),
+    (MediaSource.Bangumi, _BRACED_BANGUMIID_RE),
+    (MediaSource.AniList, _BRACED_ANILISTID_RE),
+)
+_LEGACY_ID_KEYS = (
+    (MediaSource.TMDB, "tmdbid"),
+    (MediaSource.Douban, "doubanid"),
+    (MediaSource.Bangumi, "bangumiid"),
+    (MediaSource.AniList, "anilistid"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMetaInput:
+    """
+    Python 回退解析的阶段输入，保留原文与预处理结果之间的明确边界。
+
+    :param original_title: 未经识别词处理的原始标题
+    :param parsed_title: 完成预处理后交给 Python 解析器的标题
+    :param subtitle: 用于补充季集和资源信息的副标题；未提供时为 None
+    :param isfile: 输入是否为文件名或文件路径
+    :param apply_words: 实际应用的识别词记录，保持应用顺序
+    :param explicit_metainfo: 标题中显式声明的媒体身份和剧集组信息
+    """
+
+    original_title: str
+    parsed_title: str
+    subtitle: Optional[str]
+    isfile: bool
+    apply_words: tuple[str, ...]
+    explicit_metainfo: Mapping[str, Any]
+
+
+def _empty_metainfo() -> dict[str, Any]:
+    """
+    返回媒体标签的默认结构，避免不同识别请求之间共享可变状态。
+    """
+    return {
+        'media_source': None,
+        'media_id': None,
+        'type': None,
+        'episode_group': None,
+        'begin_season': None,
+        'end_season': None,
+        'total_season': None,
+        'begin_episode': None,
+        'end_episode': None,
+        'total_episode': None,
+    }
+
+
+def _normalize_metainfo_identity(metainfo: dict[str, Any]) -> dict[str, Any]:
+    """
+    将解析器输出归一为唯一媒体身份，并移除历史来源专用字段。
+
+    Rust扩展或旧缓存仍可能返回专用字段，因此兼容只保留在这一输入边界。
+    """
+    normalized = dict(metainfo or {})
+    media_source, media_id = resolve_media_identity(media=normalized)
+    if not media_source:
+        for source, key in _LEGACY_ID_KEYS:
+            value = normalized.get(key)
+            normalized_id = str(value).strip() if value is not None else ""
+            if normalized_id and normalized_id != "0":
+                media_source, media_id = source, normalized_id
+                break
+    for _, key in _LEGACY_ID_KEYS:
+        normalized.pop(key, None)
+    normalized["media_source"] = media_source
+    normalized["media_id"] = media_id
+    return normalized
+
+
+def _apply_range_total(
+    metainfo: dict[str, Any], begin_key: str, end_key: str, total_key: str
+) -> None:
+    """
+    计算季/集范围总数；保留原有倒序输入自动交换的兼容行为。
+    """
+    if metainfo.get(begin_key) and metainfo.get(end_key):
+        if metainfo[begin_key] > metainfo[end_key]:
+            metainfo[begin_key], metainfo[end_key] = metainfo[end_key], metainfo[begin_key]
+        metainfo[total_key] = metainfo[end_key] - metainfo[begin_key] + 1
+    elif metainfo.get(begin_key) and not metainfo.get(end_key):
+        metainfo[total_key] = 1
+
+
+def _rust_parse_options_cache_key(options: dict[str, Any]) -> str:
+    """
+    生成 Rust Meta 配置缓存键，避免扩展层每次重新展开大配置。
+    """
+    digest = hashlib.blake2b(digest_size=16)
+
+    def update(value: object) -> None:
+        """
+        将选项值及分隔符写入缓存摘要，避免相邻值直接拼接产生歧义。
+        """
+        digest.update(repr(value).encode("utf-8"))
+        digest.update(b"\0")
+
+    streaming_platforms = options.get("streaming_platforms") or {}
+    update(tuple(options.get("custom_words") or []))
+    update(tuple(options.get("media_exts") or []))
+    update(options.get("release_groups") or "")
+    update(tuple(options.get("customization") or []))
+    update(tuple(sorted(
+        (str(key), str(value))
+        for key, value in streaming_platforms.items()
+    )))
+    return digest.hexdigest()
+
+
+def _find_metainfo_python(title: str) -> Tuple[str, dict[str, Any]]:
+    """
+    使用 Python 解析标题中的显式媒体标签，作为 Rust 入口不可用时的兜底。
+    """
+    metainfo = _empty_metainfo()
+    legacy_identities = {}
+    if not title:
+        return title, metainfo
+    # 自定义识别词是面向用户的独立语法，继续使用各数据源专用 ID 字段。
+    results = _BRACED_METAINFO_RE.findall(title)
+    if results:
+        for result in results:
+            legacy_matches = []
+            for source, pattern in _LEGACY_BRACED_ID_PATTERNS:
+                legacy_match = pattern.search(result)
+                if legacy_match:
+                    legacy_matches.append(legacy_match)
+                    normalized_id = legacy_match.group(0)
+                    if normalized_id.isdigit() and normalized_id != "0":
+                        legacy_identities[source] = normalized_id
+            mtype = _BRACED_TYPE_RE.search(result)
+            if mtype:
+                media_type = mtype.group(0)
+                if media_type in ["movie", "movies"]:
+                    metainfo['type'] = MediaType.MOVIE
+                elif media_type == "tv":
+                    metainfo['type'] = MediaType.TV
+            episode_group = _BRACED_EPISODE_GROUP_RE.search(result)
+            if episode_group:
+                metainfo['episode_group'] = episode_group.group(1)
+            begin_season = _BRACED_BEGIN_SEASON_RE.search(result)
+            if begin_season and begin_season.group(0).isdigit():
+                metainfo['begin_season'] = int(begin_season.group(0))
+            end_season = _BRACED_END_SEASON_RE.search(result)
+            if end_season and end_season.group(0).isdigit():
+                metainfo['end_season'] = int(end_season.group(0))
+            begin_episode = _BRACED_BEGIN_EPISODE_RE.search(result)
+            if begin_episode and begin_episode.group(0).isdigit():
+                metainfo['begin_episode'] = int(begin_episode.group(0))
+            end_episode = _BRACED_END_EPISODE_RE.search(result)
+            if end_episode and end_episode.group(0).isdigit():
+                metainfo['end_episode'] = int(end_episode.group(0))
+            if (
+                legacy_matches
+                or mtype
+                or episode_group
+                or begin_season
+                or end_season
+                or begin_episode
+                or end_episode
+            ):
+                title = title.replace(f"{{[{result}]}}", '')
+
+    # 支持 Emby 格式及常见圆括号格式的 ID 标签；第一个 [tmdbid] 历史上始终优先处理，用于覆盖前面 {[...]} 中的旧标签。
+    tmdb_match = _EMBY_TMDB_RE_LIST[0].search(title)
+    if tmdb_match:
+        if tmdb_match.group(1) != "0":
+            legacy_identities[MediaSource.TMDB] = tmdb_match.group(1)
+        title = _EMBY_TMDB_RE_LIST[0].sub('', title).strip()
+    elif MediaSource.TMDB not in legacy_identities:
+        # 保持原有优先级：[tmdbid] > [tmdb] > {tmdbid} > {tmdb}
+        for tmdb_re in _EMBY_TMDB_RE_LIST[1:]:
+            tmdb_match = tmdb_re.search(title)
+            if tmdb_match:
+                if tmdb_match.group(1) != "0":
+                    legacy_identities[MediaSource.TMDB] = tmdb_match.group(1)
+                title = tmdb_re.sub('', title).strip()
+                break
+
+    for source_name, patterns in _EXTENDED_MEDIA_ID_RE_LIST.items():
+        extended_source = normalize_media_source(source_name)
+        if not extended_source or extended_source in legacy_identities:
+            continue
+        for media_id_re in patterns:
+            media_id_match = media_id_re.search(title)
+            if not media_id_match:
+                continue
+            if media_id_match.group(1) != "0":
+                legacy_identities[extended_source] = media_id_match.group(1)
+            title = media_id_re.sub('', title).strip()
+            break
+
+    media_source, media_id = None, None
+    for source, _ in _LEGACY_ID_KEYS:
+        if legacy_identities.get(source):
+            media_source, media_id = source, legacy_identities[source]
+            break
+    metainfo['media_source'] = media_source
+    metainfo['media_id'] = media_id
+
+    _apply_range_total(metainfo, 'begin_season', 'end_season', 'total_season')
+    _apply_range_total(metainfo, 'begin_episode', 'end_episode', 'total_episode')
+    return title, _normalize_metainfo_identity(metainfo)
+
+
+def _prepare_meta_input(
+        title: str,
+        subtitle: Optional[str] = None,
+        custom_words: Optional[List[str]] = None,
+) -> _PreparedMetaInput:
+    """
+    应用识别词、显式标签和文件后缀规则，生成稳定的解析阶段输入。
+    """
+    original_title = title
+    parsed_title, parsed_subtitle, apply_words = WordsMatcher().prepare_with_subtitle(
+        title, subtitle, custom_words=custom_words
+    )
+    # 完整 Rust 入口已经失败或被禁用，参考实现不得再次跨边界调用部分 Rust 解析器。
+    parsed_title, explicit_metainfo = _find_metainfo_python(parsed_title)
+    media_exts = get_media_extensions()
+    title_path = Path(parsed_title) if parsed_title else None
+    if title_path and title_path.suffix.lower() in media_exts:
+        isfile = True
+        parsed_title = title_path.stem
+    else:
+        isfile = False
+    return _PreparedMetaInput(
+        original_title=original_title,
+        parsed_title=parsed_title,
+        subtitle=parsed_subtitle,
+        isfile=isfile,
+        apply_words=tuple(apply_words or ()),
+        explicit_metainfo=explicit_metainfo,
+    )
+
+
+def _apply_explicit_metainfo(meta: MetaBase, metainfo: Mapping[str, Any]) -> None:
+    """
+    以显式标签覆盖推断字段，保持用户声明拥有最高优先级。
+    """
+    media_source, media_id = resolve_media_identity(media=dict(metainfo))
+    if media_source and media_id:
+        meta.media_source = media_source
+        meta.media_id = media_id
+    if metainfo.get('type'):
+        meta.type = MediaType(metainfo['type']) if isinstance(metainfo['type'], str) else metainfo['type']
+    if metainfo.get('episode_group'):
+        meta.episode_group = metainfo['episode_group']
+    if metainfo.get('begin_season') is not None:
+        meta.begin_season = metainfo['begin_season']
+    if metainfo.get('end_season') is not None:
+        meta.end_season = metainfo['end_season']
+    if metainfo.get('total_season') is not None:
+        meta.total_season = metainfo['total_season']
+    if metainfo.get('begin_episode') is not None:
+        meta.begin_episode = metainfo['begin_episode']
+    if metainfo.get('end_episode') is not None:
+        meta.end_episode = metainfo['end_episode']
+    if metainfo.get('total_episode') is not None:
+        meta.total_episode = metainfo['total_episode']
+
+
+def _build_meta_info(
+        title: str,
+        subtitle: Optional[str] = None,
+        custom_words: Optional[List[str]] = None,
+) -> MetaBase:
+    """
+    按准备、分类解析、显式覆盖三个阶段构造 Python MetaInfo。
+    """
+    prepared = _prepare_meta_input(title, subtitle, custom_words)
+    meta = MetaAnime(
+        prepared.parsed_title,
+        prepared.subtitle,
+        prepared.isfile,
+    ) if is_anime(prepared.parsed_title) else MetaVideo(
+        prepared.parsed_title,
+        prepared.subtitle,
+        prepared.isfile,
+    )
+    meta.title = prepared.original_title
+    meta.apply_words = list(prepared.apply_words)
+    _apply_explicit_metainfo(meta, prepared.explicit_metainfo)
+    return meta
+
+
+def _build_python_meta_info(
+        title: str,
+        subtitle: Optional[str] = None,
+        custom_words: Optional[List[str]] = None,
+) -> MetaBase:
+    """
+    构造并完成 original_name 的纯 Python 参考解析结果。
+    """
+    meta = _build_meta_info(title=title, subtitle=subtitle, custom_words=custom_words)
+    if meta.apply_words:
+        original_meta = _build_meta_info(title=title, subtitle=subtitle)
+        meta.original_name = original_meta.name or meta.name
+    else:
+        meta.original_name = meta.name or None
+    return meta
+
+
+@lru_cache(maxsize=1)
+def _rust_default_parse_options() -> dict[str, Any]:
+    """
+    缓存 Rust Meta 默认解析配置，避免热路径反复读取配置并复制流媒体平台大表。
+    """
+    from app.domain.meta.streamingplatform import StreamingPlatforms
+
+    release_groups = ReleaseGroupsMatcher().get_release_groups()
+
+    customization = CustomizationMatcher.normalize_customization(
+        get_customization()
+    )
+    options = {
+        "custom_words": get_custom_words() or [],
+        # PyO3 当前按 Python list 提取 Vec<String>，不能传 tuple。
+        "media_exts": list(get_media_extensions()),
+        "release_groups": release_groups,
+        "customization": customization,
+        "streaming_platforms": StreamingPlatforms().get_lookup_cache(),
+    }
+    options[_RUST_PARSE_OPTIONS_CACHE_KEY] = _rust_parse_options_cache_key(options)
+    return options
+
+
+@lru_cache(maxsize=256)
+def _rust_custom_parse_options(custom_words: Tuple[str, ...]) -> dict[str, Any]:
+    """
+    缓存带自定义识别词的 Rust Meta 配置，避免同一组识别词重复构造配置对象。
+    """
+    options = dict(_rust_default_parse_options())
+    options["custom_words"] = list(custom_words)
+    options[_RUST_PARSE_OPTIONS_CACHE_KEY] = _rust_parse_options_cache_key(options)
+    return options
+
+
+def _rust_parse_options(custom_words: Optional[List[str]] = None) -> dict[str, Any]:
+    """
+    收集 Rust Meta 解析所需的运行时配置，避免 Rust 层直接访问数据库和 settings。
+
+    与 Python 识别词匹配器保持一致：None 或空列表沿用全局规则，非空列表覆盖全局规则。
+    """
+    if not custom_words:
+        return _rust_default_parse_options()
+    return _rust_custom_parse_options(tuple(custom_words))
+
+
+def clear_rust_parse_options_cache() -> None:
+    """
+    清理 Rust Meta 默认解析配置缓存，供系统配置变更后重载使用。
+    """
+    _rust_default_parse_options.cache_clear()
+    _rust_custom_parse_options.cache_clear()
+
+
+def _meta_from_rust(parsed: Optional[dict[str, Any]]) -> Optional[MetaBase]:
+    """
+    将 Rust 解析结果灌回现有 MetaVideo/MetaAnime 对象，保留下游属性和方法兼容性。
+    """
+    if not parsed:
+        return None
+    parsed = _normalize_metainfo_identity(parsed)
+    meta = MetaAnime("") if parsed.get("kind") == "anime" else MetaVideo("")
+    type_map: dict[object, MediaType] = {
+        MediaType.MOVIE.value: MediaType.MOVIE,
+        MediaType.TV.value: MediaType.TV,
+        MediaType.COLLECTION.value: MediaType.COLLECTION,
+        MediaType.UNKNOWN.value: MediaType.UNKNOWN,
+    }
+    fields = {
+        "isfile": parsed.get("isfile") or False,
+        "title": parsed.get("title") or "",
+        "org_string": parsed.get("org_string"),
+        "subtitle": parsed.get("subtitle"),
+        "type": type_map.get(parsed.get("type"), MediaType.UNKNOWN),
+        "cn_name": parsed.get("cn_name"),
+        "en_name": parsed.get("en_name"),
+        "original_name": parsed.get("original_name"),
+        "year": parsed.get("year"),
+        "total_season": parsed.get("total_season") or 0,
+        "begin_season": parsed.get("begin_season"),
+        "end_season": parsed.get("end_season"),
+        "total_episode": parsed.get("total_episode") or 0,
+        "begin_episode": parsed.get("begin_episode"),
+        "end_episode": parsed.get("end_episode"),
+        "part": parsed.get("part"),
+        "resource_type": parsed.get("resource_type"),
+        "resource_effect": parsed.get("resource_effect"),
+        "resource_pix": parsed.get("resource_pix"),
+        "resource_team": parsed.get("resource_team"),
+        "customization": parsed.get("customization"),
+        "web_source": parsed.get("web_source"),
+        "video_encode": parsed.get("video_encode"),
+        "video_bit": parsed.get("video_bit"),
+        "audio_encode": parsed.get("audio_encode"),
+        "apply_words": parsed.get("apply_words") or [],
+        "media_source": parsed.get("media_source"),
+        "media_id": parsed.get("media_id"),
+        "episode_group": parsed.get("episode_group"),
+        "fps": parsed.get("fps"),
+    }
+    for key, value in fields.items():
+        setattr(meta, key, value)
+    return meta
+
+
+def _requires_python_metainfo(
+    title: str,
+    custom_words: Optional[List[str]] = None,
+) -> bool:
+    """
+    判断标题或临时识别词是否必须由 Python 解析器处理媒体身份标签。
+
+    :param title: 原始标题
+    :param custom_words: 临时识别词
+    :return: 是否必须使用Python解析器
+    """
+    candidates = [title or "", *(custom_words or [])]
+    if any(_GENERIC_MEDIA_ID_TAG_RE.search(candidate) for candidate in candidates):
+        return True
+    if any(_PARENTHESIZED_TMDB_RE.search(candidate) for candidate in candidates):
+        return True
+    contains_extended_id = any(
+        _EXTENDED_MEDIA_ID_TAG_RE.search(candidate) for candidate in candidates
+    )
+    accelerator = get_metainfo_accelerator()
+    return contains_extended_id and bool(
+        accelerator and not accelerator.supports_extended_media_ids()
+    )
+
+
+def MetaInfo(title: str, subtitle: Optional[str] = None, custom_words: Optional[List[str]] = None,
+             force_video: bool = False, mtype: Optional[MediaType] = None) -> MetaBase:
+    """
+    根据标题和副标题识别元数据。
+
+    :param title: 标题、种子名、文件名
+    :param subtitle: 副标题、描述
+    :param custom_words: 自定义识别词列表
+    :param force_video: 音频后缀的影视附加轨（如评论音轨）强制按视频解析，用于影视整理场景
+    :param mtype: 已由调用方确定的媒体类型；音乐资源无文件后缀时也使用音乐解析器
+    :return: 解析得到的 MetaAnime、MetaVideo 或 MetaMusic 对象
+    """
+    # 媒体类型只选择解析器；音乐同样先应用用户识别词，影视附加音轨仍可强制按视频解析。
+    audio_suffix = Path(title).suffix.lower() if title else ""
+    is_audio_file = audio_suffix in get_audio_extensions()
+    if not force_video and (mtype == MediaType.MUSIC or (
+            mtype not in (MediaType.MOVIE, MediaType.TV) and is_audio_file
+    )):
+        parsed_title, apply_words = WordsMatcher().prepare(title, custom_words=custom_words)
+        parsed_path = Path(parsed_title)
+        music_meta = MetaMusic.parse_resource(
+            parsed_path.stem if is_audio_file and parsed_path.suffix.lower() in get_audio_extensions() else parsed_title,
+            subtitle,
+        )
+        music_meta.org_string = parsed_title
+        music_meta.apply_words = apply_words
+        if is_audio_file:
+            music_meta.audio_format = normalize_audio_format(audio_suffix.lstrip("."))
+            music_meta.audio_lossless = infer_audio_lossless(music_meta.audio_format)
+        return music_meta
+    rust_meta = None
+    accelerator = get_metainfo_accelerator()
+    if accelerator and not _requires_python_metainfo(title, custom_words):
+        rust_meta = _meta_from_rust(
+            accelerator.parse_metainfo(
+                title,
+                subtitle,
+                _rust_parse_options(custom_words),
+            )
+        )
+    if rust_meta:
+        return rust_meta
+    return _build_python_meta_info(
+        title=title,
+        subtitle=subtitle,
+        custom_words=custom_words,
+    )
+
+
+def MetaInfoPath(path: Path, custom_words: Optional[List[str]] = None, force_video: bool = False) -> MetaBase:
+    """
+    根据路径识别元数据。
+
+    :param path: 路径
+    :param custom_words: 自定义识别词列表
+    :param force_video: 音频后缀的影视附加轨（如评论音轨）强制按视频解析，用于影视整理场景
+    """
+    # 音频文件直接构造音乐元数据，不参与父目录季集合并，影视附加音轨强制走视频解析
+    audio_suffix = path.suffix.lower()
+    if not force_video and audio_suffix in get_audio_extensions():
+        return MetaMusic(
+            org_string=path.name,
+            title=path.stem,
+            audio_format=audio_suffix.lstrip(".").upper() or None,
+        ).apply_path_context(path)
+    path_context = " ".join(
+        [path.name, path.parent.name, path.parent.parent.name]
+    )
+    rust_meta = None
+    accelerator = get_metainfo_accelerator()
+    if accelerator and not _requires_python_metainfo(path_context, custom_words):
+        rust_meta = _meta_from_rust(
+            accelerator.parse_metainfo_path(
+                str(path),
+                _rust_parse_options(custom_words),
+            )
+        )
+    if rust_meta:
+        return rust_meta
+    # 文件元数据，不包含后缀
+    file_meta = _build_python_meta_info(title=path.name, custom_words=custom_words)
+    if should_use_parent_title_for_file_stem(path.stem, path.parent.name, file_meta):
+        clear_parsed_title_for_parent_merge(file_meta)
+    dir_meta = _build_python_meta_info(title=path.parent.name, custom_words=custom_words)
+    if file_meta.type == MediaType.TV or dir_meta.type != MediaType.TV:
+        file_meta.merge(dir_meta)
+    root_meta = _build_python_meta_info(title=path.parent.parent.name, custom_words=custom_words)
+    if file_meta.type == MediaType.TV or root_meta.type != MediaType.TV:
+        file_meta.merge(root_meta)
+    return file_meta
+
+
+def is_anime(name: str) -> bool:
+    """
+    根据集数命名选择动漫解析器，资源分辨率标签本身不构成集数证据。
+
+    :param name: 已完成识别词和显式媒体标签预处理的标题
+    :return: 标题是否包含需要动漫解析器处理的季集格式，不代表元数据源的题材分类
+    """
+    if not name:
+        return False
+    if _ANIME_BRACKET_RE.search(name):
+        return True
+    if _ANIME_DASH_EPISODE_RE.search(name):
+        return True
+    if _VIDEO_SEASON_EPISODE_RE.search(name):
+        return False
+    if _ANIME_SQUARE_BRACKET_RE.search(name):
+        return True
+    return False
+
+
+def find_metainfo(title: str) -> Tuple[str, dict[str, Any]]:
+    """
+    从标题中提取媒体信息。
+    """
+    rust_result = None
+    accelerator = get_metainfo_accelerator()
+    if accelerator and not _requires_python_metainfo(title):
+        rust_result = accelerator.find_metainfo(title)
+    if rust_result:
+        return rust_result["title"], _normalize_metainfo_identity(rust_result["metainfo"])
+    return _find_metainfo_python(title)

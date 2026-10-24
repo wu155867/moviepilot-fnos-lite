@@ -1,0 +1,142 @@
+name: Pylint Code Quality Check
+
+on:
+  pull_request:
+    branches:
+      - v3
+  push:
+    branches:
+      - v3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pylint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reuse:
+    name: Check reusable PR verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      reused: ${{ steps.check.outputs.reuse }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Test reuse decision
+        run: node --test .github/scripts/reuse.test.mjs
+      - name: Check successful PR merge tree
+        id: check
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { reuse } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/reuse.mjs`);
+            await reuse({ github, context, core });
+
+  pylint:
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true'
+    runs-on: ubuntu-latest
+    name: Pylint Code Quality Check
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v10.0.1
+      with:
+        python-version: '3.14'
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+
+    - name: Install dependencies
+      run: uv sync --locked
+
+    - name: Verify pylint config
+      run: |
+        # 检查项目中的pylint配置文件是否存在
+        if [ -f .pylintrc ]; then
+          echo "✅ 找到项目配置文件: .pylintrc"
+          echo "配置文件内容预览:"
+          head -10 .pylintrc
+        else
+          echo "❌ 未找到 .pylintrc 配置文件"
+          exit 1
+        fi
+    - name: Collect changed Python files
+      id: changed
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        BEFORE_SHA: ${{ github.event.before }}
+        CURRENT_SHA: ${{ github.sha }}
+      run: |
+        if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          git diff --name-only --diff-filter=ACMRT \
+            "origin/$BASE_REF...HEAD" -- '*.py' > changed-python-files.txt
+        elif [[ "$EVENT_NAME" == "push" ]] \
+          && [[ -n "$BEFORE_SHA" ]] \
+          && [[ ! "$BEFORE_SHA" =~ ^0+$ ]] \
+          && git cat-file -e "$BEFORE_SHA^{commit}"; then
+          git diff --name-only --diff-filter=ACMRT \
+            "$BEFORE_SHA" "$CURRENT_SHA" -- '*.py' > changed-python-files.txt
+        else
+          git diff-tree --no-commit-id --name-only --diff-filter=ACMRT \
+            -r HEAD -- '*.py' > changed-python-files.txt
+        fi
+        sort -u -o changed-python-files.txt changed-python-files.txt
+        if [[ -s changed-python-files.txt ]]; then
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+          sed -n '1,200p' changed-python-files.txt
+        else
+          echo "has_files=false" >> "$GITHUB_OUTPUT"
+          echo "本次没有改动 Python 文件"
+        fi
+
+    - name: Run pylint on changed Python files
+      if: steps.changed.outputs.has_files == 'true'
+      run: |
+        xargs uv run --locked --no-sync pylint \
+          --output-format=colorized --reports=yes --score=yes \
+          < changed-python-files.txt
+
+    - name: Generate full advisory report
+      if: always()
+      run: |
+        uv run --locked --no-sync pylint app/ \
+          --output-format=json > pylint-report.json || true
+
+    - name: Upload pylint report
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: pylint-report
+        path: pylint-report.json
+
+    - name: Summary
+      run: |
+        echo "🎉 Pylint 检查完成！"
+        echo "✅ 改动 Python 文件没有新增语法错误或严重问题"
+        echo "📊 全仓建议性报告已保存为构建工件"
+
+  proof:
+    name: CI proof (${{ github.sha }})
+    needs: [pylint]
+    if: github.event_name == 'pull_request' && needs.pylint.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record fully verified merge commit
+        run: echo 'All required checks passed for this PR merge commit.'

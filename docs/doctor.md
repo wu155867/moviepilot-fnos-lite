@@ -1,0 +1,111 @@
+# MoviePilot Doctor 诊断与自救
+
+`moviepilot doctor` 是离线诊断入口，适合 WebUI、后端 API、Agent 或插件都不可用时使用。它不调用 MoviePilot 后端 API，而是直接检查本地配置、运行时文件、进程、端口、日志、依赖、数据库、前端资源和 Docker 环境。
+
+## 快速使用
+
+本地源码安装：
+
+```shell
+moviepilot doctor
+moviepilot doctor --json
+moviepilot doctor --fix
+```
+
+安全模式启动：
+
+```shell
+moviepilot start --safe
+```
+
+Docker 容器仍在运行或处于诊断保活状态：
+
+```shell
+docker exec -it <container> moviepilot doctor
+docker exec -it <container> moviepilot doctor --json
+```
+
+容器已经退出时，可用同一镜像挂载配置目录运行：
+
+```shell
+docker run --rm --entrypoint python -v <config-dir>:/config <image> -m app.cli doctor
+```
+
+## 诊断内容
+
+Doctor 默认执行只读检查：
+
+- 运行路径：程序目录、配置目录、日志目录、Python 解释器
+- 关键配置：`API_TOKEN`、`PORT`、`NGINX_PORT`、代理格式、安全模式
+- 进程拓扑：全功能模式必须使用 `API_WORKERS=1`，避免插件、调度器、监控器和工作流重复启动
+- 进程与端口：后端、前端端口监听状态，runtime 文件是否过期
+- 日志线索：后端日志、启动日志、前端日志和插件日志最近 24 小时内的错误
+- 核心依赖：FastAPI、Pydantic、SQLAlchemy、Uvicorn、CloakBrowser 等是否可导入
+- 数据库：SQLite 只读打开和完整性检查；PostgreSQL 默认做配置检查
+- 前端资源：`version.txt`、`service.js` 或核心静态文件是否存在
+- Docker：`/config`、虚拟环境和容器内 `moviepilot` 命令是否可用
+
+`--deep` 会启用可能较慢或更依赖环境的检查，例如 PostgreSQL TCP 连通性。
+
+整体状态只聚合会影响 MoviePilot 核心运行的诊断项。插件独立日志以及主日志中可明确识别的插件子系统异常仍会作为 `warn/degraded` 诊断项保留，但其 `affects_report_status` 为 `false`，不会单独把整体状态从 `healthy` 降为 `degraded`；同一日志中若还存在核心错误，核心错误仍会参与状态聚合。
+
+Doctor 会按核心与插件两个组件聚合日志发现，并对主日志、控制台镜像和插件独立日志中的相同错误去重。JSON 汇总中的 `warn` 保留全部警告数量，`advisory` 单独统计不影响整体状态的建议项；日志发现的 `context.log_files`、`matches` 和 `unique_matches` 分别说明来源、原始命中数和去重后命中数。
+
+## 自救能力
+
+`moviepilot doctor --fix` 只做白名单安全修复：
+
+- 清理指向已退出进程的 runtime 文件
+- 在未被系统环境变量锁定时，为缺失或过短的 `API_TOKEN` 生成合规值
+
+Doctor 不会自动删除数据库、修改 Docker Compose、回滚迁移、禁用多个插件或删除用户数据。
+
+## 安全模式
+
+`moviepilot start --safe` 或 `MOVIEPILOT_SAFE_MODE=true` 会在本次启动中跳过：
+
+- 第三方插件加载与插件同步
+- 调度器和 Agent 定时任务
+- 目录监控
+- 命令注册
+- 工作流后台服务
+
+安全模式不修改用户配置，适合插件、调度任务或 Agent 导致后端无法启动时先恢复后台入口。修复问题后移除环境变量或使用普通 `moviepilot start` 重启即可恢复完整能力。
+
+MoviePilot V3 的全功能模式只支持 `API_WORKERS=1`。配置更大的值时，主入口和外部 ASGI
+lifespan 都会在数据库迁移及后台任务启动前拒绝运行，Doctor 同时给出失败项。安全模式因跳过
+控制面而允许临时使用多 worker，但 Doctor 会将其标记为降级；故障排除后应恢复单 worker。
+
+## Docker 诊断
+
+Docker 镜像由容器内 supervisor 托管 Nginx 和后端进程，后端异常退出时 supervisor 会自动拉起。需要诊断时可执行：
+
+```shell
+docker exec -it <container> moviepilot doctor
+```
+
+Dockerfile 同时提供 `HEALTHCHECK`，用于标记容器健康状态。应用进程重启由容器内 supervisor 负责，
+Docker restart policy 只影响整个容器的恢复。
+
+镜像健康检查与 entrypoint 的后端就绪等待统一访问公开的 `/health/ready`：只有数据库迁移、
+Alembic head 校验和生命周期启动完成后才返回 200；启动失败或关停时返回 503。单纯确认进程
+和事件循环可响应可访问 `/health/live`。这两个探针无需 token，响应只包含最小状态，不提供
+数据库路径、revision、插件名称或异常栈；详细原因应通过本地 `moviepilot doctor`、受控 Agent
+诊断或管理员渠道查看。
+
+## Telegram 收信中断
+
+Telegram 长轮询失败后会按指数退避自动重试，默认等待上限为 60 秒。首次失败立即记录
+`Telegram消息拉取失败` 警告；持续失败时，在失败请求返回后每隔至少 60 秒再记录一次，
+包含连续失败次数、从首次失败开始的持续时间、下一次等待秒数和最新错误。恢复后记录
+`Telegram消息拉取已恢复`，同时给出本次连续失败次数和持续时间。
+
+排查时保留最新的持续失败警告，区分连接或读取超时与 Telegram 返回的 API 错误。
+通过同一代理访问 Telegram 首页成功不能证明 `getUpdates` 长轮询可用；Doctor 或容器
+健康检查正常也不能证明 Telegram 收信正常。线程栈停在退避的 `Event.wait()` 时会表现为
+futex 等待，仅凭 `/proc` 的等待状态无法认定内部死锁。尚未恢复时，先保留失败日志和
+线程调用栈，再重载通知配置；不要采集或公开 Bot token 等局部变量。
+
+## Issue 反馈集成
+
+`feedback-issue` skill 的诊断收集脚本会自动调用 `moviepilot doctor --json`，并把 doctor 摘要写入预览和最终 Issue 正文。完整 doctor JSON 存在运行时 diagnostics 文件中，默认不会直接贴入 Issue，避免泄露本机路径和过长输出。连续重复的同类日志模板会保留首条、末条和重复次数，避免轮询或等待日志挤掉真正的错误上下文。

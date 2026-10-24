@@ -1,0 +1,674 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+Usage: moviepilot [BOOTSTRAP COMMAND] | [RUNTIME COMMAND]
+       moviepilot help [COMMAND ...]
+       moviepilot commands
+
+Bootstrap Commands:
+  moviepilot install deps [--python PYTHON] [--venv PATH] [--recreate] [--config-dir PATH]
+  moviepilot install cjk [--venv PATH] [--check]
+  moviepilot install frontend [--version TAG] [--node-version 20.12.1] [--config-dir PATH]
+  moviepilot install resources [--resources-repo PATH] [--resource-dir PATH] [--config-dir PATH]
+  moviepilot init [--skip-resources] [--force-token] [--wizard] [--superuser NAME] [--superuser-password PASSWORD] [--config-dir PATH]
+  moviepilot setup [--python PYTHON] [--venv PATH] [--recreate] [--frontend-version TAG] [--node-version 20.12.1] [--wizard] [--superuser NAME] [--superuser-password PASSWORD] [--config-dir PATH]
+  moviepilot uninstall [--venv PATH] [--config-dir PATH]
+  moviepilot update [backend|frontend|all] [OPTIONS]
+  moviepilot startup {enable|disable|status} [--venv PATH] [--config-dir PATH]
+  moviepilot agent [OPTIONS] MESSAGE...
+
+Runtime Commands:
+  moviepilot start|stop|restart|status|logs|version
+  moviepilot doctor [--json] [--fix] [--deep]
+  moviepilot config ...
+  moviepilot tool list|show|run ...
+  moviepilot scheduler list|run ...
+
+Discovery Commands:
+  moviepilot help
+  moviepilot help config
+  moviepilot help install
+  moviepilot help uninstall
+  moviepilot help update
+  moviepilot help startup
+  moviepilot commands
+
+Examples:
+  moviepilot install deps
+  moviepilot install frontend
+  moviepilot install resources
+  moviepilot setup --wizard
+  moviepilot uninstall
+  moviepilot update all
+  moviepilot startup enable
+  moviepilot agent 帮我分析最近一次搜索失败
+  moviepilot help config
+  moviepilot config keys
+  moviepilot start
+  moviepilot doctor
+  moviepilot tool list
+EOF
+}
+
+show_commands() {
+  cat <<'EOF'
+Bootstrap Commands
+  install deps
+  install cjk
+  install frontend
+  install resources
+  init
+  setup
+  uninstall
+  update backend
+  update frontend
+  update all
+  startup enable
+  startup disable
+  startup status
+  agent
+
+Runtime Commands
+  start
+  stop
+  restart
+  status
+  logs
+  doctor
+  version
+  config path
+  config list
+  config get
+  config set
+  config keys
+  config describe
+  tool list
+  tool show
+  tool run
+  scheduler list
+  scheduler run
+
+Discovery Commands
+  help
+  commands
+EOF
+}
+
+show_install_help() {
+  cat <<'EOF'
+Usage:
+  moviepilot install deps [OPTIONS]
+  moviepilot install cjk [OPTIONS]
+  moviepilot install frontend [OPTIONS]
+  moviepilot install resources [OPTIONS]
+
+Options:
+  deps:
+    --python PYTHON   用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.14+ 版本
+    --venv PATH       虚拟环境目录，默认 ./venv
+    --recreate        删除并重建虚拟环境
+    --config-dir PATH 指定配置目录
+    说明            Rust 加速扩展通过 moviepilot-rust PyPI 依赖安装
+                    同时尝试编译并验证 Agent 中文全文索引扩展
+
+  cjk:
+    --venv PATH      目标虚拟环境目录，默认 ./venv
+    --check          只验证已安装扩展，不编译或修改文件
+
+  frontend:
+    --version TAG         前端版本，默认使用 version.py 中的 FRONTEND_VERSION
+    --node-version VER    本地 Node 运行时版本，默认 20.12.1
+    --config-dir PATH     指定配置目录
+
+  resources:
+    --resources-repo PATH 本地 MoviePilot-Resources 仓库路径
+    --resource-dir PATH   直接指定 resources.v3 目录
+    --config-dir PATH     指定配置目录
+
+  -h, --help              显示帮助
+EOF
+}
+
+show_init_help() {
+  cat <<'EOF'
+Usage: moviepilot init [OPTIONS]
+
+Options:
+  --skip-resources          跳过资源同步
+  --force-token             强制重置 API_TOKEN
+  --wizard                  启动交互式初始化向导
+  --superuser NAME          预设超级管理员用户名
+  --superuser-password PWD  预设超级管理员密码
+  --config-dir PATH         指定配置目录
+  -h, --help                显示帮助
+EOF
+}
+
+show_setup_help() {
+  cat <<'EOF'
+Usage: moviepilot setup [OPTIONS]
+
+Options:
+  --python PYTHON           用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.14+ 版本
+  --venv PATH               虚拟环境目录，默认 ./venv
+  --recreate                删除并重建虚拟环境
+  --frontend-version TAG    前端版本，默认使用 version.py 中的 FRONTEND_VERSION
+  --node-version VER        本地 Node 运行时版本，默认 20.12.1
+  --skip-resources          跳过资源同步
+  --force-token             强制重置 API_TOKEN
+  --wizard                  安装完成后启动交互式初始化向导
+  --superuser NAME          预设超级管理员用户名
+  --superuser-password PWD  预设超级管理员密码
+  --config-dir PATH         指定配置目录
+  -h, --help                显示帮助
+
+说明:
+  - Rust 加速扩展通过 moviepilot-rust PyPI 依赖安装
+  - 可在前端“高级设置 - 实验室”中关闭或重新开启 Rust 加速
+  - 旧配置仅补充目标目录缺失的内容，实际复制后才显示迁移提示
+EOF
+}
+
+show_uninstall_help() {
+  cat <<'EOF'
+Usage: moviepilot uninstall [OPTIONS]
+
+Options:
+  --venv PATH        虚拟环境目录，默认 ./venv
+  --config-dir PATH  指定配置目录，默认使用当前安装配置
+  -h, --help         显示帮助
+
+说明:
+  - 默认保留配置目录，过程中会询问是否删除
+  - 卸载时会进行两次确认
+  - 源码目录不会被删除
+EOF
+}
+
+show_update_help() {
+  cat <<'EOF'
+Usage:
+  moviepilot update backend [OPTIONS]
+  moviepilot update frontend [OPTIONS]
+  moviepilot update [all] [OPTIONS]
+
+Options:
+  --ref REF                 后端 Git 版本，默认当前分支；DEV 下 detached HEAD 回到 v3
+  --dev / --no-dev          指定 DEV 更新模式，默认读取 MOVIEPILOT_UPDATE_DEV
+                            DEV 模式下同版本前端也会重新下载并替换
+  --frontend-version TAG    前端版本，DEV 默认 latest，否则使用 FRONTEND_VERSION
+  --node-version VER        本地 Node 运行时版本，默认 20.12.1
+  --python PYTHON           用于安装后端依赖的 Python 解释器，默认自动选择本地 3.14+ 版本
+  --venv PATH               虚拟环境目录，默认 ./venv
+  --recreate                删除并重建虚拟环境
+  --skip-resources          更新 all 时跳过资源同步
+  --config-dir PATH         指定配置目录
+  -h, --help                显示帮助
+
+说明:
+  - 更新后端依赖时会同步更新 moviepilot-rust PyPI 依赖
+  - 在线更新后端时会以 origin 强制覆盖同名本地标签；分支仍仅允许快进更新
+  - 后端更新前如果检测到已跟踪源码改动，CLI 会询问是否清空本地改动；确认后才会继续更新，拒绝或非交互模式会取消更新
+  - 可在前端“高级设置 - 实验室”中关闭或重新开启 Rust 加速
+EOF
+}
+
+show_startup_help() {
+  cat <<'EOF'
+Usage:
+  moviepilot startup enable [OPTIONS]
+  moviepilot startup disable [OPTIONS]
+  moviepilot startup status [OPTIONS]
+
+Options:
+  --venv PATH        虚拟环境目录，默认 ./venv
+  --config-dir PATH  指定配置目录，默认使用当前安装配置
+  -h, --help         显示帮助
+
+说明:
+  - macOS 使用 LaunchAgent
+  - Linux 优先使用 systemd --user，不可用时回退到 XDG autostart
+  - Windows 使用当前用户的 Startup 启动目录
+EOF
+}
+
+show_agent_help() {
+  cat <<'EOF'
+Usage:
+  moviepilot agent [OPTIONS] MESSAGE...
+
+Options:
+  --session ID              指定会话 ID
+  --new-session             强制创建新会话
+  --user-id ID              智能体上下文中的用户 ID，默认 cli
+  --config-dir PATH         指定配置目录
+  -h, --help                显示帮助
+EOF
+}
+
+show_doctor_help() {
+  cat <<'EOF'
+Usage:
+  moviepilot doctor [OPTIONS]
+
+Options:
+  --json   输出 JSON 报告，便于 Agent、脚本或 Issue 流程收集
+  --fix    执行白名单安全修复，如清理过期 runtime 文件或补齐 API_TOKEN
+  --deep   执行可能较慢的深度检查
+  -h, --help  显示帮助
+
+说明:
+  - doctor 是离线诊断入口，不依赖后端服务已经启动
+  - 插件日志异常会保留为告警，但不会单独降低系统整体状态
+  - Docker 环境可执行 docker exec <container> moviepilot doctor
+EOF
+}
+
+python_version_ok() {
+  local python_bin="$1"
+  "$python_bin" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 14) else 1)
+PY
+}
+
+try_python_candidate() {
+  local candidate="$1"
+  local path_entry
+  local python_path
+  local found=1
+
+  if [[ "$candidate" == */* ]]; then
+    if [ -x "$candidate" ] && python_version_ok "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    return 1
+  fi
+
+  local -a path_entries
+  IFS=: read -r -a path_entries <<< "${PATH:-}"
+  for path_entry in "${path_entries[@]}"; do
+    [ -n "$path_entry" ] || path_entry="."
+    python_path="$path_entry/$candidate"
+    if [ -x "$python_path" ] && [ ! -d "$python_path" ] && python_version_ok "$python_path"; then
+      printf '%s\n' "$python_path"
+      found=0
+    fi
+  done
+  return "$found"
+}
+
+find_system_python_candidates() {
+  local minor
+  local uv_bin
+  local uv_python
+
+  for minor in 20 19 18 17 16 15 14 13 12; do
+    if try_python_candidate "python3.$minor"; then
+      :
+    fi
+  done
+  if try_python_candidate python3; then
+    :
+  fi
+  if try_python_candidate python; then
+    :
+  fi
+  for uv_bin in "$(command -v uv 2>/dev/null || true)" "$HOME/.local/bin/uv"; do
+    if [ -n "$uv_bin" ] && [ -x "$uv_bin" ]; then
+      for minor in 20 19 18 17 16 15 14 13 12; do
+        uv_python="$("$uv_bin" python find "3.$minor" 2>/dev/null || true)"
+        if [ -n "$uv_python" ] && python_version_ok "$uv_python"; then
+          printf '%s\n' "$uv_python"
+        fi
+      done
+    fi
+  done
+}
+
+resolve_target_venv() {
+  local target_venv="${1:-$ROOT/venv}"
+  local target_parent
+  if [[ "$target_venv" != /* ]]; then
+    target_venv="$ROOT/$target_venv"
+  fi
+  if [ -d "$target_venv" ]; then
+    target_venv="$(cd -P "$target_venv" 2>/dev/null && pwd || true)"
+  else
+    target_parent="$(cd -P "$(dirname "$target_venv")" 2>/dev/null && pwd || true)"
+    if [ -n "$target_parent" ]; then
+      target_venv="$target_parent/$(basename "$target_venv")"
+    fi
+  fi
+  printf '%s\n' "$target_venv"
+}
+
+canonicalize_executable_path() {
+  local candidate="$1"
+  local candidate_dir
+  candidate_dir="$(cd -P "$(dirname "$candidate")" 2>/dev/null && pwd || true)"
+  if [ -n "$candidate_dir" ]; then
+    printf '%s/%s\n' "$candidate_dir" "$(basename "$candidate")"
+  fi
+}
+
+path_is_in_target_venv() {
+  local candidate="$1"
+  local target_venv="$2"
+  local candidate_path
+  candidate_path="$(canonicalize_executable_path "$candidate")"
+  target_venv="$(resolve_target_venv "$target_venv")"
+  [ -n "$candidate_path" ] && [ -n "$target_venv" ] \
+    && [[ "$candidate_path" == "$target_venv"/* ]]
+}
+
+find_external_python() {
+  local candidates
+  local candidate
+  local target_venv
+  target_venv="$(resolve_target_venv "${1:-$ROOT/venv}")"
+  candidates="$(find_system_python_candidates || true)"
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    candidate="$(canonicalize_executable_path "$candidate")"
+    if path_is_in_target_venv "$candidate" "$target_venv"; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done <<< "$candidates"
+  return 1
+}
+
+require_bootstrap_python() {
+  local python_bin="${1:-$BOOTSTRAP_PYTHON}"
+  if [ -n "$python_bin" ]; then
+    return 0
+  fi
+  echo "未找到可用的 Python 3.14+ 解释器，请先安装 Python 3.14 或更高版本" >&2
+  exit 1
+}
+
+bootstrap_python_for_args() {
+  local explicit_python=""
+  local recreate=false
+  local target_venv="$ROOT/venv"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --recreate)
+        recreate=true
+        ;;
+      --python)
+        if [ "$#" -gt 1 ]; then
+          explicit_python="$2"
+          shift
+        fi
+        ;;
+      --python=*)
+        explicit_python="${1#--python=}"
+        ;;
+      --venv)
+        if [ "$#" -gt 1 ]; then
+          target_venv="$2"
+          shift
+        fi
+        ;;
+      --venv=*)
+        target_venv="${1#--venv=}"
+        ;;
+    esac
+    shift
+  done
+  if [ "$recreate" = true ]; then
+    if [ -n "$explicit_python" ]; then
+      local explicit_candidates
+      local resolved_python
+      explicit_candidates="$(try_python_candidate "$explicit_python" || true)"
+      while IFS= read -r resolved_python; do
+        [ -n "$resolved_python" ] || continue
+        resolved_python="$(canonicalize_executable_path "$resolved_python")"
+        if ! path_is_in_target_venv "$resolved_python" "$target_venv"; then
+          printf '%s\n' "$resolved_python"
+          return 0
+        fi
+      done <<< "$explicit_candidates"
+    fi
+    local external_python
+    external_python="$(find_external_python "$target_venv" || true)"
+    if [ -z "$external_python" ]; then
+      echo "重建虚拟环境需要 venv 外部的 Python 3.14+ 解释器" >&2
+      return 1
+    fi
+    printf '%s\n' "$external_python"
+    return 0
+  fi
+  printf '%s\n' "$BOOTSTRAP_PYTHON"
+}
+
+default_config_dir() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "$HOME/Library/Application Support/MoviePilot"
+      ;;
+    *)
+      printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/moviepilot"
+      ;;
+  esac
+}
+
+legacy_config_exists() {
+  local legacy_dir="$ROOT/config"
+  [[ -f "$legacy_dir/app.env" ]] || [[ -f "$legacy_dir/user.db" ]] || [[ -d "$legacy_dir/logs" ]] || [[ -d "$legacy_dir/temp" ]] || [[ -d "$legacy_dir/cache" ]] || [[ -d "$legacy_dir/cookies" ]] || [[ -d "$legacy_dir/sites" ]]
+}
+
+run_runtime_cli() {
+  if [ ! -x "$MOVIEPILOT_PYTHON" ]; then
+    echo "未找到项目虚拟环境，请先执行 moviepilot install deps 或 moviepilot setup" >&2
+    exit 1
+  fi
+  exec "$MOVIEPILOT_PYTHON" -m app.cli "$@"
+}
+
+show_command_help() {
+  case "${1:-}" in
+    ""|-h|--help|help)
+      show_help
+      exit 0
+      ;;
+    install)
+      shift
+      case "${1:-}" in
+        ""|deps|cjk|-h|--help)
+          show_install_help
+          exit 0
+          ;;
+        frontend)
+          show_install_help
+          exit 0
+          ;;
+        resources)
+          show_install_help
+          exit 0
+          ;;
+        *)
+          echo "仅支持：moviepilot help install、moviepilot help install deps、moviepilot help install cjk、moviepilot help install frontend、moviepilot help install resources" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    init)
+      show_init_help
+      exit 0
+      ;;
+    setup)
+      show_setup_help
+      exit 0
+      ;;
+    uninstall)
+      show_uninstall_help
+      exit 0
+      ;;
+    agent)
+      show_agent_help
+      exit 0
+      ;;
+    doctor)
+      show_doctor_help
+      exit 0
+      ;;
+    update)
+      show_update_help
+      exit 0
+      ;;
+    startup)
+      show_startup_help
+      exit 0
+      ;;
+    commands)
+      show_commands
+      exit 0
+      ;;
+    *)
+      run_runtime_cli "$@" --help
+      ;;
+  esac
+}
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE_TARGET="$(readlink "$SOURCE")"
+  if [[ "$SOURCE_TARGET" != /* ]]; then
+    SOURCE="$SOURCE_DIR/$SOURCE_TARGET"
+  else
+    SOURCE="$SOURCE_TARGET"
+  fi
+done
+
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+VENV_PYTHON="$ROOT/venv/bin/python"
+# 优先使用项目环境提供的专用 Python 入口，保留其运行身份和系统权限。
+PROJECT_RUNTIME_PYTHON="$ROOT/venv/bin/moviepilot-python"
+if [ -x "$PROJECT_RUNTIME_PYTHON" ]; then
+  MOVIEPILOT_PYTHON="$PROJECT_RUNTIME_PYTHON"
+else
+  MOVIEPILOT_PYTHON="$VENV_PYTHON"
+fi
+SETUP_SCRIPT="$ROOT/scripts/local_setup.py"
+
+if [ -z "${CONFIG_DIR:-}" ] && [ -f "$ROOT/.moviepilot.env" ]; then
+  # 配置文件路径由当前安装目录决定，静态检查时无法预先解析。
+  # shellcheck disable=SC1090
+  . "$ROOT/.moviepilot.env"
+fi
+
+if [ -z "${CONFIG_DIR:-}" ]; then
+  if legacy_config_exists; then
+    CONFIG_DIR="$ROOT/config"
+  else
+    CONFIG_DIR="$(default_config_dir)"
+  fi
+fi
+export CONFIG_DIR
+
+BOOTSTRAP_PYTHON=""
+EXTERNAL_BOOTSTRAP_PYTHON="$(find_external_python || true)"
+if [ -x "$MOVIEPILOT_PYTHON" ]; then
+  BOOTSTRAP_PYTHON="$MOVIEPILOT_PYTHON"
+else
+  BOOTSTRAP_PYTHON="$EXTERNAL_BOOTSTRAP_PYTHON"
+fi
+
+cd "$ROOT"
+
+case "${1:-}" in
+  ""|-h|--help|help)
+    if [ "${1:-}" = "help" ]; then
+      shift
+      show_command_help "$@"
+    fi
+    show_help
+    exit 0
+    ;;
+  commands)
+    show_commands
+    exit 0
+    ;;
+  install)
+    shift
+    case "${1:-}" in
+      deps)
+        shift
+        INSTALL_DEPS_PYTHON="$(bootstrap_python_for_args "$@")" || exit 1
+        require_bootstrap_python "$INSTALL_DEPS_PYTHON"
+        exec "$INSTALL_DEPS_PYTHON" "$SETUP_SCRIPT" install-deps "$@"
+        ;;
+      frontend)
+        shift
+        require_bootstrap_python
+        exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" install-frontend "$@"
+        ;;
+      cjk)
+        shift
+        require_bootstrap_python
+        exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" install-cjk "$@"
+        ;;
+      resources)
+        shift
+        require_bootstrap_python
+        exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" install-resources "$@"
+        ;;
+      *)
+        echo "支持的命令：moviepilot install deps|cjk|frontend|resources" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  init)
+    shift
+    require_bootstrap_python
+    exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" init "$@"
+    ;;
+  setup)
+    shift
+    SETUP_PYTHON="$(bootstrap_python_for_args "$@")" || exit 1
+    require_bootstrap_python "$SETUP_PYTHON"
+    exec "$SETUP_PYTHON" "$SETUP_SCRIPT" setup "$@"
+    ;;
+  uninstall)
+    shift
+    require_bootstrap_python
+    COMMAND_PATH="$(command -v moviepilot 2>/dev/null || true)"
+    MOVIEPILOT_LAUNCH_PATH="$0" MOVIEPILOT_COMMAND_PATH="$COMMAND_PATH" exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" uninstall "$@"
+    ;;
+  update)
+    shift
+    UPDATE_PYTHON="$(bootstrap_python_for_args "$@")" || exit 1
+    require_bootstrap_python "$UPDATE_PYTHON"
+    exec "$UPDATE_PYTHON" "$SETUP_SCRIPT" update "$@"
+    ;;
+  startup)
+    shift
+    require_bootstrap_python
+    exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" startup "$@"
+    ;;
+  agent)
+    shift
+    require_bootstrap_python
+    exec "$BOOTSTRAP_PYTHON" "$SETUP_SCRIPT" agent "$@"
+    ;;
+  doctor)
+    run_runtime_cli "$@"
+    ;;
+esac
+
+if [ ! -x "$MOVIEPILOT_PYTHON" ]; then
+  echo "未找到项目虚拟环境，请先执行 moviepilot install deps 或 moviepilot setup" >&2
+  exit 1
+fi
+
+exec "$MOVIEPILOT_PYTHON" -m app.cli "$@"

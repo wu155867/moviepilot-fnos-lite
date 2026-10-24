@@ -1,0 +1,198 @@
+"""
+从已配置站点的详情页提取可下载的字幕链接。
+"""
+
+import re
+from typing import List, Optional, Tuple, Union
+from urllib.parse import urljoin, urlparse
+
+from lxml import etree
+
+from app.adapters.network.http import RequestUtils
+from app.application.site.query import get_configured_site_query_service
+
+# 站点资源在安装时提供，静态源码树不包含运行时生成的目录。
+from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
+from app.domain.context import Context
+from app.modules import _ModuleBase
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+from app.schemas.types import ModuleType, OtherModulesType
+
+
+class SubtitleModule(_ModuleBase):
+    """
+    字幕下载模块。
+    """
+
+    # 站点详情页字幕下载元素识别XPATH
+    _SITE_SUBTITLE_XPATH = [
+        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a[not(@class)]',
+        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a',
+        # 憨憨站点的字幕区域
+        '//div[contains(@class, "font-bold")][text()="字幕"]/following-sibling::div[1]//a[not(@class)]',
+    ]
+    _SUBTITLE_URL_ATTRS = (
+        "href",
+        "data-url",
+        "data-href",
+        "data-link",
+        "data-download",
+        "data-download-url",
+    )
+    _SCRIPT_URL_RE = re.compile(
+        r"""["'](?P<url>(?:https?:)?//[^"']+|/[^"']+|[^"']*(?:download|subtitle|subs?)[^"']*)["']""",
+        re.IGNORECASE,
+    )
+
+    def init_module(self) -> None:
+        """
+        字幕链接按请求解析，无需创建常驻客户端。
+        """
+        pass
+
+    @staticmethod
+    def get_name() -> str:
+        """
+        返回站点字幕模块的展示名称。
+        """
+        return "站点字幕"
+
+    @staticmethod
+    def get_type() -> ModuleType:
+        """
+        获取模块类型。
+        """
+        return ModuleType.Other
+
+    @staticmethod
+    def get_subtype() -> OtherModulesType:
+        """
+        获取模块子类型。
+        """
+        return OtherModulesType.Subtitle
+
+    @staticmethod
+    def get_priority() -> int:
+        """
+        获取模块优先级，数字越小优先级越高，只有同一接口下优先级才生效。
+        """
+        return 0
+
+    def init_setting(self) -> Optional[Tuple[str, Union[str, bool]]]:
+        """
+        字幕解析没有独立开关，是否执行由调用方决定。
+        """
+        pass
+
+    def stop(self) -> None:
+        """
+        字幕解析不持有需要停止的后台资源。
+        """
+        pass
+
+    def test(self) -> Optional[Tuple[bool, str]]:
+        """
+        字幕能力依赖具体资源详情页，不提供独立连接测试。
+        """
+        pass
+
+    @classmethod
+    def __normalize_subtitle_link(cls, page_url: str, sublink: str) -> Optional[str]:
+        """
+        将字幕候选地址解析为可请求的 HTTP 或 HTTPS 链接。
+
+        :param page_url: 字幕所在详情页地址，用于补齐相对路径和协议
+        :param sublink: 页面提取的候选地址
+        :return: 完整下载地址；空值、锚点或非 HTTP 协议返回 None
+        """
+        if not sublink:
+            return None
+        sublink = sublink.strip()
+        if not sublink or sublink.startswith("#"):
+            return None
+        parsed = urlparse(sublink)
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            return None
+        if sublink.startswith("//"):
+            page_scheme = urlparse(page_url).scheme or "https"
+            sublink = f"{page_scheme}:{sublink}"
+        else:
+            sublink = urljoin(page_url, sublink)
+        parsed = urlparse(sublink)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        return sublink
+
+    @classmethod
+    def _parse_subtitle_links(cls, html: etree._Element, page_url: str) -> List[str]:
+        """
+        按站点页面结构提取去重后的字幕下载链接。
+
+        第一个成功提取链接的区域优先，不再扫描后续较宽泛的匹配规则。
+
+        :param html: 已解析的详情页文档
+        :param page_url: 详情页地址，用于补齐相对链接
+        :return: 按页面发现顺序排列的有效下载地址
+        """
+        sublink_list: List[str] = []
+        found_links = set()
+        for xpath in cls._SITE_SUBTITLE_XPATH:
+            sublink_count = len(sublink_list)
+            sublink_nodes = html.xpath(xpath)
+            if sublink_nodes:
+                for sublink_node in sublink_nodes:
+                    sublinks = [sublink_node.get(attr) for attr in cls._SUBTITLE_URL_ATTRS]
+                    sublinks.extend(
+                        match.group("url")
+                        for match in cls._SCRIPT_URL_RE.finditer(sublink_node.get("onclick") or "")
+                    )
+                    for sublink in sublinks:
+                        sublink = cls.__normalize_subtitle_link(page_url, sublink)
+                        if not sublink or sublink in found_links:
+                            continue
+                        found_links.add(sublink)
+                        sublink_list.append(sublink)
+                # 已成功匹配字幕区域，后续xpath可以忽略
+                if len(sublink_list) > sublink_count:
+                    break
+        return sublink_list
+
+    def site_subtitle_links(self, context: Context) -> Optional[List[str]]:
+        """
+        访问普通站点的详情页并提取字幕下载链接。
+
+        :param context: 含种子详情页地址、站点凭据和代理配置的资源上下文
+        :return: 下载链接列表；页面为空时返回空列表，缺少地址、访问失败或站点使用独立接口时返回 None
+        """
+        torrent = context.torrent_info
+        if torrent is None or not torrent.page_url:
+            return None
+        page_url = torrent.page_url
+        # 采用API访问的站点由对应爬虫模块处理，详情页HTML不含字幕元素
+        if torrent.site is not None:
+            site = get_configured_site_query_service().get_sync(torrent.site)
+            if site and site.domain and (indexer := SitesHelper().get_indexer(site.domain)):
+                if indexer.get("parser") == "mTorrent":
+                    return None
+        request = RequestUtils(
+            cookies=torrent.site_cookie,
+            ua=torrent.site_ua,
+            proxies=get_runtime_setting('PROXY') if torrent.site_proxy else None,
+        )
+        res = request.get_res(page_url)
+        if res and res.status_code == 200:
+            if not res.text:
+                logger.warn(f"读取页面代码失败：{page_url}")
+                return []
+            html = etree.HTML(res.text)
+            try:
+                return self._parse_subtitle_links(html, page_url)
+            finally:
+                if html is not None:
+                    del html
+        elif res is not None:
+            logger.warn(f"连接 {page_url} 失败，状态码：{res.status_code}")
+        else:
+            logger.warn(f"无法打开链接：{page_url}")
+        return None

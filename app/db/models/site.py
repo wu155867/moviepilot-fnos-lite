@@ -1,0 +1,158 @@
+"""
+站点配置与认证信息的 ORM 模型与会话内数据操作。
+
+会话及事务由调用方管理，本模块不负责提交或回滚。
+"""
+
+from datetime import datetime
+from typing import Any, Optional, Self
+
+from sqlalchemy import JSON, Boolean, Integer, String, delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from app.db.base import Base, get_id_column
+
+
+class Site(Base):
+    """
+    站点表
+    """
+    id = get_id_column()
+    # 站点名
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    # 域名Key
+    domain: Mapped[Optional[str]] = mapped_column(String, index=True)
+    # 站点地址
+    url: Mapped[str] = mapped_column(String, nullable=False)
+    # 站点优先级
+    pri: Mapped[Optional[int]] = mapped_column(Integer, default=1)
+    # RSS地址，未启用
+    rss: Mapped[Optional[str]] = mapped_column(String)
+    # 站点认证请求使用的 Cookie 文本。
+    cookie: Mapped[Optional[str]] = mapped_column(String)
+    # 站点请求使用的浏览器标识。
+    ua: Mapped[Optional[str]] = mapped_column(String)
+    # 站点接口认证使用的 API 密钥。
+    apikey: Mapped[Optional[str]] = mapped_column(String)
+    # 站点接口认证使用的令牌。
+    token: Mapped[Optional[str]] = mapped_column(String)
+    # 是否使用代理 0-否，1-是
+    proxy: Mapped[Optional[int]] = mapped_column(Integer)
+    # 过滤规则
+    filter: Mapped[Optional[str]] = mapped_column(String)
+    # 是否渲染
+    render: Mapped[Optional[int]] = mapped_column(Integer)
+    # 是否公开站点
+    public: Mapped[Optional[int]] = mapped_column(Integer)
+    # 附加信息
+    note: Mapped[Optional[Any]] = mapped_column(JSON)
+    # 流控单位周期
+    limit_interval: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    # 流控次数
+    limit_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    # 流控间隔
+    limit_seconds: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    # 超时时间
+    timeout: Mapped[Optional[int]] = mapped_column(Integer, default=15)
+    # 是否启用
+    is_active: Mapped[Optional[bool]] = mapped_column(Boolean(), default=True)
+    # 创建时间
+    lst_mod_date: Mapped[Optional[str]] = mapped_column(String, default=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # 下载器
+    downloader: Mapped[Optional[str]] = mapped_column(String)
+
+    @classmethod
+    def get_by_domain(cls, db: Session, domain: str) -> Optional[Self]:
+        """
+        在调用方 Session 中按域名查询站点。
+        """
+        site: Optional[Self] = db.execute(select(cls).where(cls.domain == domain)).scalars().first()
+        return site
+
+    @classmethod
+    async def async_get_by_domain(
+        cls,
+        db: AsyncSession,
+        domain: str,
+    ) -> Optional[Self]:
+        """
+        在调用方 AsyncSession 中按域名查询站点。
+        """
+        result = await db.execute(select(cls).where(cls.domain == domain))
+        site: Optional[Self] = result.scalar_one_or_none()
+        return site
+
+    @classmethod
+    async def async_get_by_name(
+        cls,
+        db: AsyncSession,
+        name: str,
+    ) -> Optional[Self]:
+        """
+        在调用方 AsyncSession 中按站点名称查询。
+        """
+        result = await db.execute(select(cls).where(cls.name == name))
+        site: Optional[Self] = result.scalar_one_or_none()
+        return site
+
+    @classmethod
+    def get_actives(cls, db: Session) -> list[Self]:
+        """
+        在调用方 Session 中查询启用站点。
+        """
+        return list(db.execute(
+            select(cls).where(cls.is_active.is_(True))
+        ).scalars().all())
+
+    @classmethod
+    async def async_get_actives(cls, db: AsyncSession) -> list[Self]:
+        """
+        在调用方 AsyncSession 中查询启用站点。
+        """
+        result = await db.execute(select(cls).where(cls.is_active.is_(True)))
+        return list(result.scalars().all())
+
+    @classmethod
+    def list_order_by_pri(cls, db: Session) -> list[Self]:
+        """
+        在调用方 Session 中按优先级升序查询站点。
+        """
+        return list(db.execute(select(cls).order_by(cls.pri)).scalars().all())
+
+    @classmethod
+    async def async_list_order_by_pri(cls, db: AsyncSession) -> list[Self]:
+        """
+        在调用方 AsyncSession 中按优先级升序查询站点。
+        """
+        result = await db.execute(select(cls).order_by(cls.pri))
+        return list(result.scalars().all())
+
+    @classmethod
+    def get_domains_by_ids(
+        cls,
+        db: Session,
+        ids: list[int],
+    ) -> list[Optional[str]]:
+        """
+        在调用方 Session 中按 ID 查询域名。
+        """
+        if not ids:
+            return []
+        return list(db.execute(
+            select(cls.domain).where(cls.id.in_(ids))
+        ).scalars().all())
+
+    @classmethod
+    def reset(cls, db: Session) -> None:
+        """
+        在调用方持有的同步事务中暂存清空操作。
+        """
+        db.execute(delete(cls))
+
+    @classmethod
+    async def async_reset(cls, db: AsyncSession) -> None:
+        """
+        在调用方持有的异步事务中暂存清空操作。
+        """
+        await db.execute(delete(cls))

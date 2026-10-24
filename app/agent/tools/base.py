@@ -1,0 +1,1078 @@
+"""
+Agent 工具公共执行边界、权限校验、流式展示及结果格式化。
+"""
+
+import asyncio
+import inspect
+import json
+import threading
+from abc import ABCMeta, abstractmethod
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context, ContextVar, copy_context
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Protocol, Union, cast
+
+from langchain_core.tools import BaseTool
+from pydantic import PrivateAttr
+
+from app.agent.policy.sanitizer import (
+    stable_type_name,
+    summarize_error,
+    summarize_input,
+    summarize_result,
+)
+from app.agent.tools.result import ToolExecutionError, inspect_tool_result
+from app.agent.tools.tags import ToolTag
+from app.application.agent import AgentDataContext
+from app.application.messaging.channel.admin import matches_channel_admin
+from app.application.notification import get_notification_configs
+from app.chain.base import ChainBase
+from app.foundation.identity import build_user_memory_key
+from app.runtime.log import logger
+from app.runtime.priority import is_interactive
+from app.runtime.settings import get_runtime_setting
+from app.schemas.message import Message
+from app.schemas.types import MessageType, NotificationChannel
+
+if TYPE_CHECKING:
+    from app.agent.callback import StreamingHandler as _StreamingHandlerProtocol
+else:
+    class _StreamingHandlerProtocol(Protocol):
+        """
+        工具执行仅依赖的流式缓冲合同。
+        """
+
+        @property
+        def is_streaming(self) -> bool:
+            """
+            是否正在收集流式输出。
+
+            :return: 当前流式收集已启用时为 True
+            """
+            ...
+
+        @property
+        def is_auto_flushing(self) -> bool:
+            """
+            是否由渠道编辑能力自动刷新缓冲。
+
+            :return: 渠道支持并启用自动刷新时为 True
+            """
+            ...
+
+        @property
+        def last_buffer_char(self) -> str:
+            """
+            读取缓冲区最后一个字符。
+
+            :return: 缓冲尾字符；缓冲为空时返回空字符串
+            """
+            ...
+
+        def emit(self, token: str) -> str:
+            """
+            追加流式文本。
+
+            :param token: 本次待追加的模型输出文本
+            :return: 实际追加的文本，可能包含待输出的工具摘要并移除重复换行
+            """
+            ...
+
+        def emit_tool_message(self, message: str) -> str:
+            """
+            追加工具提示并登记展示语义。
+
+            :param message: 面向用户的工具执行提示
+            :return: 实际追加的提示文本；空白提示返回空字符串
+            """
+            ...
+
+        def report_tool_call(
+            self,
+            tool_name: str,
+            tool_message: Optional[str] = None,
+            tool_kwargs: Optional[dict[str, Any]] = None,
+        ) -> str:
+            """
+            按详细模式展示工具调用，或登记为延迟汇总。
+
+            :param tool_name: 当前调用的工具名称
+            :param tool_message: 可选用户提示；None 时仅保留工具名称用于汇总
+            :param tool_kwargs: 可选工具参数，用于生成汇总记录
+            :return: 空字符串；展示内容直接写入缓冲或延迟汇总记录
+            """
+            ...
+
+        def tool_call_started(
+            self,
+            tool_name: str,
+            tool_message: Optional[str] = None,
+        ) -> str:
+            """
+            结束模型思考状态，并预留工具调用生命周期入口。
+
+            :param tool_name: 开始执行的工具名称
+            :param tool_message: 可选用户提示；当前实现不单独展示该参数
+            :return: 当前实现返回空字符串，供调用方继续传递给结束入口
+            """
+            ...
+
+        def tool_call_finished(self, tool_id: str, status: str = "done") -> None:
+            """
+            收口工具执行生命周期入口，当前实现不修改展示状态。
+
+            :param tool_id: 开始入口返回的展示标识；当前实现忽略该参数
+            :param status: 展示结束状态，默认 done；当前实现忽略该参数
+            :return: 无返回数据，后续思考状态由模型推理协议开启
+            """
+            ...
+
+        async def take(self) -> str:
+            """
+            取出并清空当前缓冲内容。
+
+            :return: 调用时累计的文本；缓冲为空时返回空字符串
+            """
+            ...
+
+        def record_tool_call(
+            self,
+            tool_name: str,
+            tool_message: Optional[str] = None,
+            tool_kwargs: Optional[dict[str, Any]] = None,
+        ) -> None:
+            """
+            记录待汇总展示的工具调用。
+
+            :param tool_name: 待登记的工具名称
+            :param tool_message: 可选用户提示，None 表示未提供
+            :param tool_kwargs: 可选调用参数，用于提取汇总信息
+            :return: 无返回数据，将调用信息加入汇总记录
+            """
+            ...
+
+
+def __getattr__(name: str) -> Any:
+    """
+    显式访问历史 StreamingHandler 符号时返回 canonical 实现。
+    """
+    if name == "StreamingHandler":
+        from app.agent.callback import StreamingHandler
+
+        return StreamingHandler
+    raise AttributeError(f"module 'app.agent.tools.base' has no attribute {name!r}")
+
+
+class ToolChain(ChainBase):
+    """
+    为工具提供宿主业务链入口。
+    """
+
+    pass
+
+
+# 单个工具结果的兜底上限。各工具仍应优先在自身逻辑中分页或摘要化；
+# 这里用于拦截遗漏路径，避免超大结果直接进入模型上下文。
+DEFAULT_TOOL_RESULT_MAX_CHARS = 64 * 1024
+
+
+def serialize_tool_result_for_agent(result: Any) -> str:
+    """
+    将工具返回值稳定转换为 Agent 可消费的字符串。
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (int, float)):
+        return str(result)
+    try:
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        logger.warning(
+            f"工具结果转换为JSON失败: {summarize_error(e)}, 使用字符串表示"
+        )
+        return str(result)
+
+
+def normalize_tool_failure_for_agent(result: Any, *, tool_name: str) -> str | list[dict[str, Any]]:
+    """
+    将旧工具返回的裸错误文本统一成模型可恢复的结构化失败回执。
+    """
+    if not isinstance(result, str):
+        return cast(str | list[dict[str, Any]], result)
+    text = result.strip()
+    if not text or text.startswith("{") or text.startswith("["):
+        return result
+    markers = ("错误", "操作失败", "浏览器操作失败", "工具执行异常")
+    if not text.startswith(markers):
+        return result
+    return json.dumps({
+        "success": False,
+        "execution_outcome": "failed",
+        "tool": tool_name,
+        "error": text,
+        "recovery": "根据错误信息修正输入或改用正确工具后重试；不要重复未确认的写入。",
+    }, ensure_ascii=False)
+
+
+TOOL_RESULT_RECORDER: ContextVar[Optional[Callable[[str, str], dict[str, Any]]]] = ContextVar(
+    "agent_tool_result_recorder", default=None,
+)
+
+
+def format_tool_result_for_agent(
+    result: Any,
+    *,
+    tool_name: Optional[str] = None,
+    max_chars: Optional[int] = DEFAULT_TOOL_RESULT_MAX_CHARS,
+) -> str:
+    """
+    统一格式化工具结果，并在超长时返回结构化预览。
+
+    具体工具可以通过 `result_max_chars` 覆盖上限；传入 None 或 <=0 表示不截断。
+    """
+    formatted_result = serialize_tool_result_for_agent(result)
+    if not max_chars or max_chars <= 0 or len(formatted_result) <= max_chars:
+        return formatted_result
+
+    reference: dict[str, Any] = {}
+    recorder = TOOL_RESULT_RECORDER.get()
+    if recorder is not None:
+        reference = recorder(tool_name or "unknown", formatted_result)
+        if reference.get("result_id"):
+            max_chars = min(max_chars, 8192)
+    outcome = inspect_tool_result(result).value
+
+    def _dump_preview(preview: str) -> str:
+        """
+        序列化截断结果，并让 returned_chars 与实际预览保持一致。
+        """
+        payload = {
+            **reference,
+            **({"next_offset": len(preview)} if reference.get("result_id") else {}),
+            "execution_outcome": outcome,
+            "tool_result_truncated": True,
+            "tool_name": tool_name,
+            "total_chars": len(formatted_result),
+            "returned_chars": len(preview),
+            "content_preview": preview,
+            "message": (
+                "完整结果已在当前会话临时保存；使用 read_tool_result 的 result_id 和 next_offset 继续读取，无需重复执行原工具。"
+                if reference.get("result_id") else
+                f"工具返回内容超过 {max_chars} 字符，已截断为预览；"
+                "请使用更精确的筛选条件、分页参数或专用查询参数继续获取。"
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # JSON 会转义换行、引号和反斜杠，预览本身等于上限时，最终返回值仍可能
+    # 明显超限。通过二分查找预留包装开销，确保进入模型的最终字符串是硬上限。
+    low = 0
+    high = min(len(formatted_result), max_chars)
+    best_result = _dump_preview("")
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _dump_preview(formatted_result[:middle])
+        if len(candidate) <= max_chars:
+            best_result = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best_result
+
+
+# 将常见的阻塞调用按能力域拆分到独立线程池，避免外部慢 IO 抢占同一批 worker。
+_BLOCKING_BUCKET_LIMITS = {
+    "command": 4,
+    "default": 4,
+    "config": 2,
+    "db": 4,
+    "downloader": 4,
+    "mediaserver": 4,
+    "plugin": 2,
+    "rule": 2,
+    "site": 4,
+    "storage": 4,
+    "subscribe": 2,
+    "web": 2,
+    "workflow": 2,
+}
+_blocking_semaphores = {
+    bucket: asyncio.Semaphore(limit)
+    for name, limit in _BLOCKING_BUCKET_LIMITS.items()
+    for bucket in (name, f"interactive:{name}")
+}
+_blocking_executors: dict[str, ThreadPoolExecutor] = {}
+_blocking_retiring_executors: set[ThreadPoolExecutor] = set()
+_blocking_futures: dict[ConcurrentFuture[Any], ThreadPoolExecutor] = {}
+_blocking_executor_lock = threading.RLock()
+_blocking_executor_accepting = True
+
+
+def _discard_blocking_future(future: ConcurrentFuture[Any]) -> None:
+    """
+    在同步调用结束后撤销 Future 登记，并释放不再持有任务的退役执行器记录。
+    """
+    with _blocking_executor_lock:
+        executor = _blocking_futures.pop(future, None)
+        if executor is None or executor not in _blocking_retiring_executors:
+            return
+        if executor not in _blocking_futures.values():
+            _blocking_retiring_executors.discard(executor)
+
+
+def _submit_blocking_call(
+    bucket: str,
+    bound_call: Callable[[], Any],
+) -> ConcurrentFuture[Any]:
+    """
+    在提交门禁内原子取得 executor、提交调用并登记 Future owner。
+    """
+    context = copy_context()
+    with _blocking_executor_lock:
+        if not _blocking_executor_accepting:
+            raise RuntimeError("Agent 工具阻塞执行器正在关闭，不能再提交新任务")
+        executor = _blocking_executors.get(bucket)
+        if executor is None:
+            limit = _BLOCKING_BUCKET_LIMITS[bucket.removeprefix("interactive:")]
+            executor = ThreadPoolExecutor(
+                max_workers=limit,
+                thread_name_prefix=f"agent-tool-{bucket}",
+            )
+            _blocking_executors[bucket] = executor
+        # 长期 worker 保持空底层上下文，每个任务只在自己的调用快照内运行。
+        future = Context().run(partial(executor.submit, context.run, bound_call))
+        _blocking_futures[future] = executor
+        future.add_done_callback(_discard_blocking_future)
+        return future
+
+
+def _retire_blocking_executors(*, cancel_futures: bool) -> tuple[ThreadPoolExecutor, ...]:
+    """
+    撤销活动 executor 的提交资格，并保留其运行 Future 对应的 owner。
+    """
+    with _blocking_executor_lock:
+        executors = tuple(_blocking_executors.values())
+        _blocking_executors.clear()
+        _blocking_retiring_executors.update(executors)
+    for executor in executors:
+        executor.shutdown(wait=False, cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        owned_executors = set(_blocking_futures.values())
+        _blocking_retiring_executors.intersection_update(owned_executors)
+    return executors
+
+
+def begin_blocking_executor_shutdown(*, cancel_futures: bool = True) -> None:
+    """
+    原子封住新阻塞工具提交，并请求取消尚未开始的同步调用。
+    """
+    global _blocking_executor_accepting
+    with _blocking_executor_lock:
+        _blocking_executor_accepting = False
+    _retire_blocking_executors(cancel_futures=cancel_futures)
+
+
+def reopen_blocking_executors() -> bool:
+    """
+    仅在旧 Future 和 executor 全部收敛后重新开放测试生命周期。
+    """
+    global _blocking_executor_accepting
+    with _blocking_executor_lock:
+        if _blocking_futures or _blocking_retiring_executors:
+            return False
+        _blocking_executor_accepting = True
+        return True
+
+
+async def close_blocking_executors(
+    *,
+    timeout_seconds: float,
+    cancel_futures: bool = True,
+) -> bool:
+    """
+    有限等待全部阻塞工具 Future，超时保留 Future 与 executor owner。
+    """
+    begin_blocking_executor_shutdown(cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        futures = tuple(_blocking_futures)
+    wrapped_futures = tuple(asyncio.wrap_future(future) for future in futures)
+    if wrapped_futures:
+        done, pending = await asyncio.wait(
+            wrapped_futures,
+            timeout=max(0.0, timeout_seconds),
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        for pending_future in pending:
+            pending_future.add_done_callback(
+                lambda completed: completed.exception()
+                if not completed.cancelled()
+                else None
+            )
+
+    with _blocking_executor_lock:
+        unfinished = tuple(
+            future for future in _blocking_futures if not future.done()
+        )
+        retiring_count = len(_blocking_retiring_executors)
+    if unfinished:
+        logger.error(
+            "Agent 阻塞工具未在 %.1f 秒内收敛：futures=%d，executors=%d",
+            max(0.0, timeout_seconds),
+            len(unfinished),
+            retiring_count,
+        )
+        return False
+    return True
+
+
+def shutdown_blocking_executors(
+    *,
+    wait: bool = True,
+    cancel_futures: bool = False,
+) -> bool:
+    """
+    同步清理测试 owner；非等待模式下保留尚未收敛的 executor 句柄。
+    """
+    executors = _retire_blocking_executors(cancel_futures=cancel_futures)
+    for executor in executors:
+        if wait:
+            executor.shutdown(wait=True, cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        return not _blocking_futures and not _blocking_retiring_executors
+
+
+class ToolExecutionTimeoutError(TimeoutError):
+    """
+    Agent 工具执行超时异常。
+    """
+
+
+def _get_tool_timeout_seconds() -> Optional[float]:
+    """
+    读取工具执行超时时间，配置为 0 或负数时表示不限制。
+    """
+    try:
+        timeout = float(get_runtime_setting('LLM_TOOL_TIMEOUT') or 0)
+    except (TypeError, ValueError):
+        timeout = 0
+    return timeout if timeout > 0 else None
+
+
+async def run_agent_blocking(
+        bucket: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """
+    在受控线程池中运行阻塞型同步代码。
+
+    调用方被取消时不会提前释放并发名额，避免底层阻塞调用仍在运行时继续接纳
+    新任务，把同一类慢 IO 的线程池持续打满。
+    """
+    bucket_name = bucket if bucket in _BLOCKING_BUCKET_LIMITS else "default"
+    if is_interactive():
+        bucket_name = f"interactive:{bucket_name}"
+    semaphore = _blocking_semaphores[bucket_name]
+    bound_call = partial(func, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+
+    await semaphore.acquire()
+    try:
+        future = _submit_blocking_call(bucket_name, bound_call)
+    except Exception:
+        semaphore.release()
+        raise
+
+    def _release_semaphore(_future: ConcurrentFuture[object]) -> None:
+        """
+        同步工具真实结束后才归还所属执行组的并发额度。
+        """
+        try:
+            _future.exception()
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(semaphore.release)
+        except RuntimeError:
+            pass
+
+    future.add_done_callback(_release_semaphore)
+    return await asyncio.shield(asyncio.wrap_future(future, loop=loop))
+
+
+class MoviePilotTool(BaseTool, metaclass=ABCMeta):
+    """
+    MoviePilot专用工具基类（LangChain v1 / langchain_core）
+
+    :cvar result_max_chars: 结果文本上限，单位为字符；None 或不大于 0 时不截断
+    :ivar _session_id: 当前可信对话会话标识
+    :ivar _user_id: 当前调用用户标识
+    :ivar _channel: 消息渠道名称；非消息入口可为 None
+    :ivar _source: 渠道内消息来源；尚未绑定时为 None
+    :ivar _username: 展示和消息回传使用的用户名；可为 None
+    :ivar _stream_handler: 当前会话的流式输出缓冲接口；未绑定时为 None
+    :ivar _require_admin: 从具体工具字段读取的管理员权限要求，缺省为 False
+    :ivar _agent_context: 调用入口注入的身份、工作目录等上下文，默认独立空字典
+    :ivar _data: 组合根注入的数据能力；未装配时为 None，访问 data 会失败
+    """
+
+    result_max_chars: ClassVar[Optional[int]] = DEFAULT_TOOL_RESULT_MAX_CHARS
+    return_direct: bool = False
+
+    _session_id: str = PrivateAttr()
+    _user_id: str = PrivateAttr()
+    _channel: Optional[str] = PrivateAttr(default=None)
+    _source: Optional[str] = PrivateAttr(default=None)
+    _username: Optional[str] = PrivateAttr(default=None)
+    _stream_handler: Optional[_StreamingHandlerProtocol] = PrivateAttr(default=None)
+    _require_admin: bool = PrivateAttr(default=False)
+    _agent_context: dict[str, object] = PrivateAttr(default_factory=dict)
+    _data: Optional[AgentDataContext] = PrivateAttr(default=None)
+
+    def __init__(
+        self,
+        session_id: str,
+        user_id: str,
+        data: Optional[AgentDataContext] = None,
+        **kwargs: object,
+    ) -> None:
+        """
+        保存会话身份及组合根注入的 Agent 数据上下文。
+        """
+        super().__init__(**kwargs)
+        self._session_id = session_id
+        self._user_id = user_id
+        self._data = data
+        # require_admin 在各工具子类以 pydantic 字段声明，pydantic v2 不在类对象上暴露字段值
+        # （getattr(cls, ...) 取不到），必须经实例读取——super().__init__() 已按字段默认填充实例；
+        # getattr 兜底兼容未声明该字段的工具，缺省按非管理员（False）处理。
+        self._require_admin = getattr(self, "require_admin", False)
+        self.tags = self._build_tool_tags()
+
+    @property
+    def data(self) -> AgentDataContext:
+        """
+        返回工具数据上下文；未装配时稳定失败而非回退全局 locator。
+        """
+        if self._data is None:
+            raise RuntimeError("Agent 工具数据上下文尚未注入")
+        return self._data
+
+    @staticmethod
+    def _normalize_tag_values(tags: Optional[Any]) -> set[str]:
+        """
+        规范化 LangChain 工具标签。
+        """
+        if not tags:
+            return set()
+        if isinstance(tags, (str, ToolTag)):
+            tags = [tags]
+        normalized_tags = set()
+        for tag in tags:
+            if isinstance(tag, ToolTag):
+                normalized_tags.add(tag.value)
+            elif tag:
+                normalized_tags.add(str(tag))
+        return normalized_tags
+
+    def _build_tool_tags(self) -> list[str]:
+        """
+        规范化工具实现中显式声明的标签。
+        """
+        explicit_tags = self._normalize_tag_values(getattr(self, "tags", None))
+        return sorted(explicit_tags | {ToolTag.AgentTool.value})
+
+    def _run(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        拒绝同步执行，确保工具遵循异步超时与宿主策略边界。
+        """
+        raise NotImplementedError("MoviePilotTool 只支持异步调用，请使用 _arun")
+
+    async def _arun(self, *args: Any, **kwargs: Any) -> Union[str, list[dict[str, Any]]]:
+        """
+        异步运行工具，负责：
+        1. 在工具调用前将流式消息推送给用户
+        2. 持久化工具调用记录到会话记忆
+        3. 调用具体工具逻辑（子类实现的 execute 方法）
+        4. 持久化工具结果到会话记忆
+        5. 权限检查
+        """
+
+        permission_result = await self._check_permission()
+        if permission_result:
+            # 工具被权限门禁拦截时，模型在调用前可能已输出一段引导文本，且这里
+            # 不会产生工具消息或统计摘要；补一个换行分隔符，避免随后的失败说明
+            # 与引导文本直接连在一起。
+            self._ensure_tool_boundary_separator()
+            return json.dumps({"success": False, "error": permission_result}, ensure_ascii=False)
+
+        # 获取工具执行提示消息
+        tool_message = self.get_tool_message(**kwargs)
+        tool_call_id = ""
+
+        # 发送工具执行过程消息（流式传输且非最后终结工具时）
+        if self._stream_handler and self._stream_handler.is_streaming and not self.return_direct:
+            start_tool_call = getattr(self._stream_handler, "tool_call_started", None)
+            if callable(start_tool_call):
+                tool_call_id = str(start_tool_call(self.name, tool_message) or "")
+            if get_runtime_setting('AI_AGENT_VERBOSE'):
+                if self._stream_handler.is_auto_flushing:
+                    # 渠道支持编辑：工具消息追加到 buffer，由定时刷新推送
+                    if tool_message:
+                        self._stream_handler.emit_tool_message(tool_message)
+                else:
+                    allow_dispatch_without_context = self._agent_context.get(
+                        "should_dispatch_reply", False
+                    )
+                    if self._channel and self._source:
+                        # 渠道不支持编辑：取出 Agent 文字 + 工具消息合并独立发送
+                        agent_message = await self._stream_handler.take()
+                        messages = []
+                        if agent_message:
+                            messages.append(agent_message)
+                        if tool_message:
+                            messages.append(f"⚙️ => {tool_message}")
+                        if messages:
+                            merged_message = "\n\n".join(messages)
+                            await self.send_tool_message(merged_message)
+                    elif allow_dispatch_without_context:
+                        agent_message = await self._stream_handler.take()
+                        messages = []
+                        if agent_message:
+                            messages.append(agent_message)
+                        if tool_message:
+                            messages.append(f"⚙️ => {tool_message}")
+                        if messages:
+                            merged_message = "\n\n".join(messages)
+                            await self.send_tool_message(merged_message)
+                    else:
+                        # 后台 capture 流程没有渠道上下文，不能把工具提示回灌到默认通知渠道。
+                        self._stream_handler.record_tool_call(
+                            tool_name=self.name,
+                            tool_message=tool_message,
+                            tool_kwargs=kwargs,
+                        )
+            else:
+                # 非VERBOSE：不逐条回显工具调用，转为在下一段文本前补一句聚合摘要
+                self._stream_handler.record_tool_call(
+                    tool_name=self.name,
+                    tool_message=tool_message,
+                    tool_kwargs=kwargs,
+                )
+        else:
+            # 未启用流式传输，不发送任何工具消息内容
+            pass
+
+        logger.debug(
+            f"Executing tool {self.name} with input summary: {summarize_input(kwargs)}"
+        )
+
+        # 执行具体工具逻辑
+        try:
+            result = await self.run_with_timeout(**kwargs)
+            formatted_result = normalize_tool_failure_for_agent(
+                self.format_agent_result(result, **kwargs), tool_name=self.name,
+            )
+
+            logger.info(
+                f"Agent工具 {self.name} 返回结果，状态: {inspect_tool_result(formatted_result).value}，"
+                f"结果摘要: {summarize_result(formatted_result)}"
+            )
+
+            if tool_call_id:
+                finish_tool_call = getattr(self._stream_handler, "tool_call_finished", None)
+                if callable(finish_tool_call):
+                    finish_tool_call(tool_call_id, "done")
+        except ToolExecutionTimeoutError as e:
+            if tool_call_id:
+                finish_tool_call = getattr(self._stream_handler, "tool_call_finished", None)
+                if callable(finish_tool_call):
+                    finish_tool_call(tool_call_id, "error")
+            error_message = summarize_error(e)
+            logger.warning(error_message)
+            raise
+        except Exception as e:
+            if tool_call_id:
+                finish_tool_call = getattr(self._stream_handler, "tool_call_finished", None)
+                if callable(finish_tool_call):
+                    finish_tool_call(tool_call_id, "error")
+            error_message = f"工具执行异常（{stable_type_name(e)}），请检查参数或查询当前状态后继续处理。"
+            logger.error(f"Tool {self.name} execution failed: {summarize_error(e)}")
+            raise ToolExecutionError(error_message) from e
+
+        return formatted_result
+
+    def format_agent_result(self, result: Any, **tool_arguments: Any) -> Union[str, list[dict[str, Any]]]:
+        """
+        Agent 专用输出入口；默认仍为有界文本，专用工具可覆写为真实多模态块。
+        """
+        return format_tool_result_for_agent(
+            result, tool_name=self.name, max_chars=self.result_max_chars
+        )
+
+    def get_tool_message(self, **kwargs: object) -> Optional[str]:
+        """
+        获取工具执行时的友好提示消息。
+
+        子类可根据实际参数生成提示，基类不提供提示。
+
+        :param kwargs: 本次工具调用的参数
+        :return: 展示给用户的提示文本；无需提示时为 None
+        """
+        return None
+
+    @abstractmethod
+    async def run(self, *args: Any, **kwargs: Any) -> str:
+        """
+        子类实现具体的工具执行逻辑
+        """
+        raise NotImplementedError
+
+    def _get_run_timeout_seconds(self, **kwargs: Any) -> Optional[float]:
+        """
+        获取本次工具调用的等待上限，默认沿用全局配置。
+        """
+        del kwargs
+        return _get_tool_timeout_seconds()
+
+    async def run_with_timeout(self, **kwargs: object) -> str:
+        """
+        按系统配置限制单个工具调用的最长执行时间。
+        """
+        timeout = self._get_run_timeout_seconds(**kwargs)
+        if not timeout:
+            return await self.run(**kwargs)
+        try:
+            return await asyncio.wait_for(self.run(**kwargs), timeout=timeout)
+        except asyncio.TimeoutError as err:
+            raise ToolExecutionTimeoutError(
+                f"工具 {self.name} 执行超时（超过 {timeout:g} 秒），已停止等待结果。"
+                "若工具包含外部写操作，操作可能仍在继续，请先确认实际状态再重试。"
+            ) from err
+
+    @staticmethod
+    async def run_blocking(
+            bucket: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """
+        在受控线程池中运行阻塞型同步代码，避免拖住 FastAPI 主事件循环。
+        """
+        return await run_agent_blocking(bucket, func, *args, **kwargs)
+
+    def set_message_attr(
+        self,
+        channel: Optional[str],
+        source: Optional[str],
+        username: Optional[str],
+    ) -> None:
+        """
+        保存可选的消息渠道上下文；后台和 API 入口可以不提供渠道信息。
+        """
+        self._channel = channel
+        self._source = source
+        self._username = username
+
+    def set_stream_handler(
+        self, stream_handler: Optional[_StreamingHandlerProtocol]
+    ) -> None:
+        """
+        设置回调处理器
+        """
+        self._stream_handler = stream_handler
+
+    def set_agent_context(self, agent_context: Optional[dict[str, object]]) -> None:
+        """
+        设置与当前 Agent 共享的上下文。
+        """
+        # 空 dict 也是合法共享上下文；不能用 ``or {}``，否则每个工具会拿到
+        # 独立的新 dict，跨工具状态（例如质量门槛拒绝标记）无法传播。
+        self._agent_context = {} if agent_context is None else agent_context
+
+    def _ensure_tool_boundary_separator(self) -> None:
+        """
+        在流式缓冲中为工具边界补一个换行分隔符。
+
+        工具被权限门禁等前置检查拦截时不产生工具消息或统计摘要，若模型在调用前
+        已输出文本，后续内容会直接粘在前文后面；这里保证缓冲以换行结尾，让工具
+        前后的内容分行展示。缓冲为空或已以换行结尾时无需处理。
+        """
+        if (
+            self._stream_handler
+            and self._stream_handler.is_streaming
+            and self._stream_handler.last_buffer_char not in ("", "\n")
+        ):
+            self._stream_handler.emit("\n")
+
+    async def is_admin_user(self) -> bool:
+        """
+        判断当前工具调用者是否拥有管理员级权限。
+
+        :return: 当前调用者是系统管理员、渠道管理员或显式管理员上下文时返回 True
+        """
+        if "is_admin" in self._agent_context:
+            return self._agent_context.get("is_admin") is True
+
+        if not self._channel or not self._source:
+            return False
+
+        return await self._has_channel_admin_permission()
+
+    @staticmethod
+    def _resolve_local_path(path: str) -> Path:
+        """
+        解析本地路径并展开符号链接。
+
+        :param path: 用户传入的本地文件或目录路径
+        :return: 规范化后的绝对路径
+        """
+        return Path(path).expanduser().resolve(strict=False)
+
+    @staticmethod
+    def _is_path_relative_to(path: Path, root: Path) -> bool:
+        """
+        判断路径是否位于指定目录内。
+
+        :param path: 待检查路径
+        :param root: 允许访问的根目录
+        :return: 路径在根目录内或等于根目录时返回 True
+        """
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    @classmethod
+    def _get_non_admin_local_file_roots(cls) -> list[Path]:
+        """
+        获取普通用户可访问的本地文件根目录。
+
+        :return: 普通用户允许读写的本地目录列表
+        """
+        roots = [
+            get_runtime_setting('CONFIG_PATH') / "agent",
+        ]
+        resolved_roots = []
+        for root in roots:
+            resolved_root = cls._resolve_local_path(str(root))
+            if resolved_root not in resolved_roots:
+                resolved_roots.append(resolved_root)
+        return resolved_roots
+
+    async def _check_local_file_access(
+        self, path: str, operation: str = "访问"
+    ) -> tuple[Optional[Path], Optional[str]]:
+        """
+        检查当前用户是否可访问指定本地路径。
+
+        :param path: 用户传入的本地文件或目录路径
+        :param operation: 当前操作名称，用于生成拒绝提示
+        :return: 解析后的路径和拒绝原因；拒绝原因为空表示允许访问
+        """
+        if not path:
+            return None, "错误：路径不能为空"
+
+        resolved_path = self._resolve_local_path(path)
+        if await self.is_admin_user():
+            return resolved_path, None
+
+        allowed_roots = self._get_non_admin_local_file_roots()
+        if not any(
+            self._is_path_relative_to(resolved_path, root)
+            for root in allowed_roots
+        ):
+            allowed_text = "、".join(str(root) for root in allowed_roots)
+            return (
+                resolved_path,
+                f"抱歉，普通用户只能{operation}Agent配置目录内的文件或目录：{allowed_text}",
+            )
+
+        agent_root = allowed_roots[0]
+        memory_root = agent_root / "memory"
+        runtime_root = agent_root / "runtime"
+        for protected in (runtime_root / 'learning' / 'users', runtime_root / 'history' / 'users', runtime_root / 'code' / 'users'):
+            if self._is_path_relative_to(resolved_path, protected):
+                user_key = build_user_memory_key(self._user_id)
+                if not user_key or not self._is_path_relative_to(resolved_path, protected / user_key):
+                    return resolved_path, '抱歉，不能读取或修改其他用户的 Agent 消息和个人技能。'
+        if self._is_path_relative_to(resolved_path, runtime_root) and operation != "读取":
+            return (
+                resolved_path,
+                "抱歉，Agent 人格及运行时配置只有系统管理员才能修改。",
+            )
+
+        if self._is_path_relative_to(resolved_path, agent_root / 'skills') and operation != '读取':
+            return resolved_path, '抱歉，公共技能只有系统管理员才能修改；个人学习请使用 skill_manage。'
+
+        if not self._is_path_relative_to(resolved_path, memory_root):
+            return resolved_path, None
+
+        user_memory_root = memory_root / "users"
+        if self._is_path_relative_to(resolved_path, user_memory_root):
+            user_key = build_user_memory_key(self._user_id)
+            own_memory_root = user_memory_root / user_key if user_key else None
+            if not own_memory_root or not self._is_path_relative_to(resolved_path, own_memory_root):
+                return (
+                    resolved_path,
+                    "抱歉，普通用户只能访问自己的用户级记忆，不能读取或修改其他用户的记忆。",
+                )
+            return resolved_path, None
+
+        if operation != "读取":
+            return (
+                resolved_path,
+                "抱歉，全局公共记忆只有系统管理员才能写入；请将个人偏好写入当前用户的记忆目录。",
+            )
+
+        return resolved_path, None
+
+    async def _check_local_storage_access(
+        self,
+        path: str,
+        storage: Optional[str] = "local",
+        operation: str = "访问",
+    ) -> tuple[Optional[Path], Optional[str]]:
+        """
+        检查当前用户是否可访问指定存储路径。
+
+        :param path: 用户传入的文件或目录路径
+        :param storage: 存储类型，普通用户只允许 local
+        :param operation: 当前操作名称，用于生成拒绝提示
+        :return: 本地存储时返回解析后的路径和拒绝原因；远程存储无本地路径
+        """
+        if (storage or "local") != "local":
+            if await self.is_admin_user():
+                return None, None
+            return (
+                None,
+                f"抱歉，普通用户只能{operation}本地Agent配置目录，不能访问远程存储。",
+            )
+
+        return await self._check_local_file_access(path=path, operation=operation)
+
+    async def _check_permission(self) -> Optional[str]:
+        """
+        检查管理员工具权限。
+
+        Agent 共享上下文中的显式管理员事实优先；没有该事实的旧调用才按渠道
+        管理员名单回查，并保留无消息渠道内部调用的兼容行为。
+        """
+        if not self._require_admin:
+            return None
+
+        if await self.is_admin_user():
+            return None
+
+        if "is_admin" not in self._agent_context and (
+            not self._channel or not self._source
+        ):
+            return None
+
+        return (
+            "抱歉，您没有执行此工具的权限。"
+            "只有渠道管理员或系统管理员才能执行工具操作。"
+            "如需执行工具，请联系管理员将您的用户ID添加到渠道管理员列表中（设定 -> 通知 -> 对应渠道配置 -> 管理员名单），"
+            "或联系系统管理员为您设置管理员权限。"
+        )
+
+    async def _has_channel_admin_permission(self) -> bool:
+        """
+        检查当前消息渠道身份是否具备管理员权限。
+
+        :return: 当前渠道稳定用户 ID 位于显式管理员名单或等于渠道主ID时返回 True
+        """
+        if not self._channel or not self._source:
+            return False
+
+        user_id_str = str(self._user_id) if self._user_id else None
+
+        try:
+            channel = NotificationChannel(self._channel)
+        except ValueError:
+            return False
+
+        try:
+            configs = get_notification_configs(include_disabled=True)
+            for config in configs:
+                if config.name == self._source and config.config:
+                    return matches_channel_admin(
+                        channel,
+                        config.config,
+                        user_id_str,
+                    )
+        except Exception as e:
+            logger.error(f"检查权限失败: {summarize_error(e)}")
+
+        return False
+
+    async def send_message(self, message: Message) -> None:
+        """
+        发送工具消息。
+
+        WebAgent 渠道没有后端模块实例，前端流式面板通过 Agent 上下文中的
+        回调直接接收消息；无渠道的后台任务清空渠道侧定位信息后交由消息链广播，
+        其它渠道继续走统一消息链。
+        """
+        callback = self._agent_context.get("message_callback")
+        if (
+            self._channel == NotificationChannel.WebAgent.value
+            and callable(callback)
+        ):
+            callback_result = callback(message)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+            return
+
+        if not self._channel or not self._source:
+            message = message.model_copy(
+                update={
+                    "channel": None,
+                    "source": None,
+                    "userid": None,
+                    "username": message.username
+                    or self._username
+                    or get_runtime_setting('SUPERUSER'),
+                    "original_message_id": None,
+                    "original_chat_id": None,
+                }
+            )
+        elif not message.original_chat_id:
+            # 工具回调消息默认回填当前会话的原会话 ID，
+            # 保证群聊 @ 机器人时按钮选择、消息发送等交互消息回复到原群，而不是私聊窗口。
+            original_chat_id = str(
+                self._agent_context.get("original_chat_id") or ""
+            ).strip() or None
+            if original_chat_id:
+                message = message.model_copy(
+                    update={"original_chat_id": original_chat_id}
+                )
+
+        await ToolChain().async_post_message(message)
+
+    async def send_tool_message(
+        self, message: str, title: str = "", image: Optional[str] = None
+    ) -> None:
+        """
+        发送工具消息
+        """
+        await self.send_message(
+            Message.model_validate({
+                "channel": self._channel,
+                "source": self._source,
+                "mtype": MessageType.Agent,
+                "userid": self._user_id,
+                "username": self._username,
+                "title": title,
+                "text": message,
+                "image": image,
+                "save_history": False,
+            })
+        )
+
+
+# 普通导入保持 callback 冷态；显式导入或历史星号导入仍解析真实类。
+__all__ = sorted(
+    {name for name in globals() if not name.startswith("_")}
+    | {"StreamingHandler"}
+)

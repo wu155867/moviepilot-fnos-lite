@@ -1,0 +1,149 @@
+"""
+调度器业务能力装配与生命周期入口。
+"""
+
+import asyncio
+from typing import Awaitable, Callable, Optional
+
+from app.application.agenttask import AgentTaskRepository
+from app.application.image import WallpaperHelper
+from app.application.outbox import stop_outbox_recovery
+from app.application.scheduling import (
+    get_scheduler,
+    register_scheduler_class,
+    reset_scheduler_class,
+)
+from app.chain.mediaserver import MediaServerChain
+from app.chain.recommend import RecommendChain
+from app.chain.site import SiteChain
+from app.chain.subscribe.facade import SubscribeChain
+from app.chain.transfer.facade import TransferChain
+from app.chain.workflow import WorkflowChain
+from app.runtime.execution import run_in_threadpool_to_completion
+from app.scheduler.chain import SchedulerChain
+from app.scheduler.facade import Scheduler
+from app.scheduler.services import SchedulerServices
+
+
+def configure_scheduler_runtime() -> None:
+    """
+    在显式装配阶段登记 concrete Scheduler。
+    """
+    register_scheduler_class(Scheduler)
+
+
+def reset_scheduler_runtime() -> None:
+    """
+    清除 concrete Scheduler 登记，支持重复 lifespan。
+    """
+    reset_scheduler_class()
+
+
+def reset_scheduler_bindings() -> None:
+    """
+    在 Scheduler 已停止后撤销当前 lifespan 的仓储、业务能力和类登记。
+    """
+    existing_scheduler: Callable[[], Optional[Scheduler]] = Scheduler.get_existing_instance
+    scheduler = existing_scheduler()
+    if scheduler is not None:
+        scheduler.reset_runtime_bindings()
+    reset_scheduler_runtime()
+
+
+def configure_scheduler_agent_tasks(repository: AgentTaskRepository) -> None:
+    """
+    在调度器启动前注入自主任务仓储。
+    """
+    configure_scheduler_runtime()
+    get_scheduler().configure_agent_tasks(repository)
+
+
+def configure_scheduler_services() -> None:
+    """
+    构造一次调度任务能力，并在启动前注入 concrete Scheduler。
+    """
+    scheduler_chain = SchedulerChain()
+    site_chain = SiteChain()
+    mediaserver_chain = MediaServerChain()
+    subscribe_chain = SubscribeChain()
+    transfer_chain = TransferChain()
+    recommend_chain = RecommendChain()
+    workflow_chain = WorkflowChain()
+    Scheduler().configure_services(
+        SchedulerServices(
+            sync_cookies=site_chain.sync_cookies,
+            sync_mediaserver=mediaserver_chain.sync,
+            check_subscribe=subscribe_chain.check_and_reconcile,
+            search_subscribe=subscribe_chain.search,
+            resume_subscribe_search=subscribe_chain.async_resume_search_queue,
+            refresh_subscribe=subscribe_chain.refresh,
+            follow_subscribe=subscribe_chain.follow,
+            process_transfer=transfer_chain.process,
+            clear_cache=scheduler_chain.clear_cache,
+            cleanup_data=scheduler_chain.cleanup,
+            run_modules=scheduler_chain.scheduler_job,
+            get_wallpapers=WallpaperHelper().get_wallpapers,
+            clear_wallpaper_cache=WallpaperHelper().clear_cache,
+            refresh_site_data=site_chain.refresh_userdatas,
+            refresh_recommend=recommend_chain.refresh_recommend,
+            cache_subscribe_calendar=subscribe_chain.cache_calendar,
+            list_workflows=workflow_chain.get_timer_workflows,
+            process_workflow=workflow_chain.process,
+            put_message=scheduler_chain.messagehelper.put,
+            post_message=scheduler_chain.post_message,
+        )
+    )
+
+
+def init_scheduler() -> None:
+    """
+    初始化定时器
+    """
+    configure_scheduler_runtime()
+    configure_scheduler_services()
+    try:
+        Scheduler().init()
+    except Exception:
+        reset_scheduler_runtime()
+        raise
+
+
+def stop_scheduler() -> Optional[Awaitable[None]]:
+    """
+    停止定时器；生命周期事件循环中返回可等待的收口协程。
+    """
+    scheduler = Scheduler()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        scheduler.stop()
+        if not stop_outbox_recovery():
+            raise RuntimeError("Outbox 后台处理尚未停止")
+        reset_scheduler_bindings()
+        return None
+
+    async def stop_and_reset() -> None:
+        """
+        等待异步调度器收口后清除 provider。
+        """
+        await scheduler.stop_async()
+        if not await run_in_threadpool_to_completion(stop_outbox_recovery):
+            raise RuntimeError("Outbox 后台处理尚未停止")
+        reset_scheduler_bindings()
+
+    return stop_and_reset()
+
+
+def restart_scheduler() -> None:
+    """
+    重启定时器
+    """
+    configure_scheduler_runtime()
+    Scheduler().init()
+
+
+def init_plugin_scheduler() -> None:
+    """
+    初始化插件定时器
+    """
+    Scheduler().init_plugin_jobs()

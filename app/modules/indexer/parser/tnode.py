@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+"""
+解析 TNode 站点的用户资料、流量和做种信息。
+"""
+
+import json
+import re
+from typing import Optional
+
+from app.foundation import temporal as time_tools
+from app.modules.indexer.parser import SitePage, SiteParserBase, SiteSchema
+from app.runtime.log import logger
+
+
+class TNodeSiteUserInfo(SiteParserBase):
+    """
+    通过当前会话 API 获取 TNode 站点用户资料与做种信息。
+    """
+
+    schema = SiteSchema.TNode
+
+    def _parse_site_page(self, html_text: SitePage) -> None:
+        """
+        提取 CSRF 令牌，并配置用于取得用户 ID 的当前会话接口。
+        """
+        html_text = self._prepare_html_text(html_text)
+
+        # 从名为 x-csrf-token 的 meta 标签读取请求所需的令牌。
+        csrf_token = re.search(r'<meta name="x-csrf-token" content="(.+?)">', html_text)
+        if csrf_token:
+            self._addition_headers = {'X-CSRF-TOKEN': csrf_token.group(1)}
+            # 当前用户接口依赖 Cookie 会话，不需要预先知道用户 ID。
+            self._user_detail_page = "api/user/getMainInfo"
+            self._user_detail_requires_userid = False
+            self._torrent_seeding_page = "api/user/listTorrentActivity?id=&type=seeding&page=1&size=20000"
+
+    def _parse_logged_in(self, html_text: str) -> bool:
+        """
+        API 认证结果由请求响应判定，此入口不检查页面登录标记。
+
+        :param html_text: 未使用的页面文本
+        :return: 始终返回 True
+        """
+        return True
+
+    def _parse_user_base_info(self, html_text: SitePage) -> None:
+        """
+        首页不提供用户 ID，身份信息需在详情接口返回后补齐。
+        """
+        self.username = self.userid
+
+    def _parse_user_traffic_info(self, html_text: str) -> None:
+        """
+        流量信息已由当前用户接口返回，无需单独解析。
+        """
+        pass
+
+    def _parse_user_detail_info(self, html_text: str) -> None:
+        """
+        从当前用户接口一次解析身份、资料、流量及未读消息数量。
+        """
+        try:
+            detail = json.loads(html_text)
+        except json.JSONDecodeError:
+            return
+        if detail.get("status") != 200:
+            return
+
+        user_info = detail.get("data", {})
+        self.userid = user_info.get("id")
+        self.username = user_info.get("username")
+        self.user_level = user_info.get("class", {}).get("name")
+        self.join_at = user_info.get("regTime", 0)
+        self.join_at = time_tools.normalize_datetime(str(self.join_at))
+
+        self.upload = user_info.get("upload")
+        self.download = user_info.get("download")
+        self.ratio = 0 if self.download <= 0 else round(self.upload / self.download, 3)
+        self.bonus = user_info.get("bonus")
+
+        self.message_unread = user_info.get("unreadAdmin", 0) + user_info.get("unreadInbox", 0) + user_info.get(
+            "unreadSystem", 0)
+        pass
+
+    def _parse_user_torrent_seeding_info(self, html_text: str, multi_page: Optional[bool] = False) -> Optional[str]:
+        """
+        解析用户做种信息。
+        """
+        try:
+            seeding_info = json.loads(html_text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"{self._site_name}: Failed to decode seeding info JSON: {e}")
+            return None
+
+        if not isinstance(seeding_info, dict):
+            logger.warning(f"{self._site_name}: Seeding info payload is not a dictionary")
+            return None
+
+        if seeding_info.get("status") != 200:
+            return None
+
+        torrents = seeding_info.get("data", {}).get("torrents", [])
+
+        page_seeding_size = 0
+        page_seeding_info = []
+        for torrent in torrents:
+            size = torrent.get("size", 0)
+            seeders = torrent.get("seeding", 0)
+
+            page_seeding_size += size
+            page_seeding_info.append([seeders, size])
+
+        self.seeding += len(torrents)
+        self.seeding_size += page_seeding_size
+        self.seeding_info.extend(page_seeding_info)
+
+        # 是否存在下页数据
+        next_page = None
+
+        return next_page
+
+    def _parse_message_unread_links(self, html_text: str, msg_links: list[str]) -> Optional[str]:
+        """
+        当前仅支持 API 返回的未读数量，不解析消息链接。
+        """
+        return None
+
+    def _parse_message_content(self, html_text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        当前仅提供未读消息数量，不解析消息详情。
+
+        :param html_text: 未使用的消息页面文本
+        :return: 标题、日期和正文均为 None 的三元组
+        """
+        return None, None, None

@@ -1,0 +1,1412 @@
+"""
+站点连通性、用户数据、Cookie 同步与消息交互编排。
+"""
+
+import base64
+import re
+import threading
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Tuple, Union
+from urllib.parse import urljoin, urlparse
+
+from lxml import etree
+
+from app.application.configuration import get_configured_system_config
+from app.application.messaging.site import SiteInteractionHandler
+from app.application.rss import RssHelper
+from app.application.security.cookie import CookieHelper
+from app.application.site.contract import (
+    SiteCookieLoginSource,
+    SiteMutation,
+    SiteRepository,
+    SiteSnapshot,
+    SiteUserDataMutation,
+)
+
+# 站点资源包在启动时加载，静态检查环境可能无法解析其实现。
+from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
+from app.chain._interaction import InteractionChainMixin
+from app.chain.base import ChainBase
+from app.domain import site as site_rules
+from app.domain.site import SiteUtils
+from app.foundation import size as size_tools
+from app.foundation import url as url_tools
+from app.foundation.dom import DomUtils
+from app.runtime.events import Event, eventmanager
+from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
+from app.schemas.message import Message
+from app.schemas.site import SiteUserData
+from app.schemas.types import EventType, MessageType, NotificationChannel
+
+
+class SiteResponsePort(Protocol):
+    """
+    声明站点链在响应有效期内读取的最小 HTTP 字段。
+
+    :ivar status_code: 站点 HTTP 响应状态码
+    :ivar reason: HTTP 状态原因短语，用于连接失败诊断
+    :ivar text: 解码后的站点页面或接口正文
+    :ivar content: 原始响应字节，用于图标等二进制资源
+    """
+
+    status_code: int
+    reason: str
+    text: str
+    content: bytes
+
+    def __bool__(self) -> bool:
+        """
+        保留 requests.Response 对错误状态返回 False 的兼容语义。
+
+        :return: HTTP 状态小于 400 时为 True，错误状态为 False
+        """
+        ...
+
+    def json(self) -> Any:
+        """
+        解析响应 JSON，格式错误继续向调用方抛出。
+
+        :return: 解析后的 JSON 值，格式错误时传播解析异常
+        """
+        ...
+
+
+class SiteHttpPort(Protocol):
+    """
+    声明站点探测所需的同步 HTTP 上下文能力。
+    """
+
+    def open(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: Optional[Mapping[str, Any]] = None,
+        cookie: Optional[str] = None,
+        ua: Optional[str] = None,
+        proxies: Optional[Mapping[str, Any]] = None,
+        timeout: int = 20,
+        json_body: Optional[Mapping[str, Any]] = None,
+    ) -> AbstractContextManager[Optional[SiteResponsePort]]:
+        """
+        打开有界响应上下文，退出时必须关闭底层响应。
+
+        :param method: HTTP 请求方法，如 GET 或 POST
+        :param url: 站点页面或接口的完整请求地址
+        :param headers: 额外请求头，None 表示未提供
+        :param cookie: 站点认证 Cookie 文本，None 表示未提供
+        :param ua: 本次使用的 User-Agent，None 时使用客户端默认值
+        :param proxies: 协议到代理地址的映射，None 表示未指定代理
+        :param timeout: 请求超时秒数，默认 20 秒
+        :param json_body: JSON 请求体，None 表示不发送 JSON
+        :return: 进入后提供响应或 None 的上下文管理器；退出时关闭底层响应
+        """
+        ...
+
+
+class SiteBrowserPort(Protocol):
+    """
+    声明站点连通性测试所需的浏览器渲染能力。
+    """
+
+    def render(
+        self,
+        *,
+        url: str,
+        cookies: str,
+        ua: str,
+        proxies: Optional[Mapping[str, Any]],
+        timeout: int,
+    ) -> Optional[str]:
+        """
+        在受控浏览器会话内渲染页面并返回源码。
+
+        :param url: 需要浏览器渲染的完整站点地址
+        :param cookies: 站点认证 Cookie 文本
+        :param ua: 浏览器请求使用的 User-Agent
+        :param proxies: 协议到代理地址的映射，None 表示未指定代理
+        :param timeout: 浏览器页面访问超时秒数
+        :return: 渲染后的页面源码，未取得页面时为 None
+        """
+        ...
+
+
+class SiteChallengePort(Protocol):
+    """
+    声明站点页面挑战识别能力。
+    """
+
+    def detected(self, html_text: str) -> bool:
+        """
+        返回页面是否命中 Cloudflare 等挑战特征。
+
+        :param html_text: 待检测的站点 HTML 页面源码
+        :return: 命中 Cloudflare 等浏览器挑战特征时为 True，否则为 False
+        """
+        ...
+
+
+class SiteCookieCloudPort(Protocol):
+    """
+    声明 CookieCloud 同步入口的最小能力。
+    """
+
+    def download(self) -> Tuple[Optional[dict[str, str]], str]:
+        """
+        下载并解密按站点域名聚合的 Cookie。
+
+        :return: 按站点域名聚合的 Cookie 映射与错误说明；配置或请求失败时映射为 None，
+            无数据或解密失败时可为空字典，成功时错误说明为空字符串
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class _SiteAccessPorts:
+    """
+    保存一次原子发布的站点链技术端口。
+
+    :param http: 有界 HTTP 响应访问端口
+    :param browser: 站点页面浏览器渲染端口
+    :param challenge: 站点页面挑战特征检测端口
+    :param cookiecloud: CookieCloud 下载和解密端口
+    """
+
+    http: SiteHttpPort
+    browser: SiteBrowserPort
+    challenge: SiteChallengePort
+    cookiecloud: SiteCookieCloudPort
+
+
+@dataclass(frozen=True, slots=True)
+class _SiteConnectionResponse:
+    """
+    保存 CookieCloud 新站点探测完成后的必要响应数据。
+
+    :param status_code: 新站点探测得到的 HTTP 状态码
+    :param text: 已复制的页面正文，用于登录状态与站点数据识别
+    """
+
+    status_code: int
+    text: str
+
+
+_site_ports_lock = threading.Lock()
+_site_ports: Optional[_SiteAccessPorts] = None
+
+
+def configure_site_ports(
+    *,
+    http: SiteHttpPort,
+    browser: SiteBrowserPort,
+    challenge: SiteChallengePort,
+    cookiecloud: SiteCookieCloudPort,
+) -> None:
+    """
+    由启动组合根一次发布站点链的全部技术端口。
+    """
+    global _site_ports
+    ports = _SiteAccessPorts(
+        http=http,
+        browser=browser,
+        challenge=challenge,
+        cookiecloud=cookiecloud,
+    )
+    with _site_ports_lock:
+        _site_ports = ports
+
+
+def reset_site_ports() -> None:
+    """
+    原子清除站点链端口，支持重复关闭与失败回滚。
+    """
+    global _site_ports
+    with _site_ports_lock:
+        _site_ports = None
+
+
+def _site_ports_snapshot() -> _SiteAccessPorts:
+    """
+    返回一致端口快照，未装配时稳定失败。
+    """
+    with _site_ports_lock:
+        ports = _site_ports
+    if ports is None:
+        raise RuntimeError("站点链访问端口尚未由启动组合根装配")
+    return ports
+
+
+def _open_site_response(
+    *,
+    method: str,
+    url: str,
+    headers: Optional[Mapping[str, Any]] = None,
+    cookie: Optional[str] = None,
+    ua: Optional[str] = None,
+    proxies: Optional[Mapping[str, Any]] = None,
+    timeout: int = 20,
+    json_body: Optional[Mapping[str, Any]] = None,
+) -> AbstractContextManager[Optional[SiteResponsePort]]:
+    """
+    通过当前 HTTP 端口打开一个必定有界关闭的响应上下文。
+
+    :param method: HTTP 请求方法
+    :param url: 完整请求地址
+    :param headers: 额外请求头
+    :param cookie: 登录 Cookie
+    :param ua: 用户代理字符串
+    :param proxies: 代理配置
+    :param timeout: 请求超时秒数
+    :param json_body: JSON 请求体，None 表示不发送 JSON
+    :return: 由调用方进入并负责退出的响应上下文
+    """
+    return _site_ports_snapshot().http.open(
+        method=method,
+        url=url,
+        headers=headers,
+        cookie=cookie,
+        ua=ua,
+        proxies=proxies,
+        timeout=timeout,
+        json_body=json_body,
+    )
+
+
+class SiteChain(InteractionChainMixin, ChainBase):
+    """
+    站点管理处理链
+    """
+
+    # 交互处理器类注入，供 InteractionChainMixin 的 parse_callback 委托
+    _interaction_handler_type = SiteInteractionHandler
+
+    def __init__(self) -> None:
+        """
+        初始化站点管理处理链及按域名、资源协议选择的连接测试器。
+        """
+        super().__init__()
+
+        # 特殊站点登录验证
+        self.special_site_test = {
+            "zhuque.in": self.__zhuque_test,
+            "m-team.io": self.__mteam_test,
+            "m-team.cc": self.__mteam_test,
+            "yemapt.org": self.__yema_test,
+            "hddolby.com": self.__hddolby_test,
+            "rousi.pro": self.__rousi_test,
+            "sunnypt.top": self.__sunnypt_test,
+            "milkie.cc": self.__milkie_test,
+        }
+        # 资源的 schema 描述资料协议，parser 描述搜索协议；二者均可识别 API 站点。
+        self.protocol_site_test = {
+            "MTorrent": self.__mteam_test,
+            "mTorrent": self.__mteam_test,
+            "HDDolby": self.__hddolby_test,
+            "RousiPro": self.__rousi_test,
+            "SunnyPT": self.__sunnypt_test,
+            "Yema": self.__yema_api_test,
+            "Milkie": self.__milkie_test,
+            "TNode": self.__zhuque_test,
+            "TNodeSpider": self.__zhuque_test,
+        }
+
+    def refresh_userdata(self, site: Optional[dict[str, Any]] = None) -> Optional[SiteUserData]:
+        """
+        刷新站点的用户数据
+
+        :param site:  站点
+        :return: 用户数据
+        """
+        userdata: SiteUserData = self.run_module("refresh_userdata", site=site)
+        if userdata and userdata.userid and site:
+            domain = site_rules.extract_domain(
+                str(site.get("domain") or site.get("url") or "")
+            )
+            name = str(site.get("name") or domain)
+            self.site_repository.update_userdata(
+                domain=domain,
+                name=name,
+                mutation=SiteUserDataMutation(userdata.model_dump()),
+            )
+            self.eventmanager.send_event(EventType.SiteRefreshed, {
+                "site_id": site.get("id")
+            })
+            self._post_site_messages(site=site, userdata=userdata)
+            # 低分享率警告
+            if userdata.ratio and float(userdata.ratio) < 1 and not bool(
+                    re.search(r"(贵宾|VIP?)", userdata.user_level or "", re.IGNORECASE)):
+                self.post_message(Message(
+                    mtype=MessageType.SiteMessage,
+                    title="【站点分享率低预警】",
+                    text=f"站点 {site.get('name')} 分享率 {userdata.ratio}，请注意！"
+                ))
+        return userdata
+
+    def _post_site_messages(self, site: dict[str, Any], userdata: SiteUserData) -> None:
+        """
+        发送站点未读消息，并按解析器提供的来源标识做持久化去重。
+
+        :param site: 站点索引配置
+        :param userdata: 本次刷新的站点用户数据
+        """
+        if not userdata.message_unread:
+            return
+        if not userdata.message_unread_contents:
+            self.post_message(Message(
+                mtype=MessageType.SiteMessage,
+                title=f"站点 {site.get('name')} 收到 "
+                f"{userdata.message_unread} 条新消息，请登陆查看",
+                link=site.get("url")
+            ))
+            return
+        for message in userdata.message_unread_contents:
+            head, date, content, *metadata = message
+            message_source = metadata[0] if metadata else None
+            if message_source and self.messageoper.exists_by_source(message_source):
+                continue
+            msg_title = f"【站点 {site.get('name')} 消息】"
+            msg_text = f"时间：{date}\n标题：{head}\n内容：\n{content}"
+            self.post_message(Message(
+                source=message_source,
+                mtype=MessageType.SiteMessage,
+                title=msg_title,
+                text=msg_text,
+                link=site.get("url")
+            ))
+
+    def refresh_userdatas(
+            self,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Optional[Dict[str, SiteUserData]]:
+        """
+        刷新所有站点的用户数据
+
+        :param progress_callback: 定时服务进度更新回调
+        """
+        any_site_updated = False
+        result: dict[str, SiteUserData] = {}
+        sites = [site for site in SitesHelper().get_indexers() if site.get("is_active")]
+        total_num = len(sites)
+        if progress_callback:
+            progress_callback(
+                value=0,
+                text=f"开始刷新站点数据，共 {total_num} 个站点 ...",
+                data={"total": total_num, "finished": 0},
+            )
+        for index, site in enumerate(sites, start=1):
+            if runtime_stop_state.is_system_stopped:
+                return None
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在刷新站点数据（{index}/{total_num}）{site.get('name')} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": site.get("id"),
+                    },
+                )
+            userdata = self.refresh_userdata(site)
+            if userdata and userdata.userid:
+                any_site_updated = True
+                site_name = str(site.get("name") or site.get("domain") or "")
+                if site_name:
+                    result[site_name] = userdata
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"站点数据（{index}/{total_num}）刷新完成",
+                    data={"total": total_num, "finished": index},
+                )
+        if any_site_updated:
+            self.eventmanager.send_event(EventType.SiteRefreshed, {
+                "site_id": "*"
+            })
+        if progress_callback:
+            progress_callback(value=100, text="站点数据刷新完成")
+
+        return result
+
+    def is_special_site(self, domain: str) -> bool:
+        """
+        判断是否特殊站点
+        """
+        return domain in self.special_site_test
+
+    def __zhuque_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        提取 TNode CSRF 令牌并通过当前用户 API 验证 Cookie 会话。
+
+        :param site: TNode 协议站点配置
+        :return: 是否可用及认证或连接失败原因
+        """
+        token = None
+        user_agent = site.ua or self.runtime_config.user_agent
+        with _open_site_response(
+            method="GET",
+            url=site.url,
+            ua=user_agent,
+            cookie=site.cookie or "",
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code == 200:
+                csrf_token = re.search(
+                    r'<meta name="x-csrf-token" content="(.+?)">', res.text
+                )
+                if csrf_token:
+                    token = csrf_token.group(1)
+            else:
+                return False, f"错误：{res.status_code} {res.reason}"
+        if not token:
+            return False, "无法获取Token"
+        with _open_site_response(
+            method="GET",
+            url=f"{site.url}api/user/getInfo",
+            headers={
+                'X-CSRF-TOKEN': token,
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": f"{user_agent}"
+            },
+            cookie=site.cookie or "",
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as user_res:
+            if user_res is None:
+                return False, "无法打开网站！"
+            if user_res.status_code == 200:
+                user_info = user_res.json()
+                if user_info and user_info.get("data"):
+                    return True, "连接成功"
+                return False, "Cookie已失效"
+            return False, f"错误：{user_res.status_code} {user_res.reason}"
+
+    def __mteam_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通过 MTorrent 用户资料接口验证 API Key，不依赖首页登录标记。
+
+        :param site: M-Team 或兼容 MTorrent 协议的站点配置
+        :return: 是否可用及接口返回的状态信息
+        """
+        user_agent = site.ua or self.runtime_config.user_agent
+        domain = site_rules.extract_domain(site.url)
+        indexer = SitesHelper().get_indexer(domain) or {}
+        configured_host = indexer.get("api_domain") or indexer.get("api_host")
+        api_host = urlparse(site.url).netloc
+        if configured_host:
+            value = str(configured_host).strip()
+            api_host = urlparse(value if "://" in value else f"//{value}").netloc
+        elif not api_host.startswith("api."):
+            api_host = f"api.{domain}"
+        url = f"https://{api_host}/api/member/profile"
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "x-api-key": site.apikey,
+        }
+        with _open_site_response(
+            method="POST",
+            url=url,
+            headers=headers,
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code == 200:
+                user_info = res.json() or {}
+                if str(user_info.get("code")) == "0" and user_info.get("data"):
+                    return True, "连接成功"
+                return False, user_info.get("message", "鉴权已过期或无效")
+            return False, f"错误：{res.status_code} {res.reason}"
+
+    def __milkie_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通过种子搜索接口测试 Milkie API Key
+
+        :param site: Milkie 站点配置
+        :return: 是否可用及状态信息
+        """
+        with _open_site_response(
+            method="GET",
+            url=f"{site.url.rstrip('/')}/api/v1/torrents?ps=1",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": site.ua or self.runtime_config.user_agent,
+                "x-milkie-auth": site.apikey,
+            },
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code == 200:
+                payload = res.json()
+                if isinstance(payload, dict) and isinstance(payload.get("torrents"), list):
+                    return True, "连接成功"
+                return False, "站点返回了无效的种子数据"
+            if res.status_code in (401, 403):
+                return False, "API Key 无效或已过期"
+            return False, f"错误：{res.status_code} {res.reason}"
+
+    def __sunnypt_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通过 profile 接口测试 SunnyPT API Key 和下载权限
+
+        :param site: SunnyPT 站点配置
+        :return: 是否可用及状态信息
+        """
+        domain = site.domain or site_rules.extract_domain(site.url)
+        indexer = SitesHelper().get_indexer(domain) or {}
+        api_url = str(
+            indexer.get("api_url") or f"https://api.{domain}/api/v1/mp"
+        ).rstrip("/")
+        with _open_site_response(
+            method="GET",
+            url=f"{api_url}/profile",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": site.ua or self.runtime_config.user_agent,
+                "X-API-Key": site.apikey,
+            },
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法连接 SunnyPT API 服务"
+            if res.status_code != 200:
+                return False, f"错误：{res.status_code} {res.reason}"
+            try:
+                payload = res.json() or {}
+            except (TypeError, ValueError):
+                return False, "SunnyPT API 响应不是有效 JSON"
+            if str(payload.get("code")) != "0" or not isinstance(
+                payload.get("data"), dict
+            ):
+                return False, payload.get("msg") or "API Key 已过期或无效"
+            if payload["data"].get("download_allowed") is False:
+                return False, "当前账号没有下载权限"
+            return True, "连接成功"
+
+    def __yema_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        优先验证 Yema AuthKey，未配置时保留旧版 Cookie 会话探测。
+
+        :param site: YemaPT 站点配置
+        :return: 是否可用及认证或连接失败原因
+        """
+        if site.apikey:
+            return self.__yema_api_test(site)
+        user_agent = site.ua or self.runtime_config.user_agent
+        url = f"{site.url}api/consumer/fetchSelfDetail"
+        headers = {
+            "User-Agent": user_agent,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+        }
+        with _open_site_response(
+            method="GET",
+            url=url,
+            headers=headers,
+            cookie=site.cookie or "",
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code == 200:
+                user_info = res.json()
+                if user_info and user_info.get("success"):
+                    return True, "连接成功"
+                return False, "Cookie已过期"
+            return False, f"错误：{res.status_code} {res.reason}"
+
+    def __yema_api_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通过 Yema 开放 API 验证 AuthKey，与搜索和资料解析使用相同认证方式。
+
+        :param site: Yema 协议站点配置
+        :return: 是否可用及认证或连接失败原因
+        """
+        if not site.apikey:
+            return False, "未配置 AuthKey"
+        with _open_site_response(
+            method="POST",
+            url=f"{site.url.rstrip('/')}/openApi/user/fetchBasicInfo.json",
+            headers={
+                "Authorization": site.apikey,
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": site.ua or self.runtime_config.user_agent,
+            },
+            json_body={},
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code != 200:
+                return False, f"错误：{res.status_code} {res.reason}"
+            payload = res.json() or {}
+            if payload.get("success") and isinstance(payload.get("data"), dict) and payload["data"].get("id"):
+                return True, "连接成功"
+            return False, payload.get("errorMessage") or "AuthKey 已过期或无效"
+
+    def __hddolby_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通过 HDDolby 用户 API 验证 API Key，与搜索和资料解析使用相同资源 API 基础地址。
+
+        未配置 api_url 时沿用旧站的 api 子域，兼容存量资源和自定义索引。
+        API 失败提示仅描述接口主机，不据此断言网页不可访问，也不以网页成功掩盖 API 故障。
+
+        :param site: HDDolby 协议站点配置
+        :return: 是否可用及认证或连接失败原因
+        """
+        domain = site.domain or site_rules.extract_domain(site.url)
+        indexer = SitesHelper().get_indexer(domain) or {}
+        api_url = str(indexer.get("api_url") or f"https://api.{domain}/api/v1").rstrip("/")
+        api_host = urlparse(api_url).hostname
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "x-api-key": site.apikey,
+        }
+        with _open_site_response(
+            method="GET",
+            url=f"{api_url}/user/data",
+            headers=headers,
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, f"HDDolby API 主机 {api_host} 无法连接，请检查 API 地址及网络代理"
+            if res.status_code == 200:
+                user_info = res.json()
+                if user_info and user_info.get("status") == 0:
+                    return True, "连接成功"
+                return False, "APIKEY已过期"
+            return False, f"HDDolby API 主机 {api_host} 返回 HTTP {res.status_code} {res.reason}"
+
+    def __rousi_test(self, site: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        使用 PeerGo 个人 API Key 验证 RousiPro 协议站点连接。
+
+        :param site: 使用 Bearer 个人 API Key 的站点配置
+        :return: 是否可用及认证或连接失败原因
+        """
+        if not site.apikey:
+            return False, "未配置个人 API Key"
+        url = f"https://{site_rules.extract_domain(site.url)}/api/v1/profile"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {site.apikey}",
+        }
+        with _open_site_response(
+            method="GET",
+            url=url,
+            headers=headers,
+            proxies=(self.runtime_config.proxy or {}) if site.proxy else {},
+            timeout=site.timeout or 15,
+        ) as res:
+            if res is None:
+                return False, "无法打开网站！"
+            if res.status_code == 200:
+                try:
+                    user_info = res.json()
+                except (TypeError, ValueError):
+                    return False, "站点返回了无效的用户数据"
+                if user_info and user_info.get("code") == 0:
+                    return True, "连接成功"
+                return False, "个人 API Key 已失效或权限不足"
+            if res.status_code in (401, 403):
+                return False, "个人 API Key 已失效或权限不足"
+            return False, f"错误：{res.status_code} {res.reason}"
+
+    @staticmethod
+    def __parse_favicon(url: str, cookie: str, ua: str) -> Tuple[str, Optional[str]]:
+        """
+        解析站点图标地址，并读取其 Base64 编码内容。
+
+        :param url: 站点地址
+        :param cookie: 站点认证 Cookie 文本
+        :param ua: 请求使用的 User-Agent
+        :return: 图标完整地址及 Base64 编码内容，读取失败时内容为 None
+        """
+        favicon_url = urljoin(url, "favicon.ico")
+        with _open_site_response(
+            method="GET", url=url, cookie=cookie, timeout=30, ua=ua
+        ) as res:
+            if res:
+                html_text = res.text
+            else:
+                logger.error(f"获取站点页面失败：{url}")
+                return favicon_url, None
+        html = etree.HTML(html_text)
+        try:
+            if DomUtils.has_child_elements(html):
+                fav_link = html.xpath('//head/link[contains(@rel, "icon")]/@href')
+                if fav_link:
+                    favicon_url = urljoin(url, fav_link[0])
+
+            with _open_site_response(
+                method="GET", url=favicon_url,
+                cookie=cookie if url_tools.UrlUtils.same_origin(url, favicon_url) else None, timeout=15, ua=ua
+            ) as res:
+                if res:
+                    return favicon_url, base64.b64encode(res.content).decode()
+                logger.error(f"获取站点图标失败：{favicon_url}")
+        finally:
+            if html is not None:
+                del html
+        return favicon_url, None
+
+    def sync_cookies(
+            self,
+            manual: bool = False,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        通过CookieCloud同步站点Cookie
+
+        :param manual: 是否手动同步
+        :param progress_callback: 定时服务进度更新回调
+        """
+
+        logger.info("开始同步CookieCloud站点 ...")
+        if progress_callback:
+            progress_callback(value=0, text="开始下载 CookieCloud 数据 ...")
+        cookies, msg = _site_ports_snapshot().cookiecloud.download()
+        if not cookies:
+            logger.error(f"CookieCloud同步失败：{msg}")
+            if progress_callback:
+                progress_callback(value=100, text=f"CookieCloud同步失败：{msg}")
+            if manual:
+                self.messagehelper.put(msg, title="CookieCloud同步失败", role="system", level="error")
+            return False, msg
+        siteshelper = SitesHelper()
+        repository = self.site_repository
+        rsshelper = RssHelper()
+        total_num = len(cookies)
+        update_count = add_count = fail_count = 0
+        for index, (domain, cookie) in enumerate(cookies.items(), start=1):
+            if runtime_stop_state.is_system_stopped:
+                logger.info("系统正在停止，中断CookieCloud同步")
+                return False, "系统正在停止，同步被中断"
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在同步 CookieCloud 站点（{index}/{total_num}）{domain} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": domain,
+                    },
+                )
+
+            indexer = siteshelper.get_indexer(domain)
+            site_info = repository.get_by_domain(domain)
+            updated, added, failed, should_finalize = self._sync_cookiecloud_domain(
+                domain=domain,
+                cookie=cookie,
+                indexer=indexer,
+                site_info=site_info,
+                repository=repository,
+                rsshelper=rsshelper,
+            )
+            update_count += updated
+            add_count += added
+            fail_count += failed
+            if not should_finalize:
+                continue
+
+            if indexer:
+                self.eventmanager.send_event(EventType.SiteUpdated, {
+                    "domain": domain,
+                })
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"CookieCloud 站点（{index}/{total_num}）同步完成",
+                    data={"total": total_num, "finished": index},
+                )
+        ret_msg = f"更新了{update_count}个站点，新增了{add_count}个站点"
+        if fail_count > 0:
+            ret_msg += f"，{fail_count}个站点添加失败，下次同步时将重试，也可以手动添加"
+        if manual:
+            self.messagehelper.put(ret_msg, title="CookieCloud同步成功", role="system", level="success")
+        logger.info(f"CookieCloud同步成功：{ret_msg}")
+        if progress_callback:
+            progress_callback(value=100, text=f"CookieCloud同步成功：{ret_msg}")
+        return True, ret_msg
+
+    def _sync_cookiecloud_domain(
+            self,
+            domain: str,
+            cookie: str,
+            indexer: Optional[dict[str, Any]],
+            site_info: Optional[SiteSnapshot],
+            repository: SiteRepository,
+            rsshelper: RssHelper,
+    ) -> Tuple[int, int, int, bool]:
+        """
+        处理单个域名，并返回计数与是否继续发送更新事件。
+        """
+        if site_info and site_info.is_active:
+            status, _ = self.test(domain)
+            if status:
+                logger.info(f"站点【{site_info.name}】连通性正常，不同步CookieCloud数据")
+                if not site_info.public and not site_info.rss:
+                    rss_url: Optional[str]
+                    rss_url, errmsg = rsshelper.get_rss_link(
+                        url=site_info.url,
+                        cookie=cookie,
+                        ua=site_info.ua or self.runtime_config.user_agent,
+                        proxy=bool(site_info.proxy),
+                        timeout=site_info.timeout or 15,
+                    )
+                    if rss_url:
+                        repository.update_rss(domain=domain, rss=rss_url)
+                    else:
+                        logger.warning(errmsg)
+                return 0, 0, 0, False
+            logger.info(f"更新站点 {domain} Cookie ...")
+            repository.update_cookie(domain=domain, cookies=cookie)
+            return 1, 0, 0, True
+        if not indexer:
+            return 0, 0, 0, True
+        if self._cookiecloud_blacklisted(domain):
+            logger.warning(f"站点 {domain} 已在黑名单中，不添加站点")
+            return 0, 0, 0, False
+        domain_url = self._cookiecloud_indexer_domain(indexer, domain)
+        login_url = site_rules.resolve_page_url(domain_url, indexer.get("login_path"))
+        proxy, response = self._cookiecloud_connect(login_url, cookie, indexer)
+        if response is None:
+            return 0, 0, 1, False
+        if response.status_code not in [200, 500, 403]:
+            logger.warning(f"站点 {indexer.get('name')} 连接状态码：{response.status_code}，无法添加站点")
+            return 0, 0, 1, False
+        if not indexer.get("public") and not SiteUtils.is_logged_in(response.text):
+            logger.warning(f"站点 {indexer.get('name')} 登录失败，无法添加站点")
+            return 0, 0, 1, False
+        rss_url = None
+        if not indexer.get("public") and domain_url:
+            rss_url, errmsg = rsshelper.get_rss_link(
+                url=domain_url, cookie=cookie, ua=self.runtime_config.user_agent, proxy=proxy
+            )
+            if errmsg:
+                logger.warning(errmsg)
+        repository.add(SiteMutation({
+            "name": indexer.get("name"),
+            "url": domain_url,
+            "domain": domain,
+            "cookie": cookie,
+            "rss": rss_url,
+            "proxy": 1 if proxy else 0,
+            "public": 1 if indexer.get("public") else 0,
+        }))
+        return 0, 1, 0, True
+
+    def _cookiecloud_blacklisted(self, domain: str) -> bool:
+        """
+        判断域名是否命中 CookieCloud 黑名单。
+        """
+        blacklist = self.runtime_config.cookiecloud_blacklist
+        return bool(blacklist) and any(
+            site_rules.extract_domain(domain) == site_rules.extract_domain(item)
+            for item in str(blacklist).split(",")
+        )
+
+    @staticmethod
+    def _cookiecloud_indexer_domain(indexer: dict[str, Any], sub_domain: str) -> str:
+        """
+        根据索引器主域名和扩展域名解析实际访问地址。
+        """
+        indexer_domain = indexer.get("domain")
+        if isinstance(indexer_domain, str) and site_rules.extract_domain(indexer_domain) == sub_domain:
+            return indexer_domain
+        ext_domains = indexer.get("ext_domains")
+        if isinstance(ext_domains, list):
+            for ext_domain in ext_domains:
+                if isinstance(ext_domain, str) and site_rules.extract_domain(ext_domain) == sub_domain:
+                    return ext_domain
+        return sub_domain
+
+    def _cookiecloud_connect(
+        self, domain_url: str, cookie: str, indexer: dict[str, Any]
+    ) -> Tuple[bool, Optional[_SiteConnectionResponse]]:
+        """
+        连接新站点，必要时通过已配置代理重试。
+        """
+        with _open_site_response(
+            method="GET",
+            url=domain_url,
+            cookie=cookie,
+            ua=self.runtime_config.user_agent,
+        ) as response:
+            if response is not None or not self.runtime_config.proxy_host:
+                return False, self._site_connection_response(response)
+        logger.info(f"站点 {indexer.get('name')} 初次连接失败，尝试通过代理重试...")
+        with _open_site_response(
+            method="GET",
+            url=domain_url,
+            cookie=cookie,
+            ua=self.runtime_config.user_agent,
+            proxies=self.runtime_config.proxy,
+        ) as response:
+            return True, self._site_connection_response(response)
+
+    @staticmethod
+    def _site_connection_response(
+        response: Optional[SiteResponsePort],
+    ) -> Optional[_SiteConnectionResponse]:
+        """
+        在关闭响应前投影 CookieCloud 新站点探测所需字段。
+        """
+        if response is None:
+            return None
+        return _SiteConnectionResponse(
+            status_code=response.status_code,
+            text=response.text,
+        )
+
+    @eventmanager.register(EventType.SiteUpdated)
+    def cache_site_icon(self, event: Event) -> None:
+        """
+        站点更新后缓存对应图标。
+
+        :param event: 包含站点域名的更新事件
+        :return: 无返回值
+        """
+        if not event:
+            return
+        event_data = event.event_data if isinstance(event.event_data, dict) else {}
+        domain = event_data.get("domain")
+        if not domain:
+            return
+        if str(domain).startswith("http"):
+            domain = site_rules.extract_domain(domain)
+        repository = self.site_repository
+        siteshelper = SitesHelper()
+        siteinfo = repository.get_by_domain(domain)
+        if not siteinfo:
+            logger.warn(f"未维护站点 {domain} 信息！")
+            return
+        cookie = siteinfo.cookie
+        indexer = siteshelper.get_indexer(domain)
+        if not indexer:
+            logger.warn(f"站点 {domain} 索引器不存在！")
+            return
+        logger.info(f"开始缓存站点 {indexer.get('name')} 图标 ...")
+        icon_domain = indexer.get("domain")
+        icon_name = indexer.get("name")
+        if not isinstance(icon_domain, str) or not isinstance(icon_name, str):
+            logger.warn(f"站点 {domain} 索引器缺少图标域名或名称！")
+            return
+        icon_url, icon_base64 = self.__parse_favicon(url=icon_domain,
+                                                     cookie=cookie or "",
+                                                     ua=self.runtime_config.user_agent)
+        if icon_url:
+            repository.update_icon(name=icon_name,
+                                   domain=domain,
+                                   icon_url=icon_url,
+                                   icon_base64=icon_base64 or "")
+            logger.info(f"缓存站点 {indexer.get('name')} 图标成功")
+        else:
+            logger.warn(f"缓存站点 {indexer.get('name')} 图标失败")
+
+    @eventmanager.register(EventType.SiteUpdated)
+    def clear_site_data(self, event: Event) -> None:
+        """
+        站点更新后清理对应的站点配置。
+
+        :param event: 包含站点域名的更新事件
+        :return: 无返回值
+        """
+        if not event:
+            return
+        event_data = event.event_data if isinstance(event.event_data, dict) else {}
+        domain = event_data.get("domain")
+        if not domain:
+            return
+        domain_host = url_tools.host_label(domain)
+        # 查询以"site.domain_host"开头的配置项，并清除
+        # SystemConfigService 未提供 all()，无参 get() 经仓库返回全部配置字典
+        systemconfig = get_configured_system_config()
+        site_keys = systemconfig.get().keys()
+        for key in site_keys:
+            if key.startswith(f"site.{domain_host}"):
+                logger.info(f"清理站点配置：{key}")
+                systemconfig.delete(key)
+
+    @eventmanager.register(EventType.SiteUpdated)
+    def cache_site_userdata(self, event: Event) -> None:
+        """
+        站点更新后刷新对应的用户资料。
+
+        :param event: 包含站点域名的更新事件
+        :return: 无返回值
+        """
+        if not event:
+            return
+        event_data = event.event_data if isinstance(event.event_data, dict) else {}
+        domain = event_data.get("domain")
+        if not domain:
+            return
+        if str(domain).startswith("http"):
+            domain = site_rules.extract_domain(domain)
+        indexer = SitesHelper().get_indexer(domain)
+        if not indexer:
+            return
+        self.refresh_userdata(site=indexer) or {}
+
+    def test(self, url: str) -> Tuple[bool, str]:
+        """
+        测试站点是否可用
+
+        :param url: 站点域名
+        :return: (是否可用, 错误信息)
+        """
+        domain = site_rules.extract_domain(url)
+        repository = self.site_repository
+        site_info = repository.get_by_domain(domain)
+        if not site_info:
+            return False, f"站点【{url}】不存在"
+
+        try:
+            start_time = datetime.now()
+            special_test = self.special_site_test.get(domain)
+            if special_test:
+                state, message = special_test(site_info)
+            else:
+                indexer = SitesHelper().get_indexer(domain) or {}
+                protocol_test = self.protocol_site_test.get(str(indexer.get("schema") or "")) \
+                    or self.protocol_site_test.get(str(indexer.get("parser") or ""))
+                if protocol_test:
+                    state, message = protocol_test(site_info)
+                else:
+                    state, message = self.__test(
+                        replace(
+                            site_info,
+                            url=site_rules.resolve_page_url(
+                                site_info.url, indexer.get("login_path")
+                            ),
+                        )
+                    )
+            seconds = (datetime.now() - start_time).seconds
+            if state:
+                repository.success(domain=domain, seconds=seconds)
+            else:
+                repository.fail(domain)
+            return state, message
+        except Exception as e:
+            return False, f"{str(e)}！"
+
+    def __test(self, site_info: SiteSnapshot) -> Tuple[bool, str]:
+        """
+        通用站点测试
+        """
+        site_url = site_info.url
+        site_cookie = site_info.cookie or ""
+        ua = site_info.ua or self.runtime_config.user_agent
+        render = site_info.render
+        public = site_info.public
+        proxies = (self.runtime_config.proxy or {}) if site_info.proxy else {}
+        proxy_server = self.runtime_config.proxy_server if site_info.proxy else None
+        timeout = site_info.timeout or 60
+
+        if render:
+            ports = _site_ports_snapshot()
+            page_source = ports.browser.render(
+                url=site_url,
+                cookies=site_cookie,
+                ua=ua,
+                proxies=proxy_server,
+                timeout=timeout,
+            ) or ""
+            if not public and not SiteUtils.is_logged_in(page_source):
+                if ports.challenge.detected(page_source):
+                    return False, "无法通过Cloudflare！"
+                return False, "仿真登录失败，Cookie已失效！"
+        else:
+            with _open_site_response(
+                method="GET",
+                url=site_url,
+                cookie=site_cookie,
+                ua=ua,
+                proxies=proxies,
+            ) as res:
+                if res and res.status_code in [200, 500, 403]:
+                    content = res.text
+                    if not public and not SiteUtils.is_logged_in(content):
+                        if _site_ports_snapshot().challenge.detected(content):
+                            msg = "站点被Cloudflare防护，请打开站点浏览器仿真"
+                        elif res.status_code == 200:
+                            msg = "Cookie已失效"
+                        else:
+                            msg = f"错误：{res.status_code} {res.reason}"
+                        return False, f"{msg}！"
+                    if public and res.status_code != 200:
+                        return False, f"错误：{res.status_code} {res.reason}！"
+                elif res is not None:
+                    return False, f"错误：{res.status_code} {res.reason}！"
+                else:
+                    return False, "无法打开网站！"
+        return True, "连接成功"
+
+    def _interaction_handler(self) -> "SiteInteractionHandler":
+        """
+        构造 /sites 交互处理器，Cookie 更新动作由本链提供。
+        """
+        return SiteInteractionHandler(
+            messenger=self,
+            cookie_updater=self.update_cookie,
+            repository=self.site_repository,
+        )
+
+    def remote_disable(self, arg_str: str, channel: NotificationChannel,
+                       userid: Optional[Union[str, int]] = None, source: Optional[str] = None) -> None:
+        """
+        按远程命令中的编号禁用站点，并反馈操作结果。
+
+        :param arg_str: 站点编号文本
+        :param channel: 回复消息的渠道
+        :param userid: 渠道用户标识，未提供时由渠道决定接收者
+        :param source: 消息来源标识
+        :return: 无返回值
+        """
+        if not arg_str:
+            return
+        arg_str = str(arg_str).strip()
+        if not arg_str.isdigit():
+            return
+        site_id = int(arg_str)
+        repository = self.site_repository
+        site = repository.get(site_id)
+        if not site:
+            self.post_message(Message(
+                channel=channel,
+                title=f"站点编号 {site_id} 不存在！",
+                userid=userid,
+                save_history=False))
+            return
+        repository.update(site_id, SiteMutation({"is_active": False}))
+        self.remote_list(channel=channel, userid=userid, source=source)
+
+    def remote_enable(self, arg_str: str, channel: NotificationChannel,
+                      userid: Optional[Union[str, int]] = None, source: Optional[str] = None) -> None:
+        """
+        按远程命令中的编号启用站点，并反馈操作结果。
+
+        :param arg_str: 一个或多个站点编号
+        :param channel: 回复消息的渠道
+        :param userid: 渠道用户标识，未提供时由渠道决定接收者
+        :param source: 消息来源标识
+        :return: 无返回值
+        """
+        if not arg_str:
+            return
+        arg_strs = str(arg_str).split()
+        repository = self.site_repository
+        for arg_str in arg_strs:
+            arg_str = arg_str.strip()
+            if not arg_str.isdigit():
+                continue
+            site_id = int(arg_str)
+            site = repository.get(site_id)
+            if not site:
+                self.post_message(Message(
+                    channel=channel,
+                    title=f"站点编号 {site_id} 不存在！",
+                    userid=userid,
+                    save_history=False))
+                return
+            repository.update(site_id, SiteMutation({"is_active": True}))
+        self.remote_list(channel=channel, userid=userid, source=source)
+
+    def update_cookie(self, site_info: SiteCookieLoginSource,
+                      username: str, password: str, two_step_code: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        根据用户名密码更新站点Cookie
+
+        :param site_info: 站点信息
+        :param username: 用户名
+        :param password: 密码
+        :param two_step_code: 二步验证码或密钥
+        :return: (是否成功, 错误信息)
+        """
+        site_id = site_info.id
+        site_url = site_info.url
+        if site_id is None or not site_url:
+            return False, "站点配置不完整"
+        result = CookieHelper().get_site_cookie_ua(
+            url=site_url,
+            username=username,
+            password=password,
+            two_step_code=two_step_code,
+            proxies=self.runtime_config.proxy_server if site_info.proxy else None,
+            timeout=site_info.timeout or 60
+        )
+        if result:
+            cookie, ua, msg = result
+            if not cookie:
+                return False, msg
+            self.site_repository.update(site_id, SiteMutation({
+                "cookie": cookie,
+                "ua": ua
+            }))
+            return True, msg
+        return False, "未知错误"
+
+    def remote_cookie(self, arg_str: str, channel: NotificationChannel,
+                      userid: Optional[Union[str, int]] = None, source: Optional[str] = None) -> None:
+        """
+        从远程命令读取凭据并更新站点 Cookie。
+
+        :param arg_str: 站点编号、用户名、密码及可选二次验证码
+        :param channel: 回复消息的渠道
+        :param userid: 渠道用户标识，未提供时由渠道决定接收者
+        :param source: 消息来源标识
+        :return: 无返回值
+        """
+        err_title = "请输入正确的命令格式：/site_cookie [id] [username] [password] [2fa_code/secret]，" \
+                    "[id]为站点编号，[uername]为站点用户名，[password]为站点密码，[2fa_code/secret]为站点二步验证码或密钥"
+        if not arg_str:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=err_title,
+                userid=userid,
+                save_history=False))
+            return
+        arg_str = str(arg_str).strip()
+        args = arg_str.split()
+        two_step_code = None
+        if len(args) == 4:
+            two_step_code = args[3]
+        elif len(args) != 3:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=err_title,
+                userid=userid,
+                save_history=False))
+            return
+        raw_site_id = args[0]
+        if not raw_site_id.isdigit():
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=err_title,
+                userid=userid,
+                save_history=False))
+            return
+        site_id = int(raw_site_id)
+        site_info = self.site_repository.get(site_id)
+        if not site_info:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=f"站点编号 {site_id} 不存在！",
+                userid=userid,
+                save_history=False))
+            return
+        self.post_message(Message(
+            channel=channel,
+            source=source,
+            title=f"开始更新【{site_info.name}】Cookie&UA ...",
+            userid=userid,
+            save_history=False))
+        username = args[1]
+        password = args[2]
+        status, msg = self.update_cookie(site_info=site_info,
+                                         username=username,
+                                         password=password,
+                                         two_step_code=two_step_code)
+        if not status:
+            logger.error(msg)
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=f"【{site_info.name}】 Cookie&UA更新失败！",
+                text=f"错误原因：{msg}",
+                userid=userid,
+                save_history=False))
+        else:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title=f"【{site_info.name}】 Cookie&UA更新成功",
+                userid=userid,
+                save_history=False))
+
+    def remote_refresh_userdatas(self, channel: NotificationChannel,
+                                 userid: Optional[Union[str, int]] = None, source: Optional[str] = None) -> None:
+        """
+        刷新站点用户资料并向请求渠道发送流量汇总。
+
+        :param channel: 回复消息的渠道
+        :param userid: 渠道用户标识，未提供时由渠道决定接收者
+        :param source: 消息来源标识
+        :return: 无返回值
+        """
+        logger.info("收到命令，开始刷新站点数据 ...")
+        self.post_message(Message(
+            channel=channel,
+            source=source,
+            title="开始刷新站点数据 ...",
+            userid=userid,
+            save_history=False,
+        ))
+        site_datas = self.refresh_userdatas()
+        if site_datas:
+            messages = {}
+            incUploads = 0
+            incDownloads = 0
+            today_date = datetime.now().strftime("%Y-%m-%d")
+
+            for rand, site in enumerate(site_datas.keys()):
+                upload = int(site_datas[site].upload or 0)
+                download = int(site_datas[site].download or 0)
+                updated_date = site_datas[site].updated_day
+                if updated_date and updated_date != today_date:
+                    updated_date = f"（{updated_date}）"
+                else:
+                    updated_date = ""
+
+                if upload > 0 or download > 0:
+                    incUploads += upload
+                    incDownloads += download
+                    messages[upload + (rand / 1000)] = (
+                        f"【{site}】{updated_date}\n"
+                        + f"上传量：{size_tools.format_compact_size(upload)}\n"
+                        + f"下载量：{size_tools.format_compact_size(download)}\n"
+                        + "————————————"
+                    )
+            if incDownloads or incUploads:
+                sorted_messages = [messages[key] for key in sorted(messages.keys(), reverse=True)]
+                sorted_messages.insert(0, f"【汇总】\n"
+                                       f"总上传：{size_tools.format_compact_size(incUploads)}\n"
+                                       f"总下载：{size_tools.format_compact_size(incDownloads)}\n"
+                                       f"————————————")
+                self.post_message(Message(
+                    channel=channel,
+                    source=source,
+                    title="【站点数据统计】",
+                    text="\n".join(sorted_messages),
+                    userid=userid,
+                    save_history=False
+                ))
+        else:
+            self.post_message(Message(
+                channel=channel,
+                source=source,
+                title="没有刷新到任何站点数据！",
+                userid=userid,
+                save_history=False,
+            ))

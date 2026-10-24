@@ -1,0 +1,497 @@
+"""
+媒体服务器条目表的查询行为。
+
+这张表是「媒体库里已经有了吗」的唯一依据：查不到会重复下载，误命中会漏订阅。
+同步清理（delete_stale / delete_excluded_servers）的条件一旦写反，就会把当次刚同步
+进来的条目全删掉，表现为媒体库突然清空。
+"""
+import asyncio
+
+import pytest
+
+from app.db import base as db_base
+from app.db.models.mediaserver import MediaServerItem
+from app.db.oper.mediaserver import MediaServerOper
+from app.db.session import async_session_scope
+from app.schemas.types import MediaSource
+
+
+@pytest.fixture(autouse=True)
+def _track(db):
+    """
+    把媒体服务器条目表纳入用例级回收。
+    """
+    db.watermark(MediaServerItem)
+
+
+def _item(server: str, item_id: str, title: str = "片名", item_type: str = "电影",
+          year: str = "2026", media_id: str = "1001",
+          lst_mod_date: str = "2026-08-13 10:00:00") -> MediaServerItem:
+    """
+    构造一条媒体服务器条目。
+    """
+    return MediaServerItem(server=server, library="lib", item_id=item_id,
+                           item_type=item_type, title=title, year=year,
+                           media_source=str(MediaSource.TMDB), media_id=media_id,
+                           lst_mod_date=lst_mod_date)
+
+
+def test_get_by_itemid_matches_async_twin(db):
+    """
+    按条目 ID 查找的同步、异步结果必须指向同一行。
+    """
+    db.add(_item("emby", "it-1"), _item("plex", "it-2"))
+
+    assert MediaServerItem.get_by_itemid(db.session, "it-1").server == "emby"
+    assert db.run_async_session(
+        lambda session: MediaServerItem.async_get_by_itemid(session, "it-1")
+    ).server == "emby"
+    assert MediaServerItem.get_by_itemid(db.session, "it-missing") is None
+
+
+def test_mediaserver_oper_reuses_explicit_query_sessions(db, monkeypatch):
+    """
+    媒体服务器 Oper 绑定调用方会话后不得再创建兼容查询会话。
+    """
+    db.add(_item("emby", "explicit-ms", media_id="explicit-1001"))
+    monkeypatch.setattr(
+        db_base,
+        "run_sync_transaction",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("不应创建额外同步事务")
+        ),
+    )
+
+    assert MediaServerOper(db.session).exists(
+        media_source=MediaSource.TMDB,
+        media_id="explicit-1001",
+        mtype="电影",
+    ) is not None
+
+    async def check() -> None:
+        """
+        验证异步存在性查询复用显式 AsyncSession。
+        """
+        async with async_session_scope() as session:
+            monkeypatch.setattr(
+                db_base,
+                "run_async_transaction",
+                lambda _operation: (_ for _ in ()).throw(
+                    AssertionError("不应创建额外异步事务")
+                ),
+            )
+            assert await MediaServerOper(session).async_exists(
+                media_source=MediaSource.TMDB,
+                media_id="explicit-1001",
+                mtype="电影",
+            ) is not None
+
+    asyncio.run(check())
+
+
+def test_get_by_server_itemid_scopes_by_server(db):
+    """
+    条目 ID 只在单个服务器内唯一，查找必须同时限定服务器。
+
+    不限定会在多媒体服务器场景下把 Emby 的条目当成 Plex 的，路径与库信息全错。
+    """
+    db.add(_item("emby", "same-id", title="Emby 的片"),
+           _item("plex", "same-id", title="Plex 的片"))
+
+    assert MediaServerItem.get_by_server_itemid(db.session, "emby", "same-id").title == "Emby 的片"
+    assert MediaServerItem.get_by_server_itemid(db.session, "plex", "same-id").title == "Plex 的片"
+    assert MediaServerItem.get_by_server_itemid(db.session, "jellyfin", "same-id") is None
+
+
+def test_exist_by_media_identity_requires_source_id_and_type(db):
+    """
+    按媒体身份判存在必须三项齐同：来源、原生 ID、条目类型。
+
+    忽略类型会让同一 ID 的电影与剧集互相命中，订阅据此判定「已入库」而跳过。
+    """
+    db.add(_item("emby", "mi-1", media_id="555", item_type="电影"))
+
+    assert MediaServerItem.exist_by_media_identity(
+        db.session, MediaSource.TMDB, "555", "电影") is not None
+    assert MediaServerItem.exist_by_media_identity(
+        db.session, MediaSource.TMDB, "555", "电视剧") is None
+    assert MediaServerItem.exist_by_media_identity(
+        db.session, MediaSource.TMDB, "556", "电影") is None
+
+    assert db.run_async_session(
+        lambda session: MediaServerItem.async_exist_by_media_identity(
+            session,
+            media_source=MediaSource.TMDB,
+            media_id="555",
+            mtype="电影",
+        )
+    ) is not None
+
+
+def test_media_server_exists_falls_back_to_title_after_source_miss(db):
+    """
+    非主来源身份未命中时，电影和电视剧应按标题信息回退且校验季号。
+    """
+    movie = _item(
+        "emby",
+        "cross-source-movie",
+        title="跨来源电影",
+        item_type="电影",
+        year="2024",
+        media_id="tmdb-movie",
+    )
+    tv = _item(
+        "emby",
+        "cross-source-tv",
+        title="跨来源剧集",
+        item_type="电视剧",
+        year="2023",
+        media_id="tmdb-tv",
+    )
+    tv.seasoninfo = {2: [1, 2]}
+    preferred = _item(
+        "emby",
+        "exact-source-movie",
+        title="精确身份电影",
+        item_type="电影",
+        year="2024",
+        media_id="douban-preferred",
+    )
+    # 媒体库条目自身带有目标来源身份时，应走精确身份而不是标题回退。
+    preferred.media_source = str(MediaSource.Douban)
+    title_fallback = _item(
+        "emby",
+        "title-fallback-movie",
+        title="精确身份电影",
+        item_type="电影",
+        year="2024",
+        media_id="tmdb-preferred",
+    )
+    db.add(movie, tv, preferred, title_fallback)
+
+    oper = MediaServerOper(db.session)
+    assert oper.exists(
+        title="跨来源电影",
+        year="2024",
+        mtype="电影",
+        media_source=MediaSource.Douban,
+        media_id="douban-movie",
+    ) is movie
+    assert oper.exists(
+        title="跨来源剧集",
+        year="2023",
+        mtype="电视剧",
+        media_source=MediaSource.Douban,
+        media_id="douban-tv",
+        season=2,
+    ) is tv
+    assert oper.exists(
+        title="跨来源剧集",
+        year="2023",
+        mtype="电视剧",
+        media_source=MediaSource.Douban,
+        media_id="douban-tv",
+        season=1,
+    ) is None
+    assert oper.exists(
+        title="精确身份电影",
+        year="2024",
+        mtype="电影",
+        media_source=MediaSource.Douban,
+        media_id="douban-preferred",
+    ) is preferred
+
+
+def test_async_media_server_exists_falls_back_to_title_after_source_miss(db):
+    """
+    异步媒体库查询应与同步入口一样支持跨来源标题回退。
+    """
+    item = _item(
+        "emby",
+        "async-cross-source",
+        title="异步跨来源电影",
+        item_type="电影",
+        year="2022",
+        media_id="tmdb-async",
+    )
+    db.add(item)
+
+    async def query(session):
+        """
+        在显式异步会话中查询跨来源电影。
+        """
+        return await MediaServerOper(session).async_exists(
+            title="异步跨来源电影",
+            year="2022",
+            mtype="电影",
+            media_source=MediaSource.Douban,
+            media_id="douban-async",
+        )
+
+    assert db.run_async_session(query).item_id == item.item_id
+
+
+def test_cross_source_title_fallback_requires_matching_year(db):
+    """
+    跨来源无法比对 ID，标题回退必须带年份，同名不同年份的作品不得互相命中。
+    """
+    anime = _item(
+        "emby",
+        "same-title-anime",
+        title="同名剧集",
+        item_type="电视剧",
+        year="2024",
+        media_id="tmdb-anime",
+    )
+    anime.seasoninfo = {1: list(range(1, 27))}
+    db.add(anime)
+
+    oper = MediaServerOper(db.session)
+    query = {
+        "title": "同名剧集",
+        "mtype": "电视剧",
+        "media_source": MediaSource.Douban,
+        "media_id": "douban-live-action",
+        "season": 1,
+    }
+    assert oper.exists(year="2026", **query) is None
+    assert oper.exists(**query) is None
+    assert oper.exists(year="2024", **query) is anime
+
+    async def query_without_year(session):
+        """
+        异步入口缺少年份时同样不得按标题回退。
+        """
+        return await MediaServerOper(session).async_exists(**query)
+
+    async def query_other_year(session):
+        """
+        异步入口年份不一致时不得命中同名条目。
+        """
+        return await MediaServerOper(session).async_exists(year="2026", **query)
+
+    assert db.run_async_session(query_without_year) is None
+    assert db.run_async_session(query_other_year) is None
+
+
+def test_cross_source_fallback_skips_same_source_conflicts(db):
+    """
+    精确身份未命中时，同来源条目必然是另一部作品，不得作为标题回退结果。
+    """
+    db.add(_item("emby", "other-tmdb-work", title="同源冲突", year="2026",
+                 media_id="tmdb-other"))
+
+    assert MediaServerOper(db.session).exists(
+        title="同源冲突",
+        year="2026",
+        mtype="电影",
+        media_source=MediaSource.TMDB,
+        media_id="tmdb-target",
+    ) is None
+
+
+def test_cross_source_fallback_rejects_ambiguous_same_title_year(db):
+    """
+    同名同年的候选指向不同作品时无法区分，宁可判为未入库。
+    """
+    db.add(
+        _item("emby", "ambiguous-anime", title="同名同年", item_type="电视剧",
+              year="2026", media_id="tmdb-anime"),
+        _item("emby", "ambiguous-live", title="同名同年", item_type="电视剧",
+              year="2026", media_id="tmdb-live"),
+    )
+    query = {
+        "title": "同名同年",
+        "year": "2026",
+        "mtype": "电视剧",
+        "media_source": MediaSource.Douban,
+        "media_id": "douban-target",
+    }
+
+    assert MediaServerOper(db.session).exists(**query) is None
+
+    async def query_async(session):
+        """
+        异步入口应同样拒绝歧义候选。
+        """
+        return await MediaServerOper(session).async_exists(**query)
+
+    assert db.run_async_session(query_async) is None
+
+
+def test_cross_source_fallback_prefers_copy_with_target_season(db):
+    """
+    同一作品在多个媒体库各有一份时不算歧义，应选包含目标季的条目。
+    """
+    season_one = _item("emby", "copy-season-one", title="多库剧集", item_type="电视剧",
+                       year="2023", media_id="tmdb-same")
+    season_one.seasoninfo = {1: [1, 2]}
+    season_two = _item("emby", "copy-season-two", title="多库剧集", item_type="电视剧",
+                       year="2023", media_id="tmdb-same")
+    season_two.seasoninfo = {2: [1, 2]}
+    db.add(season_one, season_two)
+
+    assert MediaServerOper(db.session).get_item_id(
+        title="多库剧集",
+        year="2023",
+        mtype="电视剧",
+        media_source=MediaSource.Douban,
+        media_id="douban-same",
+        season=2,
+    ) == "copy-season-two"
+
+
+def test_exact_identity_does_not_require_year(db):
+    """
+    精确来源身份命中时不依赖年份，避免补传年份后误判已入库作品缺失。
+    """
+    item = _item(
+        "emby",
+        "exact-identity-tv",
+        title="精确身份剧集",
+        item_type="电视剧",
+        year="2024",
+        media_id="tmdb-exact",
+    )
+    db.add(item)
+
+    assert MediaServerOper(db.session).exists(
+        title="精确身份剧集",
+        year="2026",
+        mtype="电视剧",
+        media_source=MediaSource.TMDB,
+        media_id="tmdb-exact",
+    ) is item
+
+
+@pytest.mark.parametrize("mtype,year,expected", [
+    (None, None, "标题匹配"),
+    ("电影", None, "标题匹配"),
+    (None, "2026", "标题匹配"),
+    ("电影", "2026", "标题匹配"),
+    ("电视剧", "2026", None),
+    ("电影", "2020", None),
+])
+def test_exists_by_title_narrows_by_type_and_year(db, mtype, year, expected):
+    """
+    按标题判存在时，类型与年份各自可选，给出即须生效。
+
+    这四条分支是同名不同年、同名不同类型的唯一区分手段，退化成只按标题匹配会把
+    《XX 2020》当成《XX 2026》，订阅直接被跳过。
+    """
+    db.add(_item("emby", "t-1", title="标题匹配", item_type="电影", year="2026"))
+
+    found = MediaServerItem.exists_by_title(db.session, "标题匹配", mtype, year)
+
+    assert (found.title if found else None) == expected
+
+
+def test_exists_by_title_matches_async_twin(db):
+    """
+    四种参数组合下同步与异步必须给出相同的命中结果。
+    """
+    db.add(_item("emby", "t-par", title="并行标题", item_type="电影", year="2026"))
+
+    for mtype, year in ((None, None), ("电影", None), (None, "2026"), ("电影", "2026")):
+        sync_found = MediaServerItem.exists_by_title(db.session, "并行标题", mtype, year)
+        async_found = db.run_async_session(
+            lambda session: MediaServerItem.async_exists_by_title(
+                session, title="并行标题", mtype=mtype, year=year
+            )
+        )
+        assert (sync_found is None) == (async_found is None)
+
+
+def test_oper_season_lookup_accepts_json_string_keys(db):
+    """
+    跨 Session 后的 JSON 季号键为字符串，查询仍应按整数季号命中。
+    """
+    item = _item("emby", "season-json", item_type="电视剧", media_id="season-1")
+    item.seasoninfo = {"1": [1, 2]}
+    db.add(item)
+
+    assert MediaServerOper(db.session).get_item_id(
+        media_source=MediaSource.TMDB,
+        media_id="season-1",
+        mtype="电视剧",
+        season=1,
+    ) == "season-json"
+
+    async def check() -> None:
+        """
+        验证异步查询与同步查询采用相同的 JSON 季号兼容规则。
+        """
+        async with async_session_scope() as session:
+            assert await MediaServerOper(session).async_get_item_id(
+                media_source=MediaSource.TMDB,
+                media_id="season-1",
+                mtype="电视剧",
+                season=1,
+            ) == "season-json"
+
+    asyncio.run(check())
+
+
+def test_empty_clears_only_the_given_server(db):
+    """
+    指定服务器时只清空该服务器的条目，不给则清空全表。
+
+    误清其他服务器的条目会让那台服务器的媒体库在本次同步前一直显示为空。
+    """
+    db.add(_item("emby", "e-1"), _item("plex", "p-1"))
+
+    MediaServerItem.empty(db.session, server="emby")
+
+    assert MediaServerItem.get_by_itemid(db.session, "e-1") is None
+    assert MediaServerItem.get_by_itemid(db.session, "p-1") is not None
+
+    MediaServerItem.empty(db.session)
+    assert MediaServerItem.get_by_itemid(db.session, "p-1") is None
+
+
+def test_delete_stale_keeps_items_from_the_current_sync(db):
+    """
+    清理陈旧条目时必须保留本次同步时间戳的条目。
+
+    条件写反会把刚同步进来的条目全删掉，媒体库表现为同步完反而空了。
+    """
+    db.add(_item("emby", "fresh", lst_mod_date="2026-08-13 12:00:00"),
+           _item("emby", "stale", lst_mod_date="2026-08-01 12:00:00"),
+           _item("emby", "never", lst_mod_date=None),
+           _item("plex", "other", lst_mod_date="2026-08-01 12:00:00"))
+
+    deleted = MediaServerItem.delete_stale(db.session, server="emby",
+                                           sync_time="2026-08-13 12:00:00")
+
+    assert deleted == 2
+    assert MediaServerItem.get_by_itemid(db.session, "fresh") is not None
+    assert MediaServerItem.get_by_itemid(db.session, "stale") is None
+    assert MediaServerItem.get_by_itemid(db.session, "never") is None
+    assert MediaServerItem.get_by_itemid(db.session, "other") is not None
+
+
+def test_delete_excluded_servers_keeps_configured_ones(db):
+    """
+    只保留仍在配置中的服务器条目，未配置与来源为空的条目应被清掉。
+    """
+    db.add(_item("emby", "keep-1"), _item("plex", "drop-1"),
+           _item(None, "drop-null"))
+
+    deleted = MediaServerItem.delete_excluded_servers(db.session, ["emby"])
+
+    assert deleted == 2
+    assert MediaServerItem.get_by_itemid(db.session, "keep-1") is not None
+    assert MediaServerItem.get_by_itemid(db.session, "drop-1") is None
+    assert MediaServerItem.get_by_itemid(db.session, "drop-null") is None
+
+
+def test_delete_excluded_servers_with_empty_list_clears_everything(db):
+    """
+    一个服务器都没配置时清空全表——否则会留下再也不会被同步到的孤儿条目。
+    """
+    db.add(_item("emby", "orphan-1"), _item("plex", "orphan-2"))
+
+    MediaServerItem.delete_excluded_servers(db.session, [])
+
+    assert MediaServerItem.get_by_itemid(db.session, "orphan-1") is None
+    assert MediaServerItem.get_by_itemid(db.session, "orphan-2") is None

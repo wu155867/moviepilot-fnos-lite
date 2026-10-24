@@ -1,0 +1,274 @@
+"""
+提供 TMDB 搜索、发现、媒体详情和人物信息接口。
+"""
+
+from typing import Any, List, Optional, Sequence
+
+from fastapi import Depends
+
+from app.adapters.web.security.access import verify_token
+from app.api.dependencies.auth import get_current_active_superuser_async
+from app.api.response import (
+    CompatibleCountParam,
+    CompatiblePageParam,
+    ResponseAPIRouter,
+)
+from app.application.configuration import get_api_runtime_config_snapshot, get_configured_system_config
+from app.chain.tmdb import TmdbChain
+from app.schemas.context import MediaInfo as _SchemaMediaInfo
+from app.schemas.context import MediaPerson as _SchemaMediaPerson
+from app.schemas.response import Response as _SchemaResponse
+from app.schemas.tmdb import TmdbEpisode as _SchemaTmdbEpisode
+from app.schemas.tmdb import TmdbRecognitionCacheData as _SchemaTmdbRecognitionCacheData
+from app.schemas.tmdb import TmdbSeason as _SchemaTmdbSeason
+from app.schemas.token import TokenPayload as _SchemaTokenPayload
+from app.schemas.types import MediaType, SystemConfigKey
+
+router = ResponseAPIRouter()
+
+
+def _paginate_medias(medias: Sequence[Any], page: int, count: int) -> list[Any]:
+    """
+    按 browse 端点统一的页码协议切片媒体结果。
+    """
+    normalized_page = max(page, 1)
+    normalized_count = max(count, 1)
+    start = (normalized_page - 1) * normalized_count
+    return list(medias[start : start + normalized_count])
+
+
+@router.get(
+    "/cache",
+    summary="查询 TheMovieDb 识别缓存",
+    response_model=_SchemaResponse[_SchemaTmdbRecognitionCacheData],
+)
+async def tmdb_recognition_cache(
+    _: object = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[dict[str, Any]]:
+    """
+    查询可管理的 TheMovieDb 识别缓存。
+    """
+    cache_items = TmdbChain().cache_items()
+    recognized_count = sum(1 for item in cache_items if item["tmdb_id"])
+    return _SchemaResponse(
+        success=True,
+        data={
+            "count": len(cache_items),
+            "recognized": recognized_count,
+            "unrecognized": len(cache_items) - recognized_count,
+            "shared_recognized": get_configured_system_config().get(
+                SystemConfigKey.MediaRecognizeShareCount
+            ) or 0,
+            "shared_recognize_enabled": get_api_runtime_config_snapshot().media_recognize_share,
+            "data": cache_items,
+        },
+    )
+
+
+@router.delete(
+    "/cache/{cache_key:path}",
+    summary="删除指定 TheMovieDb 识别缓存",
+    response_model=_SchemaResponse[None],
+)
+async def delete_tmdb_recognition_cache(
+    cache_key: str,
+    _: object = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[None]:
+    """
+    按缓存键删除单条 TheMovieDb 识别缓存。
+
+    :param cache_key: 要删除的缓存键
+    :param _: 已验证的管理员身份
+    :return: 删除结果；缓存不存在时返回失败响应
+    """
+    deleted_item = TmdbChain().delete_cache(cache_key)
+    if not deleted_item:
+        return _SchemaResponse(success=False, message="TheMovieDb 识别缓存不存在")
+    return _SchemaResponse(success=True, message="TheMovieDb 识别缓存删除成功")
+
+
+@router.delete(
+    "/cache", summary="清空 TheMovieDb 识别缓存", response_model=_SchemaResponse[None]
+)
+async def clear_tmdb_recognition_cache(
+    _: object = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[None]:
+    """
+    清空全部 TheMovieDb 识别缓存。
+
+    :param _: 已验证的管理员身份
+    :return: 缓存清理结果
+    """
+    TmdbChain().clear_cache()
+    return _SchemaResponse(success=True, message="TheMovieDb 识别缓存清理完成")
+
+
+@router.get(
+    "/seasons/{tmdbid}", summary="TMDB所有季", response_model=List[_SchemaTmdbSeason]
+)
+async def tmdb_seasons(
+    tmdbid: int, _: _SchemaTokenPayload = Depends(verify_token),
+    page: CompatiblePageParam = None,
+    count: CompatibleCountParam = None,
+) -> Any:
+    """
+    根据TMDBID查询themoviedb所有季信息
+    """
+    seasons_info = await TmdbChain().async_tmdb_seasons(tmdbid=tmdbid)
+    if seasons_info:
+        return seasons_info
+    return []
+
+
+@router.get(
+    "/similar/{tmdbid}/{type_name}",
+    summary="类似电影/电视剧",
+    response_model=List[_SchemaMediaInfo],
+)
+async def tmdb_similar(
+    tmdbid: int,
+    type_name: str,
+    page: int = 1,
+    count: int = 20,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    根据TMDBID查询类似电影/电视剧，type_name: 电影/movie、电视剧/tv
+    """
+    mediatype = MediaType.from_agent(type_name) or MediaType(type_name)
+    if mediatype == MediaType.MOVIE:
+        medias = await TmdbChain().async_movie_similar(tmdbid=tmdbid)
+    elif mediatype == MediaType.TV:
+        medias = await TmdbChain().async_tv_similar(tmdbid=tmdbid)
+    else:
+        return []
+    if medias:
+        return [media.to_dict() for media in _paginate_medias(medias, page, count)]
+    return []
+
+
+@router.get(
+    "/recommend/{tmdbid}/{type_name}",
+    summary="推荐电影/电视剧",
+    response_model=List[_SchemaMediaInfo],
+)
+async def tmdb_recommend(
+    tmdbid: int,
+    type_name: str,
+    page: int = 1,
+    count: int = 20,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    根据TMDBID查询推荐电影/电视剧，type_name: 电影/movie、电视剧/tv
+    """
+    mediatype = MediaType.from_agent(type_name) or MediaType(type_name)
+    if mediatype == MediaType.MOVIE:
+        medias = await TmdbChain().async_movie_recommend(tmdbid=tmdbid)
+    elif mediatype == MediaType.TV:
+        medias = await TmdbChain().async_tv_recommend(tmdbid=tmdbid)
+    else:
+        return []
+    if medias:
+        return [media.to_dict() for media in _paginate_medias(medias, page, count)]
+    return []
+
+
+@router.get(
+    "/collection/{collection_id}",
+    summary="系列合集详情",
+    response_model=List[_SchemaMediaInfo],
+)
+async def tmdb_collection(
+    collection_id: int,
+    page: Optional[int] = 1,
+    count: Optional[int] = 20,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    根据合集ID查询合集详情
+    """
+    medias = await TmdbChain().async_tmdb_collection(collection_id=collection_id)
+    if medias:
+        page_value = page if page is not None else 1
+        count_value = count if count is not None else 20
+        return _paginate_medias(
+            [media.to_dict() for media in medias], page_value, count_value
+        )
+    return []
+
+
+@router.get(
+    "/credits/{tmdbid}/{type_name}",
+    summary="演员阵容",
+    response_model=List[_SchemaMediaPerson],
+)
+async def tmdb_credits(
+    tmdbid: int,
+    type_name: str,
+    page: Optional[int] = 1,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    根据TMDBID查询演员阵容，type_name: 电影/movie、电视剧/tv
+    """
+    mediatype = MediaType.from_agent(type_name) or MediaType(type_name)
+    if mediatype == MediaType.MOVIE:
+        persons = await TmdbChain().async_movie_credits(tmdbid=tmdbid, page=page)
+    elif mediatype == MediaType.TV:
+        persons = await TmdbChain().async_tv_credits(tmdbid=tmdbid, page=page)
+    else:
+        return []
+    return persons or []
+
+
+@router.get(
+    "/person/{person_id}", summary="人物详情", response_model=_SchemaMediaPerson
+)
+async def tmdb_person(
+    person_id: int, _: _SchemaTokenPayload = Depends(verify_token)
+) -> Any:
+    """
+    根据人物ID查询人物详情
+    """
+    return await TmdbChain().async_person_detail(person_id=person_id)
+
+
+@router.get(
+    "/person/credits/{person_id}",
+    summary="人物参演作品",
+    response_model=List[_SchemaMediaInfo],
+)
+async def tmdb_person_credits(
+    person_id: int,
+    page: Optional[int] = 1,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    根据人物ID查询人物参演作品
+    """
+    medias = await TmdbChain().async_person_credits(person_id=person_id, page=page)
+    if medias:
+        return [media.to_dict() for media in medias]
+    return []
+
+
+@router.get(
+    "/{tmdbid}/{season}",
+    summary="TMDB季所有集",
+    response_model=List[_SchemaTmdbEpisode],
+)
+async def tmdb_season_episodes(
+    tmdbid: int,
+    season: int,
+    episode_group: Optional[str] = None,
+    _: _SchemaTokenPayload = Depends(verify_token),
+    page: CompatiblePageParam = None,
+    count: CompatibleCountParam = None,
+) -> Any:
+    """
+    根据TMDBID查询某季的所有信信息
+    """
+    return await TmdbChain().async_tmdb_episodes(
+        tmdbid=tmdbid, season=season, episode_group=episode_group
+    )

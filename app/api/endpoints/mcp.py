@@ -1,0 +1,449 @@
+"""
+提供 MCP 工具发现、调用以及流式会话的 HTTP 接入。
+"""
+
+from typing import Annotated, Any, Dict, List, Union
+
+from fastapi import Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+
+from app.adapters.web.security.access import verify_apikey
+from app.agent.tools.manager import ToolDefinition, moviepilot_tool_manager
+from app.agent.tools.projection import project_tool_schema
+from app.api.response import (
+    RAW_RESPONSE_OPENAPI_KEY,
+    CompatibleCountParam,
+    CompatiblePageParam,
+    ResponseAPIRouter,
+)
+from app.runtime.log import logger
+from app.runtime.version import get_app_version
+from app.schemas.mcp import MCP_JSONRPC_REQUEST_SCHEMA as _SchemaMCP_JSONRPC_REQUEST_SCHEMA
+from app.schemas.mcp import McpJsonRpcError as _SchemaMcpJsonRpcError
+from app.schemas.mcp import McpJsonRpcResponse as _SchemaMcpJsonRpcResponse
+from app.schemas.mcp import McpJsonSchema as _SchemaMcpJsonSchema
+from app.schemas.mcp import McpToolInfo as _SchemaMcpToolInfo
+from app.schemas.mcp import ToolCallData as _SchemaToolCallData
+from app.schemas.mcp import ToolCallRequest as _SchemaToolCallRequest
+from app.schemas.response import Response as _SchemaResponse
+
+router = ResponseAPIRouter()
+
+# MCP 协议版本
+MCP_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2024-11-05"]
+# 默认使用最新版本
+MCP_PROTOCOL_VERSION = MCP_PROTOCOL_VERSIONS[0]
+# MCP 经 API_TOKEN / X-API-KEY 认证后是管理员级集成入口；隐藏工具只收敛暴露面，不构成权限边界。
+MCP_HIDDEN_TOOLS = {
+    "execute_command",
+    "search_web",
+    "edit_file",
+    "apply_patch",
+    "write_file",
+    "read_file",
+    "read_skill",
+    "view_image",
+}
+
+# 客户端 schema 模式：默认 full 保持完整 oneOf 合同；compact 为显式 opt-in，
+# 把序列化后超出客户端压缩阈值的工具 schema 投影为顶层对象合同（见 projection 模块）。
+MCP_SCHEMA_MODE_FULL = "full"
+MCP_SCHEMA_MODE_COMPACT = "compact"
+MCP_SCHEMA_MODES = (MCP_SCHEMA_MODE_FULL, MCP_SCHEMA_MODE_COMPACT)
+MCP_SCHEMA_MODE_HEADER = "X-MCP-Schema-Mode"
+
+MCP_JSONRPC_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
+    400: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 请求错误"},
+    401: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 认证失败"},
+    403: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 访问被拒绝"},
+    404: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 方法不存在"},
+    409: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 请求冲突"},
+    422: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 参数校验失败"},
+    500: {"model": _SchemaMcpJsonRpcError, "description": "JSON-RPC 内部错误"},
+}
+
+
+def list_exposed_tools() -> List[ToolDefinition]:
+    """
+    获取 MCP 可见工具列表
+    """
+    tools: List[ToolDefinition] = list(moviepilot_tool_manager.list_tools())
+    return [tool for tool in tools if tool.name not in MCP_HIDDEN_TOOLS]
+
+
+def resolve_schema_mode(request: Request) -> str:
+    """
+    读取客户端的 schema 模式；未声明或取值不支持时保持默认 full。
+    """
+    raw = request.headers.get(MCP_SCHEMA_MODE_HEADER) or ""
+    mode = raw.strip().lower()
+    return mode if mode in MCP_SCHEMA_MODES else MCP_SCHEMA_MODE_FULL
+
+
+def list_client_tools(schema_mode: str = MCP_SCHEMA_MODE_FULL) -> List[ToolDefinition]:
+    """
+    按客户端 schema 模式返回工具；compact 模式下投影超出客户端阈值的 schema。
+    """
+    tools = list_exposed_tools()
+    if schema_mode != MCP_SCHEMA_MODE_COMPACT:
+        return tools
+
+    client_tools: List[ToolDefinition] = []
+    projected_names: List[str] = []
+    for tool in tools:
+        schema, projected = project_tool_schema(tool.input_schema)
+        if not projected:
+            client_tools.append(tool)
+            continue
+        projected_names.append(tool.name)
+        client_tools.append(
+            ToolDefinition(name=tool.name, description=tool.description, input_schema=schema)
+        )
+    if projected_names:
+        logger.debug(f"MCP schema compact 投影：{', '.join(projected_names)}")
+    return client_tools
+
+
+def create_jsonrpc_response(request_id: Union[str, int, None], result: Any) -> Dict[str, Any]:
+    """
+    创建 JSON-RPC 成功响应
+    """
+    response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+    return response
+
+
+def create_jsonrpc_error(
+    request_id: Union[str, int, None], code: int, message: str, data: Any = None
+) -> Dict[str, Any]:
+    """
+    创建 JSON-RPC 错误响应
+    """
+    error_detail: Dict[str, object] = {"code": code, "message": message}
+    error = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": error_detail,
+    }
+    if data is not None:
+        error_detail["data"] = data
+    return error
+
+
+async def _dispatch_jsonrpc_method(
+    method: Any,
+    params: Dict[str, Any],
+    request_id: Union[str, int, None],
+    schema_mode: str = MCP_SCHEMA_MODE_FULL,
+) -> Union[JSONResponse, Response]:
+    """
+    分派一个已经通过基础格式校验的 MCP JSON-RPC 方法。
+    """
+    if method == "initialize":
+        result = await handle_initialize(params)
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "notifications/initialized":
+        if request_id is None:
+            return Response(status_code=204)
+        return JSONResponse(
+            status_code=400,
+            content=create_jsonrpc_error(request_id, -32600, "initialized must be a notification"),
+        )
+    if method == "tools/list":
+        result = await handle_tools_list(schema_mode)
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "tools/call":
+        result = await handle_tools_call(params)
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "ping":
+        return JSONResponse(content=create_jsonrpc_response(request_id, {}))
+    return JSONResponse(content=create_jsonrpc_error(request_id, -32601, f"Method not found: {method}"))
+
+
+@router.post(
+    "",
+    summary="MCP JSON-RPC 端点",
+    response_model=_SchemaMcpJsonRpcResponse,
+    openapi_extra={
+        RAW_RESPONSE_OPENAPI_KEY: True,
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _SchemaMCP_JSONRPC_REQUEST_SCHEMA}},
+        },
+    },
+    responses={
+        **MCP_JSONRPC_ERROR_RESPONSES,
+        204: {"description": "JSON-RPC 通知已接收"},
+    },
+)
+async def mcp_jsonrpc(
+    request: Request, _: Annotated[Union[str, None], Depends(verify_apikey)] = None
+) -> Union[JSONResponse, Response]:
+    """
+    MCP 标准 JSON-RPC 2.0 端点
+
+    处理所有 MCP 协议消息（初始化、工具列表、工具调用等）
+    """
+    try:
+        body = await request.json()
+    except Exception as e:
+        logger.error(f"解析请求体失败: {e}")
+        return JSONResponse(
+            status_code=400,
+            content=create_jsonrpc_error(None, -32700, "Parse error", str(e)),
+        )
+
+    # 验证 JSON-RPC 格式
+    if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
+        return JSONResponse(
+            status_code=400,
+            content=create_jsonrpc_error(
+                body.get("id") if isinstance(body, dict) else None, -32600, "Invalid Request"
+            ),
+        )
+
+    method = body.get("method")
+    params = body.get("params", {})
+    request_id = body.get("id")
+
+    try:
+        return await _dispatch_jsonrpc_method(method, params, request_id, schema_mode=resolve_schema_mode(request))
+
+    except ValueError as e:
+        logger.warning(f"MCP 请求参数错误: {e}")
+        return JSONResponse(
+            status_code=400,
+            content=create_jsonrpc_error(request_id, -32602, "Invalid params", str(e)),
+        )
+    except Exception as e:
+        logger.error(f"处理 MCP 请求失败: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content=create_jsonrpc_error(request_id, -32603, "Internal error", str(e)),
+        )
+
+
+async def handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    处理初始化请求
+    """
+    protocol_version = params.get("protocolVersion")
+    client_info = params.get("clientInfo", {})
+
+    logger.info(f"MCP 初始化请求: 客户端={client_info.get('name')}, 协议版本={protocol_version}")
+
+    # 版本协商：选择客户端和服务器都支持的版本
+    negotiated_version = MCP_PROTOCOL_VERSION
+    if protocol_version in MCP_PROTOCOL_VERSIONS:
+        # 客户端版本在支持列表中，使用客户端版本
+        negotiated_version = protocol_version
+        logger.info(f"使用客户端协议版本: {negotiated_version}")
+    else:
+        # 客户端版本不支持，使用服务器默认版本
+        logger.warning(f"协议版本不匹配: 客户端={protocol_version}, 使用服务器版本={negotiated_version}")
+
+    return {
+        "protocolVersion": negotiated_version,
+        "capabilities": {
+            "tools": {
+                # 暂不支持工具列表变更通知
+                "listChanged": False
+            },
+            "logging": {},
+        },
+        "serverInfo": {
+            "name": "MoviePilot",
+            "version": get_app_version(),
+            "description": "MoviePilot MCP Server - 电影自动化管理工具",
+        },
+        "instructions": "MoviePilot MCP 服务器，提供媒体管理、订阅、下载等工具。",
+    }
+
+
+async def handle_tools_list(schema_mode: str = MCP_SCHEMA_MODE_FULL) -> Dict[str, Any]:
+    """
+    处理工具列表请求（默认完整合同；compact 模式按客户端预算投影）
+    """
+    tools = list_client_tools(schema_mode)
+
+    # 转换为 MCP 工具格式
+    mcp_tools = []
+    for tool in tools:
+        mcp_tool = {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.input_schema,
+        }
+        mcp_tools.append(mcp_tool)
+
+    return {"tools": mcp_tools}
+
+
+async def handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    处理工具调用请求
+    """
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+
+    if not tool_name:
+        raise ValueError("Missing tool name")
+
+    try:
+        if tool_name in MCP_HIDDEN_TOOLS:
+            raise ValueError(f"工具 '{tool_name}' 未找到")
+
+        result_text = await moviepilot_tool_manager.call_tool(tool_name, arguments)
+
+        return {"content": [{"type": "text", "text": result_text}]}
+    except Exception as e:
+        logger.error(f"工具调用失败: {tool_name}, 错误: {e}", exc_info=True)
+        return {
+            "content": [{"type": "text", "text": f"错误: {str(e)}"}],
+            "isError": True,
+        }
+
+
+@router.delete(
+    "",
+    summary="终止 MCP 会话",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+    responses={
+        **MCP_JSONRPC_ERROR_RESPONSES,
+        204: {"description": "MCP 会话已终止"},
+    },
+)
+async def delete_mcp_session(
+    _: Annotated[Union[str, None], Depends(verify_apikey)] = None,
+) -> Union[JSONResponse, Response]:
+    """
+    终止 MCP 会话（无状态模式下仅返回成功）
+    """
+    return Response(status_code=204)
+
+
+# HTTP 工具管理端点
+@router.get(
+    "/tools",
+    summary="列出所有可用工具",
+    response_model=List[_SchemaMcpToolInfo],
+)
+async def list_tools(_: Annotated[str, Depends(verify_apikey)], page: CompatiblePageParam = None, count: CompatibleCountParam = None) -> Any:
+    """
+    获取所有可用的工具列表
+
+    返回每个工具的名称、描述和参数定义
+    """
+    try:
+        # 获取所有工具定义
+        tools = list_exposed_tools()
+
+        # 转换为字典格式
+        tools_list = []
+        for tool in tools:
+            tool_dict = {
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            }
+            tools_list.append(tool_dict)
+
+        return tools_list
+    except Exception as e:
+        logger.error(f"获取工具列表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取工具列表失败: {str(e)}")
+
+
+@router.post(
+    "/tools/call",
+    summary="调用工具",
+    response_model=_SchemaResponse[_SchemaToolCallData],
+)
+async def call_tool(request: _SchemaToolCallRequest, _: Annotated[Union[str, None], Depends(verify_apikey)] = None) -> Any:
+    """
+    调用对外开放的指定工具。
+
+    :param request: 工具名称和对应参数
+    :param _: 已通过 API Key 校验的依赖结果
+    :return: 工具执行结果；工具不可见、不存在或执行异常时返回失败响应
+    """
+    try:
+        if request.tool_name in MCP_HIDDEN_TOOLS:
+            raise ValueError(f"工具 '{request.tool_name}' 未找到")
+
+        result_text = await moviepilot_tool_manager.call_tool(request.tool_name, request.arguments)
+
+        return _SchemaResponse(
+            success=True,
+            data=_SchemaToolCallData(result=result_text),
+        )
+    except Exception as e:
+        logger.error(f"调用工具 {request.tool_name} 失败: {e}", exc_info=True)
+        return _SchemaResponse(success=False, message="调用工具失败")
+
+
+@router.get(
+    "/tools/{tool_name}",
+    summary="获取工具详情",
+    response_model=_SchemaMcpToolInfo,
+)
+async def get_tool_info(tool_name: str, _: Annotated[str, Depends(verify_apikey)]) -> Any:
+    """
+    获取对外开放工具的详细信息。
+
+    :param tool_name: 工具登记名称
+    :param _: 已验证的 API Key
+    :return: 工具名称、中文描述和输入 Schema
+    :raises HTTPException: 工具不存在时为 404，读取失败时为 500
+    """
+    try:
+        # 获取所有工具
+        tools = list_exposed_tools()
+
+        # 查找指定工具
+        for tool in tools:
+            if tool.name == tool_name:
+                return {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                }
+
+        raise HTTPException(status_code=404, detail=f"工具 '{tool_name}' 未找到")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取工具信息失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取工具信息失败: {str(e)}")
+
+
+@router.get(
+    "/tools/{tool_name}/schema",
+    summary="获取工具参数Schema",
+    response_model=_SchemaMcpJsonSchema,
+)
+async def get_tool_schema(tool_name: str, _: Annotated[str, Depends(verify_apikey)]) -> Any:
+    """
+    读取对外开放工具的输入 JSON Schema。
+
+    :param tool_name: 工具登记名称
+    :param _: 已验证的 API Key
+    :return: 工具输入 Schema
+    :raises HTTPException: 工具不存在时为 404，读取失败时为 500
+    """
+    try:
+        # 获取所有工具
+        tools = list_exposed_tools()
+
+        # 查找指定工具
+        for tool in tools:
+            if tool.name == tool_name:
+                return tool.input_schema
+
+        raise HTTPException(status_code=404, detail=f"工具 '{tool_name}' 未找到")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取工具Schema失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取工具Schema失败: {str(e)}")

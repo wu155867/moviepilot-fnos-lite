@@ -1,0 +1,160 @@
+"""
+文件读取工具
+"""
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Optional, Type, cast
+
+from anyio import Path as AsyncPath
+from pydantic import BaseModel, Field
+
+from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
+from app.runtime.log import logger
+
+# 最大读取大小 50KB
+MAX_READ_SIZE = 50 * 1024
+READ_FILE_TRUNCATION_MESSAGE = (
+    "文件内容超过50KB，本次结果已截断。"
+    "请使用 start_line 和 end_line 参数指定行号范围分段读取。"
+)
+
+
+class ReadFileInput(BaseModel):
+    """
+    文件读取工具的输入参数模型。
+    """
+
+    file_path: str = Field(
+        ...,
+        description="待读取文本文件的绝对路径",
+    )
+    start_line: Optional[int] = Field(
+        None,
+        description="起始行号，从 1 开始且包含该行；省略时从文件开头读取",
+    )
+    end_line: Optional[int] = Field(
+        None,
+        description="结束行号，从 1 开始且包含该行；省略时读取到文件末尾",
+    )
+    include_metadata: bool = Field(
+        False,
+        description="是否返回包含正文、大小、截断状态及 SHA-256 的结构化 JSON；进行受保护的完整覆盖前使用",
+    )
+
+
+class ReadFileTool(MoviePilotTool):
+    """
+    按行范围读取本地文本文件，并可返回文件版本元数据。
+    """
+
+    name: str = Field(
+        default="read_file",
+        description="供模型调用的稳定工具名称",
+    )
+    tags: list[str] = Field(
+        default=[ToolTag.Read, ToolTag.File],
+        description="工具的能力和权限分类标签，初始化时会统一归一化",
+    )
+    description: str = Field(
+        default="读取文本文件内容，支持指定行范围。每次最多读取 50KB；发生截断时，缩小 start_line 和 end_line 范围后继续读取。",
+        description="供模型理解工具用途、输入约束和调用边界的说明",
+    )
+    args_schema: Type[BaseModel] = Field(
+        default=ReadFileInput,
+        description="工具输入参数的验证模型或 JSON Schema",
+    )
+
+    def get_tool_message(self, **kwargs: Any) -> Optional[str]:
+        """
+        根据参数生成友好的提示消息
+        """
+        file_path = kwargs.get("file_path", "")
+        file_name = Path(file_path).name if file_path else "未知文件"
+        return f"读取文件: {file_name}"
+
+    async def run(  # type: ignore[override]
+        self,
+        file_path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        include_metadata: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        """
+        读取指定文本范围，必要时附带完整文件的 SHA-256 元数据。
+        """
+        logger.info(f"执行工具: {self.name}, 参数: file_path={file_path}, start_line={start_line}, end_line={end_line}")
+
+        try:
+            if start_line is not None and start_line < 1:
+                return "错误：start_line 必须是从 1 开始的行号；请提供有效范围后重试。"
+            if end_line is not None and end_line < 1:
+                return "错误：end_line 必须是从 1 开始的行号；请提供有效范围后重试。"
+            if start_line is not None and end_line is not None and end_line < start_line:
+                return "错误：end_line 不能小于 start_line；请调整读取范围后重试。"
+            resolved_path, access_error = await self._check_local_file_access(
+                file_path, operation="读取"
+            )
+            if access_error:
+                return access_error
+            path = AsyncPath(cast(Path, resolved_path))
+
+            if not await path.exists():
+                return f"错误：文件 {resolved_path} 不存在"
+
+            if not await path.is_file():
+                return f"错误：{resolved_path} 不是一个文件"
+
+            raw_content = await path.read_bytes()
+            content = raw_content.decode("utf-8", errors="replace")
+            truncated = False
+
+            if start_line is not None or end_line is not None:
+                lines = content.splitlines(keepends=True)
+                total_lines = len(lines)
+
+                # 将行号转换为索引（1-based -> 0-based）
+                s = (start_line - 1) if start_line and start_line >= 1 else 0
+                e = end_line if end_line and end_line >= 1 else total_lines
+
+                # 确保范围有效
+                s = max(0, min(s, total_lines))
+                e = max(s, min(e, total_lines))
+
+                content = "".join(lines[s:e])
+
+            # 检查大小限制
+            content_bytes = content.encode("utf-8")
+            if len(content_bytes) > MAX_READ_SIZE:
+                content = content_bytes[:MAX_READ_SIZE].decode("utf-8", errors="replace")
+                truncated = True
+
+            if include_metadata:
+                payload = {
+                    "file_path": str(resolved_path),
+                    "sha256": hashlib.sha256(raw_content).hexdigest(),
+                    "size_bytes": len(raw_content),
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "truncated": truncated,
+                }
+                if truncated:
+                    payload["truncation_message"] = READ_FILE_TRUNCATION_MESSAGE
+                payload["content"] = content
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+
+            if truncated:
+                return f"{content}\n\n[警告：{READ_FILE_TRUNCATION_MESSAGE}]"
+
+            return str(content)
+
+        except PermissionError:
+            return f"错误：没有权限读取 {file_path}"
+        except UnicodeDecodeError:
+            return f"错误：{file_path} 不是文本文件，无法读取"
+        except Exception as e:
+            logger.error(f"读取文件 {file_path} 时发生错误: {str(e)}", exc_info=True)
+            return f"操作失败: {str(e)}"

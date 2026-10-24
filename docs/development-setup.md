@@ -1,0 +1,333 @@
+## 开发环境设置指南
+
+本文档旨在帮助开发者快速设置开发环境，并说明主程序、开发测试、构建工具和插件依赖的管理边界。
+
+### 环境准备
+
+在开始之前，请确保您的系统已安装以下软件：
+
+- **Python 3.14+**
+- **uv 0.12.5+**（Python 版本、虚拟环境和依赖锁定工具，推荐使用最新稳定版）
+- **Git** (用于版本控制)
+- **RAR 解压工具**：本地开发如需测试或使用 `.rar` 字幕包解压，请安装 `unar`、`unrar`、`7z` 或 `bsdtar` 之一；Docker 镜像会内置 `unar`。
+
+Rust 加速扩展通过 `moviepilot-rust` PyPI 包安装，主项目本地开发不再需要 Rust toolchain。需要修改或发布 Rust 扩展时，请在 `MoviePilot-Rust` 仓库中构建。
+
+### 1. 创建锁定环境
+
+仓库通过 `pyproject.toml` 声明直接依赖，并提交统一的 `uv.lock`。在项目根目录执行：
+
+```bash
+uv sync --locked
+```
+
+`uv` 会创建或更新 `.venv`，并安装运行时与默认 `dev` 依赖组。命令中的
+`--locked` 会在 `pyproject.toml` 与 `uv.lock` 不一致时直接失败，避免开发环境静默解析出一套
+未提交的依赖结果。只需要生产运行依赖时使用：
+
+```bash
+uv sync --locked --no-dev --no-install-project
+```
+
+以上命令以独立 checkout 的仓内 `.venv` 为默认。多仓工作区若已有共享运行环境 `.venv` 和
+隔离测试环境 `.venv-test`，按工作区说明选择，不创建另一套仓内环境。以下变量指向实际工作区
+根目录，路径使用绝对路径，避免 `--directory` 改变相对环境路径的含义：
+
+```bash
+MOVIEPILOT_WORKSPACE="${MOVIEPILOT_WORKSPACE:?set absolute workspace root}"
+UV_PROJECT_ENVIRONMENT="${MOVIEPILOT_WORKSPACE}/.venv" \
+  uv sync --locked --directory "${MOVIEPILOT_WORKSPACE}/MoviePilot"
+UV_PROJECT_ENVIRONMENT="${MOVIEPILOT_WORKSPACE}/.venv-test" \
+  uv run --directory "${MOVIEPILOT_WORKSPACE}/MoviePilot" --locked --no-sync \
+  python -c 'import sys; print(sys.executable)'
+```
+
+测试与静态检查均在目标后端 checkout 工作目录执行：把公共命令中的
+`uv run --locked --no-sync` 映射到上述 `.venv-test`，或直接用该环境的 Python 执行
+`-m pytest`、`-m pylint` 及检查脚本。先确认解释器、锁文件和所需依赖组相符；`--no-sync`
+只避免同步，不证明已安装依赖匹配。环境创建/重建按工作区指令执行，不在普通验证中重建或
+同步共享环境。测试不加载运行用 `app.env`，由测试引导隔离临时 `CONFIG_DIR`；本地服务启动
+则遵循工作区的子进程环境加载约定。
+
+### 2. 依赖分层与事实源
+
+主程序只维护以下依赖事实源：
+
+| 位置 | 用途 | 维护方式 |
+| --- | --- | --- |
+| `pyproject.toml` 的 `[project].dependencies` | 两套 Python 运行时共享的主程序生产依赖。 | 开发者按直接依赖的兼容范围维护。 |
+| `pyproject.toml` 的 `[dependency-groups].dev` | pytest、覆盖率、Pylint 和源码构建等开发工具。 | 不进入 Docker 生产运行环境。 |
+| `pyproject.toml` 的 `[dependency-groups].runtime-*` | 标准与 free-threaded 解释器互斥的 ABI 敏感运行依赖。 | 只放两套运行时确实不同的直接依赖。 |
+| `uv.lock` | Python 3.14+、两套运行时 profile 和受支持平台共享的完整解析结果。 | 修改 `pyproject.toml` 后由 `uv lock` 更新并提交。 |
+
+主程序不再维护 `requirements.in`、`requirements-dev.in` 或 `requirements.txt`，也不生成
+平台专属的 requirements 锁文件。Docker、CLI 和 CI 都以提交的 `uv.lock` 为安装输入。
+
+标准运行时的 Brotli 使用 1.2.1。free-threaded 运行时使用上游源码提交
+`0ed4268a4401abcb4472096340477cf4af7d1a2b`，该提交同时保留无 GIL 声明并包含
+[CVE-2026-111497 的官方修复](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)。
+源码分支的包版本仍为 1.2.0，不能仅凭版本字符串判断补丁是否存在；1.2.1 发布分支
+尚未声明无 GIL 支持，不能直接替换 free-threaded 的源码依赖。
+
+### 2.1 本地启动脚本
+
+不需要打开 IDE 时，可以直接使用仓库内的启动脚本。脚本会自动定位项目根目录和虚拟环境，并以模块方式启动后端，避免 `ModuleNotFoundError: No module named 'app'`。
+
+后端开发入口优先使用 `uv sync` 创建的 `.venv/bin/python`，没有该解释器时使用旧的 `venv/bin/python`。`./scripts/start-local.sh help` 不要求先安装虚拟环境。
+
+```bash
+# 默认启动后端开发服务，前台运行，按 Ctrl+C 停止
+./scripts/start-local.sh
+./scripts/start-local.sh backend
+
+# 如果已经安装前端发布包，可启动完整的前后端服务
+./scripts/start-local.sh service start
+
+# 管理完整服务
+./scripts/start-local.sh stop
+./scripts/start-local.sh restart
+./scripts/start-local.sh status
+./scripts/start-local.sh logs --follow
+```
+
+默认会使用 `DEBUG=true` 和 `DEV=true`，与 IDE 开发启动保持一致。开发热重载通过
+`app.factory:create_app` 的 import string/factory 入口运行，文件变化后由 Uvicorn 重新创建
+应用结构；不会尝试在 reload 进程间传递已经实例化的 FastAPI 对象。如果不需要热重载，
+可以这样启动以降低资源占用：
+
+```bash
+DEV=false ./scripts/start-local.sh
+```
+
+脚本会优先使用 `CONFIG_DIR`，其次使用 `MOVIEPILOT_CONFIG_DIR`，再检测 `~/Documents/moviepilot`，最后回退到仓库内的 `config` 目录。需要使用其他配置目录时，可以这样运行：
+
+```bash
+MOVIEPILOT_CONFIG_DIR=/path/to/moviepilot-config ./scripts/start-local.sh
+```
+
+首次使用前如果脚本没有执行权限，运行：
+
+```bash
+chmod +x scripts/start-local.sh
+```
+
+### 3. 修改主程序依赖
+
+新增或升级依赖时，先确认依赖属于哪个层级：
+
+1. **共享运行时依赖**：被 `app/` 生产代码直接导入，或是生产功能、后台任务、插件框架启动必需，写入 `[project].dependencies`。
+2. **ABI 敏感运行依赖**：标准与 free-threaded 解释器必须选择不同制品或版本时，分别写入 `runtime-standard` 和 `runtime-free-threaded`；两组保持互斥并由运行时统一选择。
+3. **开发 / 测试 / 静态检查 / 构建依赖**：只用于单测、覆盖率、lint 辅助、源码构建等，写入 `[dependency-groups].dev`。
+4. **工具依赖**：仓库要求使用 `uv 0.12.5+`，推荐使用最新稳定版；不应为了安装工具而把它加入主程序运行依赖。
+5. **插件依赖**：由插件清单声明并在插件安装阶段处理，不直接并入主程序依赖。
+
+修改后更新并校验锁文件：
+
+如果只需要修复某个传递依赖（例如安全审计发现的问题），可先用
+`uv lock --upgrade-package <package>` 定向更新，避免无关依赖随之升级。
+
+```bash
+uv lock
+uv lock --check
+uv sync --locked
+uv sync --locked --offline --inexact --no-dev --check
+```
+
+`uv pip check` 可用于查看第三方包元数据诊断，但不作为项目依赖合同：`oss2` 已停止维护，其元数据仍
+声明旧 `crcmod`，而主程序统一使用保持相同导入接口的 `crcmod-plus`。项目一致性以锁文件和上述
+`uv sync --check` 结果为准。
+
+`uv.lock` 同时覆盖 Linux x86_64/arm64、macOS x86_64/arm64 和 Windows x64。统一锁文件只
+固定解析结果，不能替代这些平台的真实安装门禁；平台条件依赖变更必须通过对应 CI 环境验证。
+
+### 3.1 插件依赖清单
+
+新插件可以在插件根目录使用 `pyproject.toml`，宿主只读取 `[project].dependencies` 作为运行依赖：
+
+```toml
+[project]
+name = "example-plugin"
+version = "1.0.0"
+dependencies = ["example-package>=1,<2"]
+```
+
+插件依赖遵循以下合同：
+
+- `pyproject.toml` 优先于历史 `requirements.txt`；两者同时存在时只读取前者；
+- `[dependency-groups]` 属于插件自身的开发、测试或构建环境，宿主不安装其中内容；
+- `pyproject.toml` 存在但格式或依赖声明无效时直接报错，不回退到 `requirements.txt`；
+- 仅有 `requirements.txt` 的历史插件继续按原方式安装；
+- 宿主不消费插件自己的 `uv.lock`，因为多个插件共享同一主程序环境，不能分别同步独立锁文件。
+
+启动恢复依赖时，只收集已安装且存在启用本体或分身的插件清单；全部实例都停用的插件
+不会参与依赖解析，也不会提供本地 wheels。先尝试统一安装，失败后逐个恢复插件，并在
+后续请求中保留已就绪和已恢复插件的原始清单约束，避免互斥版本轮流覆盖共享环境。
+仍不可满足的插件保持 `dependency_pending`，其它就绪插件继续激活。两个互斥版本无法
+在同一环境中同时满足，应停用所有冲突实例、卸载冲突插件或由插件作者统一依赖版本。
+安装结束后宿主重新分类并激活就绪插件；容器外手工修改依赖后，需重载插件或重启以更新运行状态。
+
+### 3.2 异步 HTTP 客户端边界
+
+主程序自建的 `AsyncRequestUtils` 使用 HTTPX2，`app.sdk.network.AsyncRequestUtils` 与旧插件
+入口 `app.utils.http.AsyncRequestUtils` 共享同一实现。未显式传入客户端时，返回的响应与抛出的
+请求异常均来自 `httpx2`；直接依赖响应类型或异常类型的 V3 代码应导入 `httpx2`。
+
+OpenAI、Anthropic、Google GenAI、LangChain、CloakBrowser 等第三方 SDK 继续使用它们声明的
+HTTPX 版本。不得调用 `httpx2.alias_httpx()` 在进程内替换 `httpx`，否则会同时改变第三方 SDK、
+测试工具和插件的导入结果。确需复用调用方自管客户端时，向 `AsyncRequestUtils` 传入
+`httpx2.AsyncClient`。
+
+### 4. 准备资源与插件目录
+
+本地源码开发时，主程序需要读取资源文件和插件源码。相关文件需要放到主程序实际加载的目录下：
+
+- **资源文件**：将 [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources) 仓库中 `resources.v3/` 下的文件同步到本仓库的 `app/application/site/` 目录下。CLI 安装和 Docker 构建流程只读取 V3 资源。
+- **插件源码**：需要开发或调试的插件放到本仓库的 `app/plugins/` 目录下，例如 `app/plugins/<插件目录>/`。主程序运行时从该目录加载插件，独立插件仓库只是源码来源。
+
+如果资源文件没有放到 `app/application/site/`，站点索引、规则和内置资源相关能力可能无法按本地开发预期工作；如果插件没有放到 `app/plugins/`，主程序也不会在本地运行时发现该插件。
+
+### 4.1 GitHub 发版时生成插件市场默认值
+
+源码分支中的 `ConfigModel.PLUGIN_MARKET` 只保留官方插件仓库作为离线兜底。GitHub 的 V3 正式版与 Beta 镜像构建会检出 `MoviePilot-Wiki` 的 `main` 分支，并由 `scripts/generate_plugin_market_default.py` 读取 `plugin.md` 中 `plugin-market-repos:start/end` 标记区域，将规范化、去重后的公开仓库清单写入构建工作区。
+
+生成过程遵循以下约束：
+
+- 标记必须唯一、顺序正确，清单不能为空且必须包含 `jxxghp/MoviePilot-Plugins`；不满足时直接终止构建。
+- 生成脚本只替换 `ConfigModel` 中的 `PLUGIN_MARKET` 默认值，不写入运行时环境变量，因此用户仍可通过系统环境变量或 `/config/app.env` 覆盖。
+- 正式版工作流会创建仅由 Release Tag 引用的本地快照提交，Docker 镜像和 Tag 源码归档均来自该快照；Actions 不会将生成结果回写到 `v3` 分支。
+- Release Tag 快照提交信息和镜像标签会记录本次使用的 MoviePilot Wiki Commit，便于追溯清单来源。
+
+本地验证生成结果时，先激活项目虚拟环境，再执行：
+
+```bash
+python -m scripts.generate_plugin_market_default \
+  --wiki-file /path/to/MoviePilot-Wiki/plugin.md \
+  --config-file app/runtime/config.py
+```
+
+### 5. 运行依赖漏洞检查
+
+正式发布会使用最新稳定版 `pip-audit` 检查 `uv.lock` 锁定的运行时依赖。依赖变更后也可以在
+本地执行同一检查：
+
+```bash
+uv export --quiet --locked --no-dev --no-emit-project \
+  --output-file /tmp/moviepilot-audit-requirements.txt
+uvx --from pip-audit pip-audit \
+  --require-hashes --disable-pip --strict --progress-spinner off \
+  --requirement /tmp/moviepilot-audit-requirements.txt
+```
+
+导出文件由 `uv.lock` 生成且保留哈希，不作为项目依赖清单提交。
+
+Docker 镜像直接基于官方基础镜像构建，只安装应用运行所需的系统依赖；不运行镜像漏洞扫描，
+也不为扫描结果刷新系统包、删除基础镜像自带工具或维护漏洞忽略清单。正式版和 Beta 均直接构建
+并发布标准版与 free-threaded 版的双架构镜像。应用锁定依赖仍按上述流程审计。
+`v3` 分支自动发布仅在 `version.py` 的 `APP_VERSION` 或 `FRONTEND_VERSION` 值发生变化时运行；
+只修改该文件的说明文字不会重建正式镜像。维护者仍可通过手动触发正式发布工作流重建当前版本。
+
+### 6. Contributor 提交准备
+
+公共提交准备按 [AGENTS.md](../AGENTS.md) 的 contributor default 执行；已确认的维护者可以
+依据有效证据明确调整适用检查范围、时机和交付顺序，包括先保存本地 anchor 再补验证。记录
+决定、证据、未验证项和后续安排，已有同范围授权不重问；这不取消架构、兼容、正确性和真实报告。
+
+按改动选择检查，命令入口统一见 [命令参考](rules/03-commands.md) 与
+[测试规范](testing.md)：
+
+1. **依赖变化**：确认依赖分层、`uv.lock`、锁定环境一致性和 `pip-audit`；平台条件依赖还需对应平台安装证据。
+2. **行为变化**：运行受影响测试；依赖/锁文件、共享脚手架、数据库、启动、跨模块生命周期、兼容或大范围行为变化运行 `python tests/run.py` 全量。纯文档及其契约测试使用对应文本、结构、链接和 focused 检查。
+3. **架构与静态检查**：按受影响合同选择架构策略、snapshot 和 ratchet；策略测试先于 snapshot。Pylint 候选范围分别取 PR base 到 HEAD、暂存 diff、未暂存 diff 及本次新文件的并集；以实际待提交的索引 tree 过滤路径并检查内容。仅暂存本次选择的路径/hunks；代码、项目配置与仓内 lint 依赖必须来自同一 tree。只有全部 tracked 工作树与索引一致（`git diff --quiet`）且没有会影响 lint 的额外配置或导入输入时才使用工作树快捷路径，否则（含部分暂存）按 `AGENTS.md` 导出索引验证。这是现有 lint 的输入选择，不增加门禁；大范围 Python 变化在同一待提交 tree 中检查 `app/`。
+4. **最终核对**：复用仍有效的证据，只重跑被后续变化失效的检查；检查最终 diff、`git diff --check` 和工作树。CI 失败归属及维护者预授权按 [协作规则](rules/12-collaboration-and-distribution.md) 处理。
+
+提交前还须按 [注释规范](rules/08-comment-styles.md) 审查本次新增和修改的对象：说明文字使用中文，
+文档字符串使用多行三双引号，参数与返回值统一使用 `:param:` / `:return:` 字段列表，
+dataclass、Pydantic 和 Protocol 的声明项逐项提供说明。Pydantic 字段使用 `Field(description=...)`，
+不得因注释调整改变模型行为。旧文件风格不构成例外；现有 Pylint / Ruff 检查未覆盖全部注释要求，
+检查通过不能代替这项审查。
+
+主仓架构检查不依赖独立插件仓；官方插件兼容观察通过每周或手工工作流单独运行，仅上传语义差异
+报告，不自动更新基线。普通主仓改动不要求额外检出插件仓或运行观察任务。宿主架构门禁和 changed-file
+Pylint 由 `v3` PR/push 的 GitHub Actions 执行，`app/` 全量 Pylint 是建议性报告。
+
+站点采集器源码与构建工作流位于 [MoviePilot-Site-Collector](https://github.com/jxxghp/MoviePilot-Site-Collector)，使用独立的 `site-adapter-collector-v1.0.x` Release，仅在采集器发布输入变化时递增版本并构建，不跟随后端 Release。下载入口为 [采集器独立 Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest)，自动版本和手动测试构建规则见 [采集器发布说明](https://github.com/jxxghp/MoviePilot-Site-Collector/blob/main/docs/site-adapter-collector-release.md#维护者发布流程)。
+
+Ruff/Mypy 基线只允许收紧，不接受新增诊断或类型错误增长。`mypy.ini` 默认严格检查整个 `app/`，
+仅排除由插件发布链路治理的运行时 `app/plugins/` 副本；新宿主文件自动纳入检查。
+Mypy 完整 ratchet 固定按 Linux/Python 3.14 分析。Coverage job 在 `v3` PR/push
+运行，按 `tests/run.py` 的分片合同执行并合并报告，除 `app/plugins` 外全部 `app` 文件按逐文件
+低水位检查，存量只能提升，新文件必须达到 80%。
+宿主类型错误基线 `tests/fixtures/architecture/mypy-baseline.json` 已清零，不能重新添加诊断预算；
+兼容例外使用下文的精确登记，不以定向扫描结果宣称全量交付。
+每个 Coverage 分片预算为 15 分钟（测试 step 为 10 分钟），报告与 ratchet 为 10 分钟；不得靠
+跳过测试或产物规避超时。Coverage 只接受 GitHub Actions 的 Ubuntu/Python 3.14、locked
+依赖和全量测试工件，本机 macOS 报告仅供诊断，不得写入并提交 canonical baseline。
+
+### 6.1 结构复杂度门禁
+
+复杂度按全宿主函数的 Ruff C901（上限 15）与 PLR1702（嵌套上限 5）检查，排除
+`app/plugins/**`。方法、类和文件行数只生成观察报告，注释、空行和格式换行不再消耗硬预算。
+原来的 `--v2` 行数检查已退役。阈值以内允许正常开发；存量超限函数不能新增或继续增长。
+
+```bash
+uv run --locked --no-sync python scripts/architecture/complexity.py --report /tmp/moviepilot-complexity-report.json
+# 仅在消除全部回退、确认真实下降后固化低水位
+uv run --locked --no-sync python scripts/architecture/complexity.py --write
+uv run --locked --no-sync python scripts/architecture/complexity.py
+```
+
+`--write` 拒绝接受已有基线上的增长；减少或删除热点后必须固化低水位。
+CI 上传 `complexity-report` 工件，门禁失败时也保留已生成的指标。指标口径以
+`scripts/architecture/complexity.py` 与 `scripts/architecture/mypy_ratchet.py` 的实现为准。
+
+### 6.2 类型兼容例外门禁
+
+`scripts/architecture/mypy_policy.py` 核对
+`tests/fixtures/architecture/mypy-policy.json` 中每项兼容原因、所属方法、错误码和语法指纹。
+保留例外涉及异步工具旧接口、动态 Facade 描述符、运行时 MRO/元类、FastAPI Response
+注入默认值和供应方类型限制；
+例外只作用于登记语句，方法体继续严格检查。二进制站点接口的 `sites.pyi` 按文件摘要登记。
+
+门禁拒绝新增或变化的 `type: ignore`、没有错误码的忽略、`no_type_check`、文件内 mypy
+配置和未经复核的本地类型桩；同时锁定完整 mypy 配置，防止缩小检查范围或扩大导入豁免。
+供应方导入仍使用现有 `follow_imports=skip` 边界；已接入的 LangChain/LangGraph、Pydantic、
+FastAPI/Starlette、Slack 等读取真实供应方声明，不允许用本地类型桩遮蔽它们。
+缺失导入豁免只覆盖配置中逐一列出的既有无类型 SDK，新依赖不会自动得到豁免。
+psutil、regex、tqdm 的正式类型声明由锁文件中的开发依赖提供。
+默认检查同时保留既有的异步阻塞治理脚本，并覆盖新的类型例外门禁自身。
+
+```bash
+uv run --locked --no-sync python scripts/architecture/mypy_policy.py
+uv run --locked --no-sync mypy --config-file mypy.ini
+uv run --locked --no-sync python scripts/architecture/mypy_ratchet.py
+# 修复例外后仅删除已失效的登记；存在任何增长时拒绝写入
+uv run --locked --no-sync python scripts/architecture/mypy_policy.py --write
+```
+
+新增兼容边界必须说明真实运行合同与无法直接使用供应方声明的原因，补充行为验证，
+人工复核登记和配置差异；不能用写入命令自动接收。CI 执行同一门禁，并测试新文件报错、
+例外转移、类型桩遮蔽和写入拒绝行为。发布前以最终提交的全量检查结果为准。
+
+### 7. 参考资源
+
+- [uv 官方文档](https://docs.astral.sh/uv/)
+- [pip-audit](https://github.com/pypa/pip-audit)
+- [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)
+- [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
+
+### Agent 历史消息索引验证
+
+独立消息库位于 Agent 运行目录，不参与主库 Alembic。使用临时运行目录运行 `tests/test_agent_recall_persistence.py`，不得用真实用户的 `state.db` 做索引破坏或重建测试。CJK tokenizer 保留 Hermes 原版源码及许可证于 `native/fts5_cjk/`；Docker 构建与 CLI 依赖安装使用该目录的 `install.py`，按本机架构编译并用目标解释器实际验证两字中文查询，安装到 `<sys.prefix>/lib/moviepilot/libfts5_cjk.so`。旧配置目录内的手工扩展作为加载回退；编译器要求和补装/检查命令见该目录 README。测试有本地 C 编译器时在临时目录构建，无编译器时只跳过原生扩展用例，不能宣称该分词路径已验证。常规 FTS5 与 trigram、短中文回退无需该扩展，扩展缺失或失效时索引状态会明确降级。独立 schema 版本不等于产品版本；后续新增主库升级脚本从 3.1.0 命名。
+
+### Agent 学习验证
+
+交互执行隔离、后台避让及超时配置见 [智能助手执行优先策略](agent-execution.md)。
+
+`tests/test_agent_learning_skills.py`、`tests/test_agent_learning_memory.py` 和
+`tests/test_agent_learning_review.py` 用临时目录与确定性模型核对 Hermes 学习契约，
+不访问实际 LLM 或个人记忆。匹配器、威胁模式和提示词的上游来源及 MIT 许可在
+`app/agent/learning/LICENSE.hermes`；不得以这些离线测试替代固定真实模型的效果评测。
+
+`tests/test_agent_guardrail_controller.py` 保留 Hermes 原始循环规则的纯行为回归，
+`tests/test_agent_guardrails.py` 使用真实 LangGraph 验证并行顺序、逐运行隔离、正常轮询、
+未知结果、尾部行动继续提示和流式停止交付。派生代码许可在 `app/agent/guardrails/LICENSE.hermes`。

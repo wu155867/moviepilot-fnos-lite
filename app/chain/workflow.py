@@ -1,0 +1,1547 @@
+"""
+工作流的加载、调度、执行与结果通知编排。
+"""
+
+import ast
+import base64
+import binascii
+import copy
+import inspect
+import pickletools
+import threading
+from collections import defaultdict, deque
+from concurrent.futures import Future
+from contextvars import Context, copy_context
+from dataclasses import is_dataclass
+from datetime import date, datetime
+from functools import partial
+from io import BytesIO, StringIO
+from pickle import HIGHEST_PROTOCOL
+from time import monotonic, sleep
+from typing import Any, Callable, List, Optional, Tuple
+
+from pydantic import BaseModel
+
+from app.application.workflow import (
+    WorkflowExecutionPort,
+    WorkflowSnapshot,
+    get_configured_workflow_execution,
+    get_configured_workflow_query,
+    get_workflow_manager,
+    validate_workflow_graph,
+)
+from app.chain.base import ChainBase
+from app.runtime.events import Event, eventmanager
+from app.runtime.execution import OwnedThreadPoolExecutor
+from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
+from app.schemas.types import EventType
+from app.schemas.workflow import Action, ActionContext, ActionExecution, ActionFlow, ActionResult
+
+ARTIFACT_FIELDS = {"torrents", "medias", "fileitems", "downloads", "sites", "subscribes"}
+DEFAULT_WORKFLOW_MAX_WORKERS = 4
+WORKFLOW_EXECUTOR_STOP_TIMEOUT_SECONDS = 10.0
+CIRCULAR_REFERENCE_PLACEHOLDER = "[Circular]"
+
+
+def _serialize_workflow_key(key: Any) -> Any:
+    """
+    将映射键转换为 JSON 安全值。
+    """
+    if key is None or isinstance(key, (str, int, float, bool)):
+        return key
+    return str(key)
+
+
+def _serialize_workflow_value(value: Any, stack: Optional[set[int]] = None) -> Any:
+    """
+    把工作流上下文和值转换为可持久化的 JSON 结构。
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+
+    stack = stack or set()
+    object_id = id(value)
+    if object_id in stack:
+        return CIRCULAR_REFERENCE_PLACEHOLDER
+
+    if isinstance(value, BaseModel):
+        stack.add(object_id)
+        try:
+            return {
+                field_name: _serialize_workflow_value(getattr(value, field_name, None), stack)
+                for field_name in value.__class__.model_fields
+            }
+        finally:
+            stack.remove(object_id)
+
+    to_dict = getattr(value, "to_dict", None) if is_dataclass(value) and not isinstance(value, type) else None
+    if callable(to_dict):
+        # RSS 等动作按设计把领域 dataclass（如 app.domain.context.Context）放进上下文，其 to_dict
+        # 与工作流 Schema 字段对齐，恢复时可经 ActionContext 校验还原；落到 str() 会存成无法恢复的文本。
+        stack.add(object_id)
+        try:
+            return _serialize_workflow_value(to_dict(), stack)
+        finally:
+            stack.remove(object_id)
+
+    if isinstance(value, dict):
+        stack.add(object_id)
+        try:
+            return {
+                _serialize_workflow_key(key): _serialize_workflow_value(item, stack)
+                for key, item in value.items()
+            }
+        finally:
+            stack.remove(object_id)
+
+    if isinstance(value, (list, tuple, set)):
+        stack.add(object_id)
+        try:
+            return [_serialize_workflow_value(item, stack) for item in value]
+        finally:
+            stack.remove(object_id)
+
+    return str(value)
+
+
+def _serialize_workflow_context(context: ActionContext) -> dict[str, Any]:
+    """
+    构建可写入数据库的工作流上下文字典。
+    """
+    serialized = _serialize_workflow_value(context)
+    return serialized if isinstance(serialized, dict) else {}
+
+
+class WorkflowCancelToken:
+    """
+    工作流取消令牌。
+    """
+
+    def __init__(
+            self,
+            workflow_id: int,
+            stop_event: Optional[threading.Event] = None,
+    ) -> None:
+        """
+        初始化取消令牌。
+
+        :param workflow_id: 工作流ID
+        :param stop_event: 单次执行 任务持有者 的本地停止信号
+        """
+        self.workflow_id = workflow_id
+        self.stop_event = stop_event
+
+    def is_cancelled(self) -> bool:
+        """
+        判断工作流是否已被取消。
+        """
+        return bool(
+            (self.stop_event and self.stop_event.is_set())
+            or runtime_stop_state.is_workflow_stopped(self.workflow_id)
+        )
+
+
+class WorkflowExecutor:
+    """
+    工作流执行器
+    """
+
+    def __init__(
+            self,
+            workflow: WorkflowSnapshot,
+            step_callback: Optional[Callable[..., object]] = None,
+            *,
+            from_begin: bool = False,
+            completion_callback: Optional[Callable[["WorkflowExecutor"], None]] = None,
+    ):
+        """
+        初始化工作流执行器
+
+        :param workflow: 工作流对象
+        :param step_callback: 步骤回调函数
+        :param from_begin: 忽略历史节点和上下文，从头构建本次执行
+        :param completion_callback: 节点真实终止后、释放同 ID 所有权前提交终态
+        """
+        validate_workflow_graph(workflow.actions, workflow.flows)
+        self.workflow = workflow
+        self._from_begin = from_begin
+        self._completion_callback = completion_callback
+        self.step_callback = step_callback
+        self.step_callback_extended = (
+            len(inspect.signature(step_callback).parameters) > 2
+            if step_callback
+            else False
+        )
+        self.actions: dict[str, Action] = {}
+        for action_data in workflow.actions or ():
+            action = Action.model_validate(dict(action_data))
+            if not action.id:
+                raise ValueError("工作流动作缺少 ID")
+            self.actions[action.id] = action
+        self.flows = [ActionFlow.model_validate(dict(flow)) for flow in workflow.flows or ()]
+        execution_config = getattr(workflow, "execution_config", None) or {}
+        execution_state = {} if from_begin else (getattr(workflow, "execution_state", None) or {})
+        self.execution_config = (
+            execution_config.model_dump(exclude_none=True)
+            if isinstance(execution_config, BaseModel)
+            else execution_config
+        )
+        self.restored_execution_state = (
+            execution_state.model_dump(exclude_none=True)
+            if isinstance(execution_state, BaseModel)
+            else execution_state
+        )
+        self.total_actions = len(self.actions)
+        self.success = True
+        self.has_failure = False
+        self.stopped = False
+        self.errmsg = ""
+        self.errors = self.get_restored_errors()
+        self.node_metadata = self.get_restored_node_metadata()
+        self.node_attempts = self.get_restored_attempts()
+        self.node_states = self.get_restored_node_states()
+        self.completed_actions = {
+            action_id for action_id, state in self.node_states.items()
+            if state == "success"
+        }
+        self.finished_actions = len([
+            state for state in self.node_states.values()
+            if state in ("success", "failed", "skipped")
+        ])
+        self.flow_finished: set[str] = set()
+        self.flow_satisfied: set[str] = set()
+        self.flow_failed: set[str] = set()
+
+        self.workflowmanager = get_workflow_manager()
+        # 具体管理器登记活动执行；旧自定义 能力提供方 不实现 任务持有者 接口时保持原调用兼容。
+        self._execution_lock = threading.RLock()
+        self._admission_state = "pending"
+        self._registered_execution = False
+        self._stop_event = threading.Event()
+        self._execute_returned = threading.Event()
+        self._stopped_event = threading.Event()
+        self.queue: deque[str] = deque()
+        self.queued_actions: set[str] = set()
+        self.active_concurrency_keys: set[str] = set()
+        self.lock = threading.Lock()
+        self.executor = OwnedThreadPoolExecutor(max_workers=self.get_workflow_max_workers())
+        self.cancel_token = WorkflowCancelToken(self.workflow.id, self._stop_event)
+        self.running_tasks = 0
+
+        # 构建出边与入边表，用于条件流转和多上游汇合。
+        self.outgoing_flows = defaultdict(list)
+        self.incoming_flows = defaultdict(list)
+        for flow in self.flows:
+            if not flow.source or not flow.target:
+                continue
+            self.outgoing_flows[flow.source].append(flow)
+            self.incoming_flows[flow.target].append(flow)
+
+        self.context = self.restore_context()
+        self.ensure_context_partitions()
+
+        # 恢复时重新释放已终态节点的出边，使后继节点能继续执行或保持跳过传播。
+        for action_id, state in self.node_states.items():
+            if state == "success":
+                self.release_successors(action_id, source_success=True)
+            elif state in ("failed", "skipped"):
+                self.release_successors(action_id, source_success=False)
+        # 初始化队列，添加没有入边的起始节点。
+        for action_id in self.actions:
+            if self.node_states.get(action_id) == "pending" and not self.incoming_flows.get(action_id):
+                self.enqueue_node(action_id)
+
+    def admit(self) -> bool:
+        """
+        向 concrete manager 登记本次执行，并保持旧 能力提供方 可直接运行。
+        """
+        with self._execution_lock:
+            if self._admission_state == "admitted":
+                return True
+            if self._admission_state == "rejected":
+                return False
+            register = getattr(self.workflowmanager, "register_execution", None)
+            if callable(register) and not register(self):
+                self._admission_state = "rejected"
+                self.success = False
+                self.stopped = True
+                self.errmsg = "工作流正在执行或服务正在停止"
+                self.executor.shutdown_bounded(timeout=0.0)
+                self._execute_returned.set()
+                self._stopped_event.set()
+                return False
+            self._registered_execution = callable(register)
+            self._admission_state = "admitted"
+        # 只有获得执行准入后才能清除历史单工作流停止标记。
+        runtime_stop_state.resume_workflow(self.workflow.id)
+        return True
+
+    @property
+    def workflow_id(self) -> int:
+        """
+        返回执行 任务持有者 互斥准入所使用的工作流 ID。
+        """
+        return self.workflow.id
+
+    def request_stop(self) -> None:
+        """
+        停止调度新节点，并通过本地令牌通知支持取消的活动动作。
+        """
+        self._stop_event.set()
+
+    def abort_before_execute(self) -> None:
+        """
+        执行状态启动失败时释放尚未使用的节点池和 manager 任务持有者。
+        """
+        self.request_stop()
+        # reset/start 失败尚未真正执行，不提交误导性的成功或失败终态。
+        self._completion_callback = None
+        converged = self.executor.shutdown_bounded(timeout=0.0)
+        self._execute_returned.set()
+        if converged:
+            self._release_execution()
+
+    def wait_stopped(self, timeout: float) -> bool:
+        """
+        有限等待 execute 返回，并在需要时重试节点线程池收敛。
+        """
+        deadline = monotonic() + max(0.0, timeout)
+        if self._stopped_event.is_set():
+            return True
+        if not self._execute_returned.wait(
+                timeout=max(0.0, deadline - monotonic()),
+        ):
+            return False
+        if self._stopped_event.is_set():
+            return True
+        if not self.executor.shutdown_bounded(
+                timeout=max(0.0, deadline - monotonic()),
+        ):
+            return False
+        self._release_execution()
+        return self._stopped_event.is_set()
+
+    def _release_execution(self) -> None:
+        """
+        先完成终态事务，再释放已真实终止的执行 任务持有者；事务失败允许重试。
+        """
+        with self._execution_lock:
+            if self._stopped_event.is_set():
+                return
+            if self._completion_callback is not None:
+                self._completion_callback(self)
+                self._completion_callback = None
+            if self._registered_execution:
+                unregister = getattr(self.workflowmanager, "unregister_execution", None)
+                if callable(unregister):
+                    unregister(self)
+                self._registered_execution = False
+            self._stopped_event.set()
+
+    def _stop_requested(self) -> bool:
+        """
+        判断本次执行或全局工作流是否已收到停止请求。
+        """
+        return bool(
+            self._stop_event.is_set()
+            or runtime_stop_state.is_workflow_stopped(self.workflow.id)
+        )
+
+    def get_workflow_max_workers(self) -> int:
+        """
+        获取工作流最大并发数。
+        """
+        max_workers = self.execution_config.get("max_workers") if isinstance(self.execution_config, dict) else None
+        try:
+            return max(int(max_workers or DEFAULT_WORKFLOW_MAX_WORKERS), 1)
+        except (TypeError, ValueError):
+            return DEFAULT_WORKFLOW_MAX_WORKERS
+
+    def get_restored_node_metadata(self) -> dict[str, Any]:
+        """
+        获取已持久化的节点状态元数据。
+        """
+        nodes = self.restored_execution_state.get("nodes") if isinstance(self.restored_execution_state, dict) else {}
+        return nodes if isinstance(nodes, dict) else {}
+
+    def get_restored_errors(self) -> dict[str, Any]:
+        """
+        获取已持久化的错误状态。
+        """
+        errors = self.restored_execution_state.get("errors") if isinstance(self.restored_execution_state, dict) else {}
+        return errors if isinstance(errors, dict) else {}
+
+    def get_restored_attempts(self) -> dict[str, Any]:
+        """
+        获取已持久化的节点尝试次数。
+        """
+        attempts = {}
+        for action_id, metadata in self.get_restored_node_metadata().items():
+            if isinstance(metadata, dict) and metadata.get("attempt"):
+                attempts[action_id] = int(metadata.get("attempt") or 0)
+        return attempts
+
+    def get_restored_node_states(self) -> dict[str, Any]:
+        """
+        获取结构化节点状态，兼容旧版 current_action 字符串。
+        """
+        legacy_actions = {
+            action_id for action_id in (self.workflow.current_action or "").split(",")
+            if not self._from_begin and action_id in self.actions
+        }
+        states = {}
+        for action_id in self.actions:
+            metadata = self.node_metadata.get(action_id) or {}
+            state = metadata.get("state") if isinstance(metadata, dict) else None
+            if state == "completed":
+                state = "success"
+            if state in ("running", "queued", "failed", "skipped"):
+                state = "pending"
+            if not state and action_id in legacy_actions:
+                state = "success"
+            states[action_id] = state or "pending"
+        return states
+
+    def restore_context(self) -> ActionContext:
+        """
+        恢复工作流上下文。
+
+        只接受结构化 JSON 上下文；旧版 Base64 Pickle 格式（``content`` 字段）不再反序列化，
+        按空上下文从头执行，避免执行数据库中来源不可信的序列化载荷。
+        """
+        context = ActionContext()
+        if self._from_begin:
+            return context
+        if self.workflow.context:
+            if self.workflow.current_action:
+                logger.info(f"工作流已执行动作：{self.workflow.current_action}")
+            try:
+                if self.is_legacy_context(self.workflow.context):
+                    logger.warning(f"工作流 {self.workflow.name} 的上下文为已废弃的旧版格式，将从空上下文开始执行")
+                elif isinstance(self.workflow.context, dict):
+                    context = ActionContext.model_validate(self.workflow.context)
+            except Exception:
+                context = ActionContext()
+        outputs = self.restored_execution_state.get("outputs") if isinstance(self.restored_execution_state, dict) else {}
+        if outputs and not getattr(context, "node_outputs", None):
+            context.node_outputs = outputs
+        return context
+
+    @staticmethod
+    def is_legacy_context(context: Any) -> bool:
+        """
+        只识别单字段的旧 Base64 Pickle 包装，绝不反序列化载荷。
+
+        当前文本 content 即使是唯一字段也属于合法结构，不能据其非空丢弃上下文。
+
+        :param context: 持久化的工作流上下文字典
+        :return: 仅旧包装内含支持协议的完整指令流、栈合法且无尾部数据时为 True
+        """
+        if not isinstance(context, dict) or set(context) != {"content"}:
+            return False
+        content = context.get("content")
+        if not isinstance(content, str):
+            return False
+        try:
+            payload = base64.b64decode(content, validate=True)
+            if len(payload) < 2 or payload[0] != 0x80 or not 2 <= payload[1] <= HIGHEST_PROTOCOL:
+                return False
+            stream = BytesIO(payload)
+            # 静态解析校验指令、memo 与栈，不导入载荷引用，也不执行其 callable。
+            pickletools.dis(stream, out=StringIO())
+            return stream.tell() == len(payload)
+        except (ValueError, binascii.Error):
+            return False
+
+    def ensure_context_partitions(self) -> None:
+        """
+        确保上下文具备新版分区结构，并把旧字段映射到 artifacts。
+        """
+        self.context.workflow_context = self.context.workflow_context or {}
+        self.context.node_outputs = self.context.node_outputs or {}
+        self.context.runtime_state = self.context.runtime_state or {}
+        self.context.artifacts = self.context.artifacts or {}
+        for key in ARTIFACT_FIELDS:
+            value = getattr(self.context, key, None)
+            if value not in (None, "", [], {}) and key not in self.context.artifacts:
+                self.context.artifacts[key] = value
+        self.update_runtime_state()
+
+    def update_runtime_state(self) -> None:
+        """
+        更新上下文中的运行期状态分区。
+        """
+        if self.context.runtime_state is None:
+            self.context.runtime_state = {}
+        self.context.runtime_state.update({
+            "progress": self.context.progress,
+            "finished_actions": self.finished_actions,
+            "running_tasks": self.running_tasks,
+            "errors": self.errors,
+            "node_states": self.node_states,
+            "attempts": self.node_attempts,
+        })
+
+    def set_node_state(self, action_id: str, state: str, message: Optional[str] = None) -> None:
+        """
+        更新节点结构化状态。
+        """
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        metadata = self.node_metadata.setdefault(action_id, {})
+        metadata["state"] = state
+        if state == "success":
+            self.errors.pop(action_id, None)
+        metadata["attempt"] = self.node_attempts.get(action_id, metadata.get("attempt") or 0)
+        if state == "running":
+            metadata["started_at"] = now
+        if state in ("success", "failed", "skipped"):
+            metadata["finished_at"] = now
+        if message is not None:
+            metadata["message"] = message
+        self.node_states[action_id] = state
+        self.update_runtime_state()
+
+    def build_execution_state(self) -> dict[str, Any]:
+        """
+        构建可持久化的结构化执行状态。
+        """
+        self.update_runtime_state()
+        execution_state = _serialize_workflow_value({
+            "version": 1,
+            "nodes": self.node_metadata,
+            "outputs": self.context.node_outputs,
+            "errors": self.errors,
+            "runtime": self.context.runtime_state,
+        })
+        return execution_state if isinstance(execution_state, dict) else {}
+
+    def execute(self) -> None:
+        """
+        执行工作流
+        """
+        if not self.admit():
+            return
+        try:
+            while True:
+                should_sleep = False
+                node_id = None
+                with self.lock:
+                    if self._stop_requested():
+                        self.success = False
+                        self.stopped = True
+                        self.errmsg = "工作流已停止"
+                        if self.running_tasks == 0:
+                            break
+                        should_sleep = True
+                    # 退出条件：队列为空且无运行任务
+                    elif not self.queue and self.running_tasks == 0:
+                        break
+                    # 出错后不再调度新节点，但等待已提交节点完成，避免后台线程继续写状态。
+                    if not self.success:
+                        if self.running_tasks == 0:
+                            break
+                        should_sleep = True
+                    elif not self.queue:
+                        should_sleep = True
+                    else:
+                        node_id = self.pop_dispatchable_node()
+                        if not node_id:
+                            should_sleep = True
+
+                if should_sleep:
+                    sleep(0.1)
+                    continue
+
+                if not node_id:
+                    continue
+
+                # 节点分别复制业务上下文和调用上下文，避免共享可变状态或丢失触发链路。
+                context = copy_context()
+                future = Context().run(
+                    self.executor.submit,
+                    context.run,
+                    self.execute_node,
+                    self.workflow.id,
+                    node_id,
+                    copy.deepcopy(self.context),
+                )
+                future.add_done_callback(partial(self._complete_in_context, context))
+        except Exception as err:
+            self.success = False
+            self.has_failure = True
+            self.errmsg = str(err)
+            raise
+        finally:
+            converged = self.executor.shutdown_bounded(
+                timeout=WORKFLOW_EXECUTOR_STOP_TIMEOUT_SECONDS,
+            )
+            try:
+                if converged:
+                    self._release_execution()
+            finally:
+                # 终态事务仍在进行时，停机等待不能把节点线程结束等同于 任务持有者 已释放。
+                self._execute_returned.set()
+
+    def pop_dispatchable_node(self) -> Optional[str]:
+        """
+        从队列中取出当前可调度节点。
+        """
+        for _ in range(len(self.queue)):
+            node_id = self.queue.popleft()
+            self.queued_actions.discard(node_id)
+            if self.node_states.get(node_id) != "queued":
+                continue
+            concurrency_key = self.get_action_concurrency_key(self.actions[node_id])
+            if concurrency_key and concurrency_key in self.active_concurrency_keys:
+                self.queue.append(node_id)
+                self.queued_actions.add(node_id)
+                continue
+            if concurrency_key:
+                self.active_concurrency_keys.add(concurrency_key)
+            self.running_tasks += 1
+            self.set_node_state(node_id, "running")
+            return node_id
+        return None
+
+    def execute_node(self, workflow_id: int, node_id: str,
+                     context: ActionContext) -> Tuple[Action, ActionResult]:
+        """
+        执行单个节点操作，返回修改后的上下文和节点ID
+        """
+        action = self.actions[node_id]
+        action_result = self.workflowmanager.execute(
+            workflow_id,
+            action,
+            context=context,
+            inputs=self.build_action_inputs(action),
+            runtime=self.build_action_runtime(action),
+            cancel_token=self.cancel_token
+        )
+        return action, action_result
+
+    def _complete_in_context(
+            self,
+            context: Context,
+            future: Future[Tuple[Action, ActionResult]],
+    ) -> None:
+        """
+        在节点提交时的上下文中消费完成结果。
+        """
+        context.run(self.on_node_complete, future)
+
+    def on_node_complete(self, future: Future[Tuple[Action, ActionResult]]) -> None:
+        """
+        节点完成回调：更新上下文、处理后继节点
+        """
+        action = None
+        try:
+            action, action_result = future.result()
+            if not action.id:
+                raise ValueError("工作流动作缺少 ID")
+            with self.lock:
+                if self._stop_requested():
+                    self.success = False
+                    self.stopped = True
+                    self.errmsg = "工作流已停止"
+                    return
+                state = bool(action_result.success)
+                message = action_result.message or ""
+                result_ctx = action_result.context or ActionContext()
+                self.node_attempts[action.id] = action_result.attempts or self.node_attempts.get(action.id, 1)
+
+                self.finished_actions += 1
+                self.update_progress()
+                if self.context.execute_history is None:
+                    self.context.execute_history = []
+                self.context.execute_history.append(
+                    ActionExecution(
+                        action=action.name,
+                        result=state,
+                        message=message
+                    )
+                )
+
+                # 节点执行失败时默认停止；显式配置 continue/ignore 时继续释放后续 all_done 汇合。
+                if not state:
+                    self.errors[action.id] = message or f"{action.name} 失败"
+                    self.set_node_state(action.id, "failed", message=message)
+                    fail_policy = self.get_action_fail_policy(action)
+                    if fail_policy != "ignore":
+                        self.has_failure = True
+                        self.errmsg = f"{action.name} 失败"
+                    if fail_policy == "stop":
+                        self.success = False
+                        self.call_step_callback(action, completed=False)
+                        return
+                    if fail_policy not in ("continue", "ignore"):
+                        self.success = False
+                        self.errmsg = f"{action.name} 失败：无效失败策略 {fail_policy}"
+                        self.call_step_callback(action, completed=False)
+                        return
+                    self.release_successors(action.id, source_success=False)
+                    self.call_step_callback(action, completed=False)
+                    return
+
+                self.ensure_result_context_partitions(result_ctx)
+                outputs = self.normalize_action_outputs(action, action_result, result_ctx)
+                self.merge_context_partitions(result_ctx)
+                self.merge_action_outputs(action, outputs)
+                self.record_node_outputs(action.id, outputs)
+                self.completed_actions.add(action.id)
+                self.set_node_state(action.id, "success", message=message)
+                self.release_successors(action.id, source_success=True)
+                self.call_step_callback(action, completed=True)
+        except Exception as err:
+            logger.error(f"工作流节点执行回调失败: {str(err)}")
+            with self.lock:
+                self.success = False
+                self.errmsg = str(err)
+        finally:
+            with self.lock:
+                if action:
+                    concurrency_key = self.get_action_concurrency_key(action)
+                    if concurrency_key:
+                        self.active_concurrency_keys.discard(concurrency_key)
+                self.running_tasks -= 1
+                self.update_runtime_state()
+
+    def enqueue_node(self, node_id: str) -> None:
+        """
+        将满足条件的节点加入待执行队列。
+        """
+        if node_id not in self.actions:
+            return
+        if self.node_states.get(node_id) != "pending" or node_id in self.queued_actions:
+            return
+        self.queue.append(node_id)
+        self.queued_actions.add(node_id)
+        self.set_node_state(node_id, "queued")
+
+    def skip_node(self, node_id: str, message: str) -> None:
+        """
+        将不可达节点标记为跳过，并把跳过状态继续传递给后继节点。
+        """
+        if node_id not in self.actions:
+            return
+        if self.node_states.get(node_id) not in ("pending", "queued"):
+            return
+        self.queued_actions.discard(node_id)
+        self.finished_actions += 1
+        self.update_progress()
+        self.set_node_state(node_id, "skipped", message=message)
+        if self.context.execute_history is None:
+            self.context.execute_history = []
+        self.context.execute_history.append(
+            ActionExecution(
+                action=self.actions[node_id].name,
+                result=True,
+                message=message
+            )
+        )
+        self.call_step_callback(self.actions[node_id], completed=False)
+        self.release_successors(node_id, source_success=False)
+
+    def release_successors(self, source_id: str, source_success: bool) -> None:
+        """
+        根据源节点状态释放出边，并重新判断目标节点是否可运行。
+        """
+        flows = self.outgoing_flows.get(source_id, [])
+        branch_policy = self.get_action_branch_policy(self.actions.get(source_id), flows)
+        matched_exclusive_flow = None
+        for flow in flows:
+            flow_key = self.get_flow_key(flow)
+            if flow_key in self.flow_finished:
+                continue
+            condition_matched = False
+            if source_success:
+                try:
+                    condition_matched = self.evaluate_condition(self.get_flow_condition(flow))
+                except ValueError as err:
+                    self.success = False
+                    self.errmsg = f"流程条件判断失败：{err}"
+                    return
+                if branch_policy == "exclusive" and condition_matched and matched_exclusive_flow:
+                    condition_matched = False
+                elif branch_policy == "exclusive" and condition_matched:
+                    matched_exclusive_flow = flow_key
+            self.flow_finished.add(flow_key)
+            if source_success and condition_matched:
+                self.flow_satisfied.add(flow_key)
+            if not source_success and self.node_states.get(source_id) == "failed":
+                self.flow_failed.add(flow_key)
+            if flow.target:
+                self.evaluate_target_state(flow.target)
+
+    def evaluate_target_state(self, target_id: str) -> None:
+        """
+        按目标节点汇合策略判断节点是否入队或跳过。
+        """
+        if not target_id or target_id not in self.actions:
+            return
+        if self.node_states.get(target_id) != "pending":
+            return
+        incoming_flows = self.incoming_flows.get(target_id, [])
+        if not incoming_flows:
+            self.enqueue_node(target_id)
+            return
+
+        total_count = len(incoming_flows)
+        finished_count = sum(1 for flow in incoming_flows if self.get_flow_key(flow) in self.flow_finished)
+        satisfied_count = sum(1 for flow in incoming_flows if self.get_flow_key(flow) in self.flow_satisfied)
+        failed_count = sum(1 for flow in incoming_flows if self.get_flow_key(flow) in self.flow_failed)
+        join_policy = self.get_action_join_policy(self.actions[target_id], incoming_flows)
+
+        if join_policy == "fail_fast":
+            if failed_count > 0:
+                self.skip_node(target_id, "上游失败触发 fail_fast，已取消后续节点")
+            elif finished_count == total_count and satisfied_count == total_count:
+                self.enqueue_node(target_id)
+            elif finished_count == total_count:
+                self.skip_node(target_id, "上游条件未全部满足，已跳过")
+            return
+
+        if join_policy == "any_success":
+            if satisfied_count > 0:
+                self.enqueue_node(target_id)
+            elif finished_count == total_count:
+                self.skip_node(target_id, "所有上游条件均未满足，已跳过")
+            return
+
+        if join_policy == "all_done":
+            if finished_count == total_count:
+                self.enqueue_node(target_id)
+            return
+
+        if join_policy != "all_success":
+            self.success = False
+            self.errmsg = f"{self.actions[target_id].name} 汇合策略无效：{join_policy}"
+            return
+
+        if finished_count != total_count:
+            return
+        if satisfied_count == total_count:
+            self.enqueue_node(target_id)
+        else:
+            self.skip_node(target_id, "上游条件未全部满足，已跳过")
+
+    def update_progress(self) -> None:
+        """
+        根据已完成和已跳过节点数量更新整体进度。
+        """
+        self.context.progress = round(self.finished_actions / self.total_actions * 100) if self.total_actions else 100
+        self.update_runtime_state()
+
+    def build_action_inputs(self, action: Action) -> dict[str, Any]:
+        """
+        根据动作输入声明读取上游节点输出。
+        """
+        inputs = {}
+        input_paths = action.inputs or self.get_action_data_value(action, "inputs")
+        if not input_paths:
+            input_paths = [
+                field["name"] for field in self.get_action_contract(action).get("inputs") or []
+            ]
+        if isinstance(input_paths, str):
+            input_paths = [item.strip() for item in input_paths.splitlines() if item.strip()]
+        for input_path in input_paths:
+            inputs[input_path] = self.resolve_action_input(input_path)
+        return inputs
+
+    def resolve_action_input(self, input_path: str) -> Any:
+        """
+        解析动作输入声明。
+        """
+        if input_path in ActionContext.model_fields:
+            value = getattr(self.context, input_path, None)
+            if value not in (None, "", [], {}):
+                return value
+            return self.context.artifacts.get(input_path) if self.context.artifacts else value
+        return self.resolve_context_path(input_path)
+
+    def build_action_runtime(self, action: Action) -> dict[str, Any]:
+        """
+        构建传递给动作的新运行期数据。
+        """
+        return {
+            "workflow_id": self.workflow.id,
+            "action_id": action.id,
+            "execution_config": self.execution_config,
+            "runtime_state": self.context.runtime_state,
+        }
+
+    @staticmethod
+    def ensure_result_context_partitions(context: ActionContext) -> None:
+        """
+        确保动作返回上下文具备新版分区字段。
+        """
+        context.workflow_context = context.workflow_context or {}
+        context.node_outputs = context.node_outputs or {}
+        context.runtime_state = context.runtime_state or {}
+        context.artifacts = context.artifacts or {}
+
+    def normalize_action_outputs(self, action: Action, action_result: ActionResult,
+                                 result_context: ActionContext) -> dict[str, Any]:
+        """
+        根据动作输出声明整理当前节点输出。
+        """
+        outputs = action_result.outputs or self.extract_context_outputs(result_context)
+        declared_outputs = self.get_action_output_declarations(action)
+        if isinstance(declared_outputs, list):
+            normalized_outputs = {}
+            missing = object()
+            for item in declared_outputs:
+                key = item.get("name") if isinstance(item, dict) else item
+                if not key:
+                    continue
+                value = outputs.get(key, missing)
+                if value is missing and key in result_context.__class__.model_fields:
+                    value = getattr(result_context, key, missing)
+                if value is not missing and self.should_keep_output_value(action, key, value):
+                    normalized_outputs[key] = value
+            return normalized_outputs or outputs
+        if isinstance(declared_outputs, dict):
+            normalized_outputs = {}
+            missing = object()
+            for key in declared_outputs:
+                value = outputs.get(key, missing)
+                if value is missing and key in result_context.__class__.model_fields:
+                    value = getattr(result_context, key, missing)
+                if value is not missing and self.should_keep_output_value(action, key, value):
+                    normalized_outputs[key] = value
+            return normalized_outputs or outputs
+        return outputs
+
+    def should_keep_output_value(self, action: Action, key: str, value: Any) -> bool:
+        """
+        判断输出值是否应参与后续合并。
+        """
+        if value not in (None, "", [], {}):
+            return True
+        output_config = self.get_action_output_config(action, key)
+        target_key = output_config.get("target") or key
+        merge_policy = output_config.get("merge") or self.get_default_merge_policy(action, target_key, value)
+        return merge_policy == "replace"
+
+    def record_node_outputs(self, action_id: str, outputs: dict[str, Any]) -> None:
+        """
+        记录当前节点输出，供后续条件表达式读取。
+        """
+        if outputs:
+            if self.context.node_outputs is None:
+                self.context.node_outputs = {}
+            if self.context.runtime_state is None:
+                self.context.runtime_state = {}
+            self.context.node_outputs[action_id] = outputs
+            self.context.runtime_state["last_outputs"] = outputs
+
+    def merge_context_partitions(self, context: ActionContext) -> None:
+        """
+        合并动作返回的新分区上下文。
+        """
+        for key in ("workflow_context", "runtime_state", "artifacts"):
+            value = getattr(context, key, None)
+            if not value:
+                continue
+            current_value = getattr(self.context, key, None) or {}
+            current_value.update(value)
+            setattr(self.context, key, current_value)
+
+    def merge_action_outputs(self, action: Action, outputs: dict[str, Any]) -> None:
+        """
+        按声明式合并策略写入全局上下文和 artifacts 分区。
+        """
+        for key, value in outputs.items():
+            output_config = self.get_action_output_config(action, key)
+            target_key = output_config.get("target") or key
+            merge_policy = output_config.get("merge") or self.get_default_merge_policy(action, target_key, value)
+            if value in (None, "", [], {}) and merge_policy != "replace":
+                continue
+            identity = output_config.get("identity")
+            self.merge_output_value(target_key, value, merge_policy, identity)
+
+    def merge_output_value(self, key: str, value: Any, merge_policy: str, identity: Optional[str] = None) -> None:
+        """
+        按指定策略合并单个输出值。
+        """
+        current_value = getattr(self.context, key, None) if key in ActionContext.model_fields else None
+        merged_value = self.apply_merge_policy(current_value, value, merge_policy, identity)
+        if key in ActionContext.model_fields:
+            setattr(self.context, key, merged_value)
+        if key in ARTIFACT_FIELDS:
+            if self.context.artifacts is None:
+                self.context.artifacts = {}
+            current_artifact = self.context.artifacts.get(key)
+            self.context.artifacts[key] = self.apply_merge_policy(current_artifact, value, merge_policy, identity)
+
+    def get_action_output_config(self, action: Action, output_key: str) -> dict[str, Any]:
+        """
+        获取动作输出声明配置。
+        """
+        outputs_config = self.get_action_output_declarations(action)
+        if isinstance(outputs_config, dict):
+            value = outputs_config.get(output_key) or {}
+            return value if isinstance(value, dict) else {}
+        if isinstance(outputs_config, list):
+            for item in outputs_config:
+                if isinstance(item, dict) and item.get("name") == output_key:
+                    return {
+                        key: value for key, value in item.items()
+                        if key not in ("name", "label", "kind") and value not in (None, "", [], {})
+                    }
+        return {}
+
+    def get_action_output_declarations(self, action: Action) -> Any:
+        """
+        获取动作输出声明，优先使用节点显式配置，其次使用动作固定契约。
+        """
+        outputs_config = action.outputs or self.get_action_data_value(action, "outputs")
+        if outputs_config:
+            return outputs_config
+        return self.get_action_contract(action).get("outputs") or {}
+
+    @staticmethod
+    def get_default_merge_policy(action: Action, key: str, value: Any) -> str:
+        """
+        获取输出默认合并策略。
+        """
+        if isinstance(value, list):
+            action_type = action.type or ""
+            action_name = action.name or ""
+            if key in ARTIFACT_FIELDS and (
+                action_type.startswith("Filter")
+                or action_name.startswith("过滤")
+            ):
+                return "replace"
+            return "append_unique"
+        if isinstance(value, dict):
+            return "merge_dict"
+        return "first_non_empty"
+
+    def apply_merge_policy(self, current_value: Any, value: Any, merge_policy: str,
+                           identity: Optional[str] = None) -> Any:
+        """
+        应用声明式合并策略。
+        """
+        if merge_policy == "replace":
+            return value
+        if merge_policy == "merge_dict":
+            merged = current_value.copy() if isinstance(current_value, dict) else {}
+            if isinstance(value, dict):
+                merged.update(value)
+                return merged
+            return current_value or value
+        if merge_policy == "append_unique":
+            return self.append_unique_values(current_value, value, identity)
+        if merge_policy == "first_non_empty":
+            return current_value or value
+        return current_value or value
+
+    def append_unique_values(self, current_value: Any, value: Any, identity: Optional[str] = None) -> list[Any]:
+        """
+        追加列表并按身份字段去重。
+        """
+        current_list = list(current_value or [])
+        incoming_list = value if isinstance(value, list) else [value]
+        seen = {self.get_identity_value(item, identity) for item in current_list}
+        for item in incoming_list:
+            identity_value = self.get_identity_value(item, identity)
+            if identity_value in seen:
+                continue
+            current_list.append(item)
+            seen.add(identity_value)
+        return current_list
+
+    def get_identity_value(self, item: Any, identity: Optional[str] = None) -> Any:
+        """
+        获取列表元素去重身份。
+        """
+        if not identity:
+            return self.make_hashable_identity(item)
+        value = item
+        for part in identity.split("."):
+            value = self.read_value(value, int(part) if part.isdigit() else part)
+        return self.make_hashable_identity(value)
+
+    @staticmethod
+    def make_hashable_identity(value: Any) -> Any:
+        """
+        将身份值转换为可哈希对象。
+        """
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return repr(value)
+
+    def call_step_callback(self, action: Action, completed: bool) -> None:
+        """
+        持久化当前步骤上下文和结构化执行状态。
+        """
+        if not self.step_callback:
+            return
+        if self.step_callback_extended:
+            self.step_callback(action, self.context, self.build_execution_state(), completed)
+            return
+        self.step_callback(action, self.context)
+
+    @staticmethod
+    def extract_context_outputs(context: ActionContext) -> dict[str, Any]:
+        """
+        从动作上下文中提取非空业务字段作为节点默认输出。
+        """
+        if not context:
+            return {}
+        outputs = {}
+        for key in context.__class__.model_fields:
+            if key in ("execute_history", "progress", "node_outputs", "runtime_state"):
+                continue
+            value = getattr(context, key, None)
+            if value in (None, "", [], {}):
+                continue
+            outputs[key] = value
+        return outputs
+
+    @staticmethod
+    def get_flow_key(flow: ActionFlow) -> str:
+        """
+        生成流程边的运行期唯一标识。
+        """
+        return flow.id or f"{flow.source}->{flow.target}:{id(flow)}"
+
+    def get_action_join_policy(self, action: Action, incoming_flows: List[ActionFlow]) -> str:
+        """
+        获取动作汇合策略，优先使用动作配置，其次兼容流程边配置。
+        """
+        join_policy = action.join_policy or self.get_action_data_value(action, "join_policy")
+        if join_policy:
+            return join_policy
+        for flow in incoming_flows:
+            join_policy = flow.join_policy or self.get_flow_data_value(flow, "join_policy")
+            if join_policy:
+                return join_policy
+        return "all_success"
+
+    def get_action_branch_policy(self, action: Optional[Action], outgoing_flows: List[ActionFlow]) -> str:
+        """
+        获取动作出边分支策略。
+        """
+        if action:
+            branch_policy = action.branch_policy or self.get_action_data_value(action, "branch_policy")
+            if branch_policy:
+                return branch_policy
+        for flow in outgoing_flows:
+            branch_policy = flow.branch_policy or self.get_flow_data_value(flow, "branch_policy")
+            if branch_policy:
+                return branch_policy
+        return "parallel"
+
+    def get_action_fail_policy(self, action: Action) -> str:
+        """
+        获取动作失败策略。
+        """
+        return action.fail_policy or self.get_action_data_value(action, "fail_policy") or "stop"
+
+    def get_action_concurrency_key(self, action: Action) -> Optional[str]:
+        """
+        获取动作并发互斥键。
+        """
+        return (
+            action.concurrency_key
+            or self.get_action_data_value(action, "concurrency_key")
+            or self.get_action_contract(action).get("concurrency_key")
+        )
+
+    def get_action_contract(self, action: Action) -> dict[str, Any]:
+        """
+        获取动作固定输入输出契约。
+        """
+        get_contract = getattr(self.workflowmanager, "get_action_contract", None)
+        if not get_contract:
+            return {}
+        return get_contract(action.type) or {}
+
+    def get_flow_condition(self, flow: ActionFlow) -> Optional[str]:
+        """
+        获取流程边条件表达式。
+        """
+        return flow.condition or self.get_flow_data_value(flow, "condition")
+
+    @staticmethod
+    def get_action_data_value(action: Optional[Action], key: str) -> Any:
+        """
+        从动作 data 中读取扩展配置。
+        """
+        if not action:
+            return None
+        data = action.data or {}
+        return data.get(key) if isinstance(data, dict) else None
+
+    @staticmethod
+    def get_flow_data_value(flow: ActionFlow, key: str) -> Any:
+        """
+        从流程边 data 中读取扩展配置。
+        """
+        data = flow.data or {}
+        return data.get(key) if isinstance(data, dict) else None
+
+    def evaluate_condition(self, condition: Optional[str]) -> bool:
+        """
+        安全计算流程边条件表达式。
+        """
+        if not condition:
+            return True
+        expression = condition.strip()
+        if not expression:
+            return True
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError as err:
+            raise ValueError(f"{condition} 语法错误") from err
+        return bool(self.evaluate_condition_node(tree.body))
+
+    def evaluate_condition_node(self, node: ast.AST) -> Any:
+        """
+        递归计算受限 AST 节点，避免执行任意代码。
+        """
+        if isinstance(node, ast.BoolOp):
+            values = [bool(self.evaluate_condition_node(value)) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not bool(self.evaluate_condition_node(node.operand))
+        if isinstance(node, ast.Compare):
+            return self.evaluate_compare_node(node)
+        if isinstance(node, ast.Name):
+            return self.resolve_condition_name(node.id)
+        if isinstance(node, ast.Attribute):
+            return self.read_value(self.evaluate_condition_node(node.value), node.attr)
+        if isinstance(node, ast.Subscript):
+            return self.read_subscript_node(node)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.List):
+            return [self.evaluate_condition_node(item) for item in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(self.evaluate_condition_node(item) for item in node.elts)
+        if isinstance(node, ast.Set):
+            return {self.evaluate_condition_node(item) for item in node.elts}
+        if isinstance(node, ast.Dict):
+            if any(key is None for key in node.keys):
+                raise ValueError("条件表达式不支持字典展开")
+            return {
+                self.evaluate_condition_node(key): self.evaluate_condition_node(value)
+                for key, value in zip(node.keys, node.values)
+                if key is not None
+            }
+        raise ValueError(f"不支持的条件表达式：{ast.dump(node)}")
+
+    def evaluate_compare_node(self, node: ast.Compare) -> bool:
+        """
+        计算比较表达式，支持链式比较和成员判断。
+        """
+        left = self.evaluate_condition_node(node.left)
+        for operator, comparator in zip(node.ops, node.comparators):
+            right = self.evaluate_condition_node(comparator)
+            if not self.compare_values(left, operator, right):
+                return False
+            left = right
+        return True
+
+    def read_subscript_node(self, node: ast.Subscript) -> Any:
+        """
+        读取下标访问表达式。
+        """
+        if isinstance(node.slice, ast.Slice):
+            raise ValueError("条件表达式不支持切片访问")
+        container = self.evaluate_condition_node(node.value)
+        key = self.evaluate_condition_node(node.slice)
+        return self.read_value(container, key)
+
+    def resolve_condition_name(self, name: str) -> Any:
+        """
+        将条件表达式中的根名称映射到当前工作流上下文。
+        """
+        if name in ("true", "True"):
+            return True
+        if name in ("false", "False"):
+            return False
+        if name in ("none", "None", "null"):
+            return None
+        if name == "context":
+            return self.context
+        if name == "workflow_context":
+            return self.context.workflow_context or {}
+        if name == "runtime_state":
+            return self.context.runtime_state or {}
+        if name == "artifacts":
+            return self.context.artifacts or {}
+        if name in ("outputs", "node_outputs"):
+            return self.context.node_outputs or {}
+        if name == "last":
+            return self.context.runtime_state.get("last_outputs") if self.context.runtime_state else {}
+        node_outputs = self.context.node_outputs or {}
+        if name in node_outputs:
+            return node_outputs[name]
+        if name in ActionContext.model_fields:
+            return getattr(self.context, name, None)
+        raise ValueError(f"未知上下文变量 {name}")
+
+    def resolve_context_path(self, path: str) -> Any:
+        """
+        按点分路径读取工作流上下文数据。
+        """
+        if not path:
+            return None
+        value = None
+        for index, part in enumerate(path.split(".")):
+            if index == 0:
+                value = self.resolve_condition_name(part)
+                continue
+            key = int(part) if part.isdigit() else part
+            value = self.read_value(value, key)
+        return value
+
+    @staticmethod
+    def read_value(value: Any, key: Any) -> Any:
+        """
+        从 dict、对象或序列中读取属性值。
+        """
+        if value is None:
+            return None
+        if isinstance(key, str) and key in ("count", "length") and hasattr(value, "__len__"):
+            return len(value)
+        if isinstance(value, dict):
+            return value.get(key)
+        if isinstance(value, (list, tuple)):
+            if isinstance(key, int) and 0 <= key < len(value):
+                return value[key]
+            return None
+        if isinstance(key, str) and hasattr(value, key):
+            return getattr(value, key)
+        return None
+
+    @staticmethod
+    def compare_values(left: Any, operator: ast.cmpop, right: Any) -> bool:
+        """
+        比较两个条件表达式值。
+        """
+        try:
+            if isinstance(operator, ast.Eq):
+                return bool(left == right)
+            if isinstance(operator, ast.NotEq):
+                return bool(left != right)
+            if isinstance(operator, ast.Gt):
+                return bool(left > right)
+            if isinstance(operator, ast.GtE):
+                return bool(left >= right)
+            if isinstance(operator, ast.Lt):
+                return bool(left < right)
+            if isinstance(operator, ast.LtE):
+                return bool(left <= right)
+            if isinstance(operator, ast.In):
+                return left in right
+            if isinstance(operator, ast.NotIn):
+                return left not in right
+        except TypeError:
+            return False
+        raise ValueError(f"不支持的比较操作符：{operator.__class__.__name__}")
+
+    def merge_context(self, context: ActionContext) -> None:
+        """
+        合并上下文
+        """
+        if not context:
+            return
+        for key in context.__class__.model_fields:
+            value = getattr(context, key, None)
+            if key in ("execute_history", "progress") or value in (None, "", [], {}):
+                continue
+            current_value = getattr(self.context, key, None)
+            if isinstance(value, list):
+                if current_value is None:
+                    setattr(self.context, key, value)
+                    continue
+                for item in value:
+                    if item not in current_value:
+                        current_value.append(item)
+            elif isinstance(value, dict):
+                if not current_value:
+                    setattr(self.context, key, value)
+                else:
+                    current_value.update(value)
+            elif not current_value:
+                setattr(self.context, key, value)
+
+
+class WorkflowChain(ChainBase):
+    """
+    工作流链
+    """
+
+    @eventmanager.register(EventType.WorkflowExecute)
+    def event_process(self, event: Event) -> None:
+        """
+        事件触发工作流执行
+        """
+        if not isinstance(event.event_data, dict):
+            return
+        workflow_id = event.event_data.get('workflow_id')
+        if not workflow_id:
+            return
+        self.process(workflow_id, from_begin=False)
+
+    @staticmethod
+    def process(
+            workflow_id: int,
+            from_begin: Optional[bool] = True,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        处理工作流
+
+        :param workflow_id: 工作流ID
+        :param from_begin: 是否从头开始，默认为True
+        :param progress_callback: 定时服务进度更新回调
+        """
+        workflow_execution = get_configured_workflow_execution()
+
+        workflow = get_configured_workflow_query().get_sync(workflow_id)
+        if not workflow:
+            logger.warn(f"工作流 {workflow_id} 不存在")
+            return False, "工作流不存在"
+        try:
+            validate_workflow_graph(workflow.actions, workflow.flows)
+        except ValueError as err:
+            return False, str(err)
+        if not workflow.actions:
+            logger.warn(f"工作流 {workflow.name} 无动作")
+            return False, "工作流无动作"
+
+        def save_step(
+                action: Action,
+                context: ActionContext,
+                execution_state: dict[str, Any],
+                completed: bool,
+        ) -> None:
+            """
+            保存动作上下文和结构化执行状态。
+            """
+            persisted_action_id = (action.id or "") if completed else ""
+            workflow_execution.step(
+                workflow_id,
+                action_id=persisted_action_id,
+                context=_serialize_workflow_context(context),
+                execution_state=_serialize_workflow_value(execution_state)
+            )
+            if progress_callback:
+                runtime = execution_state.get("runtime") or {}
+                finished_actions = int(runtime.get("finished_actions") or 0)
+                total_actions = len(workflow.actions)
+                progress_callback(
+                    value=finished_actions / total_actions * 100,
+                    text=(
+                        f"工作流动作（{finished_actions}/{total_actions}）"
+                        f"{action.name or action.type or action.id} "
+                        f"{'执行完成' if completed else '执行中'}"
+                    ),
+                    data={
+                        "total": total_actions,
+                        "finished": finished_actions,
+                        "current": action.id,
+                    },
+                )
+
+        def commit_terminal(execution: WorkflowExecutor) -> None:
+            """
+            同 ID 所有权持有期间提交最后一次结果，避免覆盖后续执行的状态。
+            """
+            if execution.stopped:
+                return
+            if not execution.success or execution.has_failure:
+                committed = workflow_execution.fail(workflow_id, result=execution.errmsg)
+            else:
+                committed = workflow_execution.success(workflow_id)
+            if not committed:
+                raise RuntimeError("工作流终态写入失败")
+
+        executor = WorkflowExecutor(
+            workflow, step_callback=save_step, from_begin=bool(from_begin), completion_callback=commit_terminal,
+        )
+        if not executor.admit():
+            logger.warning("%s，拒绝执行 %s", executor.errmsg, workflow.name)
+            return False, executor.errmsg
+        started, message = WorkflowChain._start_execution(
+            executor, workflow_execution, bool(from_begin), progress_callback,
+        )
+        if not started:
+            return False, message
+        executor.execute()
+
+        if executor.stopped:
+            logger.info(f"工作流 {workflow.name} 已停止")
+            return False, executor.errmsg
+
+        if not executor.success or executor.has_failure:
+            logger.info(f"工作流 {workflow.name} 执行失败：{executor.errmsg}")
+            return False, executor.errmsg
+        logger.info(f"工作流 {workflow.name} 执行完成")
+        if progress_callback:
+            progress_callback(value=100, text=f"工作流 {workflow.name} 执行完成")
+        return True, ""
+
+    @staticmethod
+    def _start_execution(
+        executor: WorkflowExecutor,
+        execution: WorkflowExecutionPort,
+        from_begin: bool,
+        progress_callback: Optional[Callable[..., None]],
+    ) -> Tuple[bool, str]:
+        """
+        仅在获得同 ID 准入后重置并启动；事务拒绝或异常均释放未执行 任务持有者。
+        """
+        workflow = executor.workflow
+        try:
+            if from_begin and not execution.reset(workflow.id):
+                executor.abort_before_execute()
+                return False, "工作流重置失败"
+            if not execution.start(workflow.id):
+                executor.abort_before_execute()
+                return False, "工作流启动失败"
+            logger.info(f"开始执行工作流 {workflow.name}，共 {len(workflow.actions)} 个动作 ...")
+            if progress_callback:
+                progress_callback(
+                    value=0,
+                    text=f"开始执行工作流 {workflow.name} ...",
+                    data={"total": len(workflow.actions), "finished": 0},
+                )
+        except Exception:
+            executor.abort_before_execute()
+            raise
+        return True, ""
+
+    @staticmethod
+    def get_workflows() -> List[WorkflowSnapshot]:
+        """
+        获取工作流列表
+        """
+        return get_configured_workflow_query().list_enabled()
+
+    @staticmethod
+    def get_timer_workflows() -> List[WorkflowSnapshot]:
+        """
+        获取定时触发的工作流列表
+        """
+        return get_configured_workflow_query().list_timer_enabled()
+
+    @staticmethod
+    def get_event_workflows() -> List[WorkflowSnapshot]:
+        """
+        获取事件触发的工作流列表
+        """
+        return get_configured_workflow_query().list_event_enabled()

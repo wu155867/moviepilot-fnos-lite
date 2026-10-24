@@ -1,0 +1,681 @@
+"""
+验证媒体服务器增量同步的身份隔离、统计和类型归一。
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app import schemas
+from app.chain import mediaserver as MEDIA_SERVER_CHAIN_MODULE
+from app.chain.mediaserver import MediaServerChain
+from app.db.adapters.mediaserver import TransactionalMediaServerRepository
+from app.db.base import Base
+from app.db.models.mediaserver import MediaServerItem
+from app.db.oper.mediaserver import MediaServerOper
+from app.runtime.config import global_vars
+
+
+@pytest.fixture
+def database(tmp_path):
+    """
+    创建隔离的媒体服务器测试数据库。
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'mediaserver.db'}")
+    session_factory = sessionmaker(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    yield session_factory
+    engine.dispose()
+
+
+def test_add_allows_same_item_id_across_servers(database):
+    """
+    不同媒体服务器允许复用相同 item_id。
+    """
+    with database() as db:
+        oper = MediaServerOper(db)
+
+        assert oper.add(
+            server="plex",
+            library="movies",
+            item_id="same-item-id",
+            item_type="电影",
+            title="Movie A",
+        )
+        assert oper.add(
+            server="jellyfin",
+            library="movies",
+            item_id="same-item-id",
+            item_type="电影",
+            title="Movie B",
+        )
+
+        items = (
+            db.query(MediaServerItem)
+            .order_by(MediaServerItem.server.asc())
+            .all()
+        )
+
+    assert len(items) == 2
+    assert [item.server for item in items] == ["jellyfin", "plex"]
+
+
+def test_media_count_reuses_existing_server_statistics():
+    """
+    整服同步应复用现有媒体统计并排除剧集集数。
+    """
+    chain = object.__new__(MediaServerChain)
+    chain.run_module = lambda *_args, **_kwargs: [
+        schemas.Statistic(movie_count=12, tv_count=8, music_count=3, episode_count=200)
+    ]
+
+    assert chain.media_count("plex") == 23
+
+
+@pytest.mark.parametrize(
+    ("raw_type", "expected"),
+    [
+        ("Series", "电视剧"),
+        ("show", "电视剧"),
+        ("音乐", "音乐"),
+        ("MusicAlbum", "音乐"),
+        ("Audio", "音乐"),
+        ("artist", "音乐"),
+        ("album", "音乐"),
+        ("track", "音乐"),
+        ("Movie", "电影"),
+    ],
+)
+def test_sync_normalizes_movie_tv_and_music_item_types(raw_type, expected):
+    """
+    同步缓存应保留音乐类型，并兼容不同媒体服务器的原始类型名称。
+    """
+    assert MediaServerChain._normalize_item_type(raw_type) == expected
+
+
+def test_sync_persists_music_without_querying_tv_episodes(database):
+    """
+    Navidrome 专辑同步应写成音乐条目，且不能触发电视剧分集查询。
+    """
+    chain = object.__new__(MediaServerChain)
+    chain.librarys = lambda _server, **_kwargs: [SimpleNamespace(id="music", name="音乐", item_count=1)]
+    chain.media_count = lambda _server: 1
+    chain.items_count = lambda **_kwargs: pytest.fail("目录已有数量时不应重复计数")
+    chain.items = lambda **_kwargs: iter(
+        [
+            schemas.MediaServerItem(
+                server="navidrome",
+                library="music",
+                item_id="album-1",
+                item_type="音乐",
+                title="叶惠美",
+                year="2003",
+            )
+        ]
+    )
+    chain.episodes = lambda *_args, **_kwargs: pytest.fail("音乐条目不应查询电视剧分集")
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+
+    with patch.object(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        return_value=[SimpleNamespace(name="navidrome", enabled=True, sync_libraries=["all"])],
+    ):
+        chain.sync()
+
+    with database() as db:
+        item = db.query(MediaServerItem).one()
+
+    assert item.item_type == "音乐"
+    assert item.title == "叶惠美"
+    assert item.seasoninfo == {}
+
+
+def test_sync_normalizes_incomplete_tv_episode_rows(database):
+    """
+    TV 同步应丢弃无季号记录，并把缺失集列表规范为空列表。
+    """
+    chain = object.__new__(MediaServerChain)
+    chain.librarys = lambda _server, **_kwargs: [SimpleNamespace(id="shows", name="剧集库")]
+    chain.media_count = lambda _server: 1
+    chain.items_count = lambda **_kwargs: 1
+    chain.items = lambda **_kwargs: iter(
+        [
+            schemas.MediaServerItem(
+                server="plex",
+                library="shows",
+                item_id="show-1",
+                item_type="Series",
+                title="测试剧集",
+            )
+        ]
+    )
+    chain.episodes = lambda *_args, **_kwargs: [
+        schemas.MediaServerSeasonInfo(season=None, episodes=[99]),
+        schemas.MediaServerSeasonInfo(season=1, episodes=None),
+    ]
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+
+    with patch.object(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        return_value=[SimpleNamespace(name="plex", enabled=True, sync_libraries=["all"])],
+    ):
+        chain.sync()
+
+    with database() as session:
+        item = session.query(MediaServerItem).one()
+
+    assert item.seasoninfo == {"1": []}
+
+
+def test_sync_updates_rows_and_removes_stale_entries(database):
+    """
+    同步应更新已存在条目，并清理未再出现或已移除服务的数据。
+    """
+    old_sync_time = "2026-05-01 00:00:00"
+
+    with database() as db:
+        db.add_all(
+            [
+                MediaServerItem(
+                    server="plex",
+                    library="movies",
+                    item_id="/library/metadata/1",
+                    item_type="电影",
+                    title="Old Title",
+                    year="2024",
+                    path="/media/old.mkv",
+                    lst_mod_date=old_sync_time,
+                ),
+                MediaServerItem(
+                    server="plex",
+                    library="movies",
+                    item_id="/library/metadata/2",
+                    item_type="电影",
+                    title="Stale Title",
+                    year="2020",
+                    path="/media/stale.mkv",
+                    lst_mod_date=old_sync_time,
+                ),
+                MediaServerItem(
+                    server="jellyfin",
+                    library="movies",
+                    item_id="/library/metadata/1",
+                    item_type="电影",
+                    title="Removed Server Title",
+                    year="2024",
+                    path="/media/removed.mkv",
+                    lst_mod_date=old_sync_time,
+                ),
+            ]
+        )
+        db.commit()
+        existing_id = (
+            db.query(MediaServerItem.id)
+            .filter(
+                MediaServerItem.server == "plex",
+                MediaServerItem.item_id == "/library/metadata/1",
+            )
+            .scalar()
+        )
+
+    chain = object.__new__(MediaServerChain)
+    chain.librarys = lambda _server, **_kwargs: [
+        SimpleNamespace(id="movies", name="电影库", item_count=1),
+        SimpleNamespace(id="shows", name="剧集库"),
+    ]
+    chain.media_count = lambda _server: pytest.fail("部分媒体库同步不应使用整服统计")
+    chain.items_count = lambda **_kwargs: 1
+    chain.items = lambda **_kwargs: iter(
+        [
+            schemas.MediaServerItem(
+                server="plex",
+                library="movies",
+                item_id="/library/metadata/1",
+                item_type="Movie",
+                title="New Title",
+                year="2024",
+                tmdbid=100,
+                path="/media/new.mkv",
+            )
+        ]
+    )
+    chain.episodes = lambda *_args, **_kwargs: []
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+
+    with patch.object(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        return_value=[SimpleNamespace(name="plex", enabled=True, sync_libraries=["movies"])],
+    ):
+        chain.sync()
+
+    with database() as db:
+        items = db.query(MediaServerItem).order_by(MediaServerItem.server.asc(), MediaServerItem.item_id.asc()).all()
+
+    assert len(items) == 1
+    assert items[0].id == existing_id
+    assert items[0].server == "plex"
+    assert items[0].item_id == "/library/metadata/1"
+    assert items[0].item_type == "电影"
+    assert items[0].title == "New Title"
+    assert items[0].path == "/media/new.mkv"
+    assert items[0].lst_mod_date != old_sync_time
+
+
+def test_sync_reuses_library_counts_before_items_and_reports_media_progress(database):
+    """
+    同步前应查询全部目标媒体库总数，并按媒体条目更新进度。
+    """
+    chain = object.__new__(MediaServerChain)
+    events = []
+    progress_snapshots = []
+    server_libraries = {
+        "plex-a": [SimpleNamespace(id="movies", name="电影库", item_count=1)],
+        "plex-b": [SimpleNamespace(id="shows", name="剧集库")],
+    }
+    library_items = {
+        ("plex-a", "movies"): [
+            schemas.MediaServerItem(
+                server="plex-a",
+                library="movies",
+                item_id=f"movie-{index}",
+                item_type="Movie",
+                title=f"电影 {index}",
+            )
+            for index in range(2)
+        ],
+        ("plex-b", "shows"): [
+            schemas.MediaServerItem(
+                server="plex-b",
+                library="shows",
+                item_id="show-1",
+                item_type="Movie",
+                title="剧集 1",
+            )
+        ],
+    }
+
+    def librarys(server, **_kwargs):
+        """
+        返回已经带数量的目录，不允许同步链重复进行整服或逐库统计。
+
+        :param server: 合成媒体服务器名称
+        :param _kwargs: 本次库目录查询的投影与范围选项
+        :return: 包含精确条目数的库目录
+        """
+        events.append(f"count:{server}")
+        for library in server_libraries[server]:
+            library.item_count = len(library_items[(server, library.id)])
+        return server_libraries[server]
+
+    chain.librarys = librarys
+
+    def items(**kwargs):
+        """
+        记录同步顺序并返回媒体库条目。
+        """
+        server = kwargs["server"]
+        library_id = kwargs["library_id"]
+        events.append(f"items:{server}:{library_id}")
+        return iter(library_items[(server, library_id)])
+
+    chain.media_count = lambda _server: pytest.fail("不应重复查询整服统计")
+    chain.items_count = lambda **_kwargs: pytest.fail("整服同步不应逐库重复计数")
+    chain.items = items
+    chain.episodes = lambda *_args, **_kwargs: []
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+
+    with patch.object(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        return_value=[
+            SimpleNamespace(name="plex-a", enabled=True, sync_libraries=["all"]),
+            SimpleNamespace(name="plex-b", enabled=True, sync_libraries=["all"]),
+        ],
+    ):
+        chain.sync(progress_callback=lambda **kwargs: progress_snapshots.append(kwargs))
+
+    assert events == [
+        "count:plex-a",
+        "count:plex-b",
+        "items:plex-a:movies",
+        "items:plex-b:shows",
+    ]
+    media_progress = [
+        snapshot
+        for snapshot in progress_snapshots
+        if snapshot["text"].startswith(("正在同步 plex-a 媒体库", "正在同步 plex-b 媒体库"))
+    ]
+    assert [round(snapshot["value"], 2) for snapshot in media_progress] == [
+        33.33,
+        66.67,
+        100.0,
+    ]
+    assert media_progress[0]["data"]["media_total"] == 3
+    assert media_progress[1]["data"]["library_media_finished"] == 2
+    assert media_progress[2]["data"]["current_library"] == "剧集库"
+    assert media_progress[2]["data"]["media_total"] == 3
+    assert media_progress[2]["data"]["media_finished"] == 3
+    progress_values = [snapshot["value"] for snapshot in progress_snapshots]
+    assert progress_values == sorted(progress_values)
+
+
+def test_sync_targets_one_server_without_excluding_other_enabled_servers(monkeypatch):
+    """
+    定向同步只访问目标服务器，缓存清理仍保留其他已启用服务器。
+    """
+    chain = object.__new__(MediaServerChain)
+    library_calls = []
+    excluded_server_calls = []
+
+    class FakeMediaServerOper:
+        """
+        记录媒体服务器缓存清理参数的测试替身。
+        """
+
+        def delete_excluded_servers(self, servers):
+            """
+            记录应保留的全部已启用服务器名称。
+            """
+            excluded_server_calls.append(servers)
+
+    chain.librarys = lambda server, **_kwargs: library_calls.append(server) or []
+    chain.media_server_repository = FakeMediaServerOper()
+    monkeypatch.setattr(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        lambda **_kwargs: [
+            SimpleNamespace(name="plex-a", enabled=True, sync_libraries=["all"]),
+            SimpleNamespace(name="plex-b", enabled=True, sync_libraries=["all"]),
+        ],
+    )
+
+    chain.sync(server="plex-a")
+
+    assert library_calls == ["plex-a"]
+    assert excluded_server_calls == [["plex-a", "plex-b"]]
+
+
+@pytest.mark.parametrize("failure", [TimeoutError("read timeout"), ConnectionError("connection refused")])
+def test_sync_preserves_cached_rows_when_plex_read_fails(database, failure):
+    """
+    Plex 读取中断时，应保留上一轮缓存且不报告同步完成。
+    """
+    with database() as session:
+        session.add(
+            MediaServerItem(
+                server="plex",
+                library="movies",
+                item_id="not-reached-before-timeout",
+                item_type="电影",
+                title="已有媒体",
+                lst_mod_date="2026-05-01 00:00:00",
+            )
+        )
+        session.commit()
+
+    chain = object.__new__(MediaServerChain)
+    chain.librarys = lambda _server, **_kwargs: [SimpleNamespace(id="movies", name="电影库", item_count=1)]
+    chain.media_count = lambda _server: 1
+    chain.items_count = lambda **_kwargs: pytest.fail("目录已有数量时不应重复计数")
+
+    def items_with_failure(**_kwargs):
+        """
+        模拟 Plex 已返回部分条目后，下一次分页读取失败。
+        """
+        yield schemas.MediaServerItem(
+            server="plex",
+            library="movies",
+            item_id="received-before-timeout",
+            item_type="Movie",
+            title="已读取媒体",
+        )
+        raise failure
+
+    chain.items = items_with_failure
+    chain.episodes = lambda *_args, **_kwargs: []
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+    progress = []
+
+    with (
+        patch.object(
+            MEDIA_SERVER_CHAIN_MODULE,
+            "get_mediaserver_configs",
+            return_value=[SimpleNamespace(name="plex", enabled=True, sync_libraries=["all"])],
+        ),
+        pytest.raises(type(failure), match=str(failure)),
+    ):
+        chain.sync(progress_callback=lambda **kwargs: progress.append(kwargs))
+
+    with database() as session:
+        item_ids = {
+            item.item_id for item in session.query(MediaServerItem).filter(MediaServerItem.server == "plex").all()
+        }
+
+    assert item_ids == {"not-reached-before-timeout", "received-before-timeout"}
+    assert not any("同步完成" in entry.get("text", "") for entry in progress)
+
+
+# 前端新增媒体服务器的默认名称为「服务器N」，与模块条目携带的类型名不同
+_CUSTOM_NAMED_JELLYFIN = [SimpleNamespace(name="服务器1", enabled=True, sync_libraries=["all"])]
+
+
+def _custom_named_jellyfin_chain(database, items):
+    """
+    构造配置名称与模块类型名不同的 Jellyfin 同步链。
+    """
+    chain = object.__new__(MediaServerChain)
+    chain.librarys = lambda _server, **_kwargs: [SimpleNamespace(id="movies", name="电影库", item_count=1)]
+    chain.media_count = lambda _server: 1
+    chain.items_count = lambda **_kwargs: pytest.fail("目录已有数量时不应重复计数")
+    chain.items = items
+    chain.episodes = lambda *_args, **_kwargs: []
+    chain.media_server_repository = TransactionalMediaServerRepository(database)
+    return chain
+
+
+def _jellyfin_movie_items(**_kwargs):
+    """
+    模拟 Jellyfin 模块返回的条目，server 字段为类型名而非配置名称。
+    """
+    yield schemas.MediaServerItem(
+        server="jellyfin",
+        library="movies",
+        item_id="movie-1",
+        item_type="Movie",
+        title="已入库电影",
+        year="2026",
+    )
+
+
+def test_sync_stores_rows_under_config_name_for_existence_lookup(database):
+    """
+    缓存必须按配置名称写入，存在性检查按配置名称查询才能命中。
+    """
+    chain = _custom_named_jellyfin_chain(database, _jellyfin_movie_items)
+
+    with patch.object(MEDIA_SERVER_CHAIN_MODULE, "get_mediaserver_configs", return_value=_CUSTOM_NAMED_JELLYFIN):
+        chain.sync()
+
+    with database() as session:
+        servers = {item.server for item in session.query(MediaServerItem).all()}
+    assert servers == {"服务器1"}
+    assert chain.media_server_repository.get_item_id(
+        server="服务器1", title="已入库电影", year="2026", mtype="电影",
+    ) == "movie-1"
+
+
+def test_sync_keeps_custom_named_server_cache_when_read_fails(database):
+    """
+    配置名称与类型名不同时，后续读取失败也不得清空上一轮缓存。
+    """
+    chain = _custom_named_jellyfin_chain(database, _jellyfin_movie_items)
+
+    def items_with_timeout(**_kwargs):
+        """
+        模拟条目列表请求超时。
+        """
+        yield from ()
+        raise TimeoutError("read timeout")
+
+    with patch.object(MEDIA_SERVER_CHAIN_MODULE, "get_mediaserver_configs", return_value=_CUSTOM_NAMED_JELLYFIN):
+        chain.sync()
+        chain.items = items_with_timeout
+        with pytest.raises(TimeoutError, match="read timeout"):
+            chain.sync()
+
+    with database() as session:
+        rows = [(item.server, item.item_id) for item in session.query(MediaServerItem).all()]
+    assert rows == [("服务器1", "movie-1")]
+
+
+def test_sync_partial_commit_preserves_stale_rows_until_next_run(
+    database,
+    monkeypatch,
+):
+    """
+    前序条目提交后发生失败时保留 stale，并由下一轮成功同步收敛。
+    """
+    old_sync_time = "2026-05-01 00:00:00"
+    with database() as session:
+        session.add(
+            MediaServerItem(
+                server="plex",
+                library="movies",
+                item_id="stale",
+                item_type="电影",
+                title="陈旧条目",
+                lst_mod_date=old_sync_time,
+            )
+        )
+        session.commit()
+
+    chain = object.__new__(MediaServerChain)
+    stale_calls = []
+    items = [
+        schemas.MediaServerItem(
+            server="plex",
+            library="movies",
+            item_id=f"movie-{index}",
+            item_type="Movie",
+            title=f"测试电影 {index}",
+        )
+        for index in (1, 2)
+    ]
+    transactional = TransactionalMediaServerRepository(database)
+
+    class FailingMediaServerRepository:
+        """
+        提交首个条目后让第二个条目失败，并记录不应发生的清理。
+        """
+
+        def __init__(self):
+            """
+            初始化本轮已尝试写入计数。
+            """
+            self.upsert_count = 0
+
+        def delete_excluded_servers(self, servers):
+            """
+            委托真实短事务清理已移除服务器。
+            """
+            return transactional.delete_excluded_servers(servers)
+
+        def upsert(self, item):
+            """
+            提交首条记录，在第二条写入前模拟数据库不可用。
+            """
+            self.upsert_count += 1
+            if self.upsert_count == 2:
+                raise RuntimeError("database unavailable")
+            return transactional.upsert(item)
+
+        def delete_stale(self, **kwargs):
+            """
+            记录不应发生的 stale 清理。
+            """
+            stale_calls.append(kwargs)
+            return transactional.delete_stale(**kwargs)
+
+    chain.librarys = lambda _server, **_kwargs: [SimpleNamespace(id="movies", name="电影库", item_count=1)]
+    chain.media_count = lambda _server: len(items)
+    chain.items_count = lambda **_kwargs: len(items)
+    chain.items = lambda **_kwargs: iter(items)
+    chain.episodes = lambda *_args, **_kwargs: []
+    repository = FailingMediaServerRepository()
+    chain.media_server_repository = repository
+    monkeypatch.setattr(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        lambda **_kwargs: [SimpleNamespace(name="plex", enabled=True, sync_libraries=["all"])],
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        chain.sync()
+
+    assert stale_calls == []
+    with database() as session:
+        assert {item.item_id for item in session.query(MediaServerItem).all()} == {"movie-1", "stale"}
+
+    chain.media_server_repository = transactional
+    chain.sync()
+
+    with database() as session:
+        assert {item.item_id for item in session.query(MediaServerItem).all()} == {"movie-1", "movie-2"}
+
+
+def test_sync_stops_without_emitting_completion_after_stop_signal(monkeypatch):
+    """
+    系统停止发生在逐库同步期间时，不应再发送服务器或全局完成进度。
+    """
+    chain = object.__new__(MediaServerChain)
+    server = SimpleNamespace(name="plex", enabled=True)
+    progress = []
+
+    class FakeMediaServerOper:
+        """
+        提供同步阶段所需的最小数据库端口。
+        """
+
+        def delete_excluded_servers(self, _servers):
+            """
+            忽略测试中的媒体服务器清理。
+            """
+
+    def stop_during_sync(**_kwargs):
+        """
+        模拟读取媒体条目时收到系统停止信号。
+        """
+        global_vars.stop_system()
+        return 0, 0
+
+    chain.media_server_repository = FakeMediaServerOper()
+    monkeypatch.setattr(
+        chain,
+        "_prepare_sync_contexts",
+        lambda _servers, _server, _repository: (
+            [server],
+            1,
+            {"plex": ([], {})},
+            0,
+        ),
+    )
+    monkeypatch.setattr(chain, "_sync_server_libraries", stop_during_sync)
+    monkeypatch.setattr(
+        MEDIA_SERVER_CHAIN_MODULE,
+        "get_mediaserver_configs",
+        lambda **_kwargs: [server],
+    )
+    global_vars.STOP_EVENT.clear()
+    try:
+        chain.sync(progress_callback=lambda **kwargs: progress.append(kwargs))
+    finally:
+        global_vars.STOP_EVENT.clear()
+
+    texts = [item.get("text") for item in progress]
+    assert not any(text and "同步完成" in text for text in texts)

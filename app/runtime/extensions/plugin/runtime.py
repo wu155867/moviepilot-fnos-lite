@@ -1,0 +1,578 @@
+"""
+插件宿主运行时依赖聚合与构造。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Protocol
+
+from app.foundation.crypto import RSAUtils
+from app.foundation.version import compare_version
+from app.runtime.events import eventmanager
+from app.runtime.extensions.plugin.access import PluginAccessPolicy
+from app.runtime.extensions.plugin.admission import PluginMutationAdmission
+from app.runtime.extensions.plugin.catalog import PluginCatalogFacade
+from app.runtime.extensions.plugin.classification import PluginClassificationRegistry
+from app.runtime.extensions.plugin.clone import PluginCloneService
+from app.runtime.extensions.plugin.contracts import supports_plugin_hook
+from app.runtime.extensions.plugin.database import PluginDatabase
+from app.runtime.extensions.plugin.dependency import PluginDependencyService
+from app.runtime.extensions.plugin.lifecycle import PluginLifecycle
+from app.runtime.extensions.plugin.loader import (
+    PluginLoader,
+    PluginRuntimeDeclarationReader,
+)
+from app.runtime.extensions.plugin.loglevel import PluginLogLevelControl
+from app.runtime.extensions.plugin.metadata import PluginMetadataMapper
+from app.runtime.extensions.plugin.monitor import PluginMonitorController
+from app.runtime.extensions.plugin.paths import PluginPathResolver
+from app.runtime.extensions.plugin.projection import PluginProjection
+from app.runtime.extensions.plugin.registry import PluginRegistry
+from app.runtime.extensions.plugin.storage import (
+    PluginConfigStore,
+    PluginInstanceDirectory,
+    PluginInstanceStore,
+    PluginStorage,
+)
+from app.runtime.extensions.plugin.sync import (
+    LocalPluginSyncService,
+    PluginSyncService,
+)
+from app.runtime.extensions.plugin.system import PluginSystemServices
+from app.runtime.extensions.plugin.target import PluginDefaultTargetControl
+from app.runtime.extensions.plugin.tools import PluginToolCatalog
+from app.schemas.types import SystemConfigKey
+
+
+class PluginRuntimeHost(Protocol):
+    """
+    声明运行时 owner 回调宿主生命周期门面的最小合同。
+    """
+
+    def reload_plugin(self, plugin_id: str) -> Any:
+        """
+        重载指定插件。
+
+        :param plugin_id: 需要操作的插件实例标识
+        :return: 宿主完成重载后报告的插件运行状态
+        """
+        ...
+
+    def remove_plugin(self, plugin_id: str) -> Any:
+        """
+        移除指定插件运行实例。
+
+        :param plugin_id: 需要操作的插件实例标识
+        :return: 宿主移除调用的结果；当前宿主实现不返回业务数据
+        """
+        ...
+
+    @staticmethod
+    def get_plugin_remote_entry(plugin_id: str, page: str) -> str:
+        """
+        构造插件远程页面入口。
+
+        :param plugin_id: 需要操作的插件实例标识
+        :param page: 插件远程页面名称
+        :return: 面向该插件页面的远程入口地址
+        """
+        ...
+
+    def _run_file_watcher(self) -> None:
+        """
+        运行插件文件监控循环。
+        """
+        ...
+
+    def get_plugins_from_market(
+        self,
+        market: str,
+        package_version: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[list[Any]]:
+        """
+        读取指定市场目录。
+
+        :param market: 插件市场地址
+        :param package_version: 限定的插件代际；为 None 时按当前主程序兼容范围读取
+        :param force: 是否跳过目录缓存并重新获取，默认使用缓存
+        :return: 可用的插件目录条目；获取失败或没有可用目录时可返回 None
+        """
+        ...
+
+    async def async_get_plugins_from_market(
+        self,
+        market: str,
+        package_version: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[list[Any]]:
+        """
+        异步读取指定市场目录。
+
+        :param market: 插件市场地址
+        :param package_version: 限定的插件代际；为 None 时按当前主程序兼容范围读取
+        :param force: 是否跳过目录缓存并重新获取，默认使用缓存
+        :return: 等待后取得插件目录条目；获取失败或没有可用目录时可返回 None
+        """
+        ...
+
+
+PluginCatalogFactory = Callable[[Callable[..., Any]], Any]
+PluginImportService = Callable[..., None]
+PluginRemoteEntryBuilder = Callable[[str, str], str]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginRuntimeEnvironment:
+    """
+    保存由组合根提供的插件运行时外部端口。
+
+    :param plugins_root: 插件源码根目录
+    :param storage: 取得插件配置和数据存储服务的工厂
+    :param instance_directory: 取得插件实例目录的工厂
+    :param system: 取得已注入系统服务的工厂
+    :param database: 取得插件持久化服务的工厂
+    :param catalog_factory: 按运行环境创建插件目录的工厂
+    :param import_preparer: 导入插件前准备依赖资源的回调
+    :param import_scanner: 扫描插件导入依赖的回调
+    :param auth_level: 读取当前授权级别的回调
+    :param remote_entry: 构造插件远程页面入口的回调
+    :param development: 读取是否启用开发模式的回调
+    :param logger: 组合根注入的日志门面
+    :param set_default_target: 设置插件默认调用实例的回调，返回是否发生变更
+    :param clear_default_target: 清除插件默认调用实例的回调
+    :param runtime_declaration: 读取插件运行时声明的回调
+    """
+
+    plugins_root: Path
+    storage: Callable[[], PluginStorage]
+    instance_directory: Callable[[], PluginInstanceDirectory]
+    system: Callable[[], PluginSystemServices]
+    database: Callable[[], PluginDatabase]
+    catalog_factory: PluginCatalogFactory
+    import_preparer: PluginImportService
+    import_scanner: PluginImportService
+    auth_level: Callable[[], int]
+    remote_entry: PluginRemoteEntryBuilder
+    development: Callable[[], bool]
+    logger: Any
+    set_default_target: Callable[[str, str], bool]
+    clear_default_target: Callable[[str], None]
+    runtime_declaration: PluginRuntimeDeclarationReader
+
+
+@dataclass(frozen=True, slots=True)
+class PluginRuntime:
+    """
+    聚合一个 PluginManager 生命周期内唯一的职责 owner。
+
+    :param registry: 当前生命周期的插件实例注册表
+    :param instances: 插件实例目录存储
+    :param configs: 插件配置存储
+    :param access: 插件访问权限策略
+    :param catalog: 本地与远程插件目录门面
+    :param paths: 插件路径解析服务
+    :param local_sync: 本地仓库源码同步服务
+    :param monitor: 源码变化监控控制器
+    :param admission: 插件变更的并发准入控制
+    :param dependencies: 插件依赖检查和安装服务
+    :param loader: 插件类加载与实例构造服务
+    :param tools: 插件工具目录
+    :param lifecycle: 插件启动、停止和重载服务
+    :param metadata: 插件元数据映射服务
+    :param sync: 插件目录与运行状态同步服务
+    :param clone: 插件分身创建和恢复服务
+    :param log_level: 插件实例日志等级控制
+    :param default_target: 插件默认调用目标控制
+    :param projection: 插件运行信息展示投影
+    :param classification: 插件媒体分类来源注册表
+    :param recent_local_sync: 各插件最近一次本地同步的时间记录
+    :param system: 取得已注入系统服务的工厂
+    """
+
+    registry: PluginRegistry
+    instances: PluginInstanceStore
+    configs: PluginConfigStore
+    access: PluginAccessPolicy
+    catalog: PluginCatalogFacade
+    paths: PluginPathResolver
+    local_sync: LocalPluginSyncService
+    monitor: PluginMonitorController
+    admission: PluginMutationAdmission
+    dependencies: PluginDependencyService
+    loader: PluginLoader
+    tools: PluginToolCatalog
+    lifecycle: PluginLifecycle
+    metadata: PluginMetadataMapper
+    sync: PluginSyncService
+    clone: PluginCloneService
+    log_level: PluginLogLevelControl
+    default_target: PluginDefaultTargetControl
+    projection: PluginProjection
+    classification: PluginClassificationRegistry
+    recent_local_sync: dict[str, float]
+    system: Callable[[], PluginSystemServices]
+
+
+def build_plugin_runtime(
+    host: PluginRuntimeHost,
+    environment: PluginRuntimeEnvironment,
+    *,
+    tool_build_max_attempts: int,
+) -> PluginRuntime:
+    """
+    按依赖顺序构造唯一插件运行时，各业务能力仍由对应 owner 实现。
+    """
+    registry = PluginRegistry()
+    instances = PluginInstanceStore(
+        storage=environment.storage,
+        directory=environment.instance_directory,
+    )
+    configs = PluginConfigStore(
+        storage=environment.storage,
+        database=environment.database,
+        plugin_exists=lambda plugin_id: bool(registry.classes.get(plugin_id)),
+    )
+    access = PluginAccessPolicy(
+        auth_level=environment.auth_level,
+        verify_keys=RSAUtils.verify_rsa_keys,
+        log=environment.logger,
+    )
+    loader = PluginLoader(
+        plugins_root=environment.plugins_root,
+        import_preparer=environment.import_preparer,
+        import_scanner=environment.import_scanner,
+        # 运行时不兼容的插件不进入 lifecycle 遍历，状态只能由加载器自己落记，
+        # 否则启动期全量加载会把它们跳过得无声无息
+        runtime_status_writer=registry.set_runtime_status,
+        runtime_declaration=environment.runtime_declaration,
+        gil_fallback_recorder=registry.mark_gil_fallback,
+        log=environment.logger,
+    )
+    tools = PluginToolCatalog(max_attempts=tool_build_max_attempts)
+    classification = PluginClassificationRegistry(environment.logger)
+
+    def refresh_classification(plugin_id: str, instance: Any) -> None:
+        """
+        读取插件当前媒体来源声明并替换其分类扩展注册。
+        """
+        classification.remove(plugin_id)
+        declarations = (
+            instance.get_media_source() or []
+            if supports_plugin_hook(instance, "get_media_source")
+            else []
+        )
+        classification.replace(plugin_id, declarations)
+
+    def load_plugins(
+        plugin_id: Optional[str],
+        loadable_plugins: list[str],
+        validator: Callable[[Any], bool],
+    ) -> list[Any]:
+        """
+        加载物理插件或虚拟实例，并保持持久化实例顺序。
+
+        带具体实例 ID 的定向装载同样认启用位。实例存储的读取口刻意返回全部在册行
+        （含停用的），加载器在收到具体插件 ID 时也只按这个 ID 找目录、不看可装载
+        清单；两处叠在一起，源码变更触发的实例树重载、按 ID 发起的重载就会绕过启用
+        判据，把用户停用的实例又拉起来跑到下次重启。
+        """
+        if plugin_id:
+            instance = instances.get(plugin_id)
+            if instance:
+                if not instance.is_enabled:
+                    return []
+                return loader.load_instance(instance, validator)
+            if not any(
+                loadable.casefold() == plugin_id.casefold()
+                for loadable in loadable_plugins
+            ):
+                return []
+            return loader.load(plugin_id, loadable_plugins, validator)
+        plugins = loader.load(None, loadable_plugins, validator)
+        # 只装载启用的配置：停用的分身仍登记在册、卡片可见，但不该被实例化
+        for instance in instances.enabled().values():
+            plugins.extend(loader.load_instance(instance, validator))
+        return plugins
+
+    def runtime_compatible(plugin_id: str) -> bool:
+        """
+        按分身归一到源插件目录后判断运行时兼容性。
+        """
+        instance = instances.get(plugin_id)
+        source_id = instance.source_plugin_id if instance else plugin_id
+        return loader.is_runtime_compatible(source_id)
+
+    lifecycle = PluginLifecycle(
+        classes=registry.classes,
+        running=registry.running,
+        load_plugins=load_plugins,
+        # 本体的装载判据归口到实例表的启用位；安装清单只回答「包在不在磁盘上」，
+        # 它同时兼任运行开关时，「装着但先不跑」根本没有地方可以表达
+        loadable_plugins=lambda: list(instances.enabled_hosts()),
+        plugin_config=configs.read,
+        auth_checker=lambda plugin: access.check(plugin),
+        clear_modules=loader.clear_modules,
+        clear_tools=tools.clear,
+        enable_events=eventmanager.enable_event_handler,
+        disable_events=eventmanager.disable_event_handler,
+        runtime_status_writer=registry.set_runtime_status,
+        runtime_compatible=runtime_compatible,
+        database=environment.database,
+        log=environment.logger,
+        event_sender=eventmanager.send_event,
+        refresh_classification=refresh_classification,
+        remove_classification=classification.remove,
+        gil_fallback_recorder=registry.mark_gil_fallback,
+        enabled_state_recorder=registry.mark_enabled_state_changed,
+    )
+    metadata = PluginMetadataMapper(
+        plugin_instance=registry.instance,
+        plugin_class=registry.plugin_class,
+        annotate_system_version=lambda info: environment.system().annotate_system_version(
+            info
+        ),
+        annotate_runtime_compatibility=lambda info: (
+            environment.system().annotate_runtime_compatibility(info)
+        ),
+        is_package_compatible=lambda info, version: environment.system().is_package_compatible(
+            info,
+            version,
+        ),
+        auth_checker=lambda plugin, source: access.check(plugin, source),
+        version_compare=lambda source, comparison, target: (
+            compare_version(source, comparison, target) is True
+        ),
+        log=environment.logger,
+    )
+    catalog = PluginCatalogFacade(
+        classes=registry.classes_snapshot,
+        running=lambda: registry.running,
+        storage=environment.storage,
+        system=environment.system,
+        market_catalog=lambda: environment.catalog_factory(metadata.map),
+        market_loader=lambda market, package_version=None, force=False: (
+            host.get_plugins_from_market(market, package_version, force)
+        ),
+        async_market_loader=lambda market, package_version=None, force=False: (
+            host.async_get_plugins_from_market(
+                market,
+                package_version,
+                force,
+            )
+        ),
+        map_plugin=lambda **kwargs: metadata.map(
+            plugin_id=kwargs["pid"],
+            plugin_info=kwargs["plugin_info"],
+            market=kwargs["market"],
+            installed_plugins=kwargs["installed_apps"],
+            add_time=kwargs["add_time"],
+            package_version=kwargs.get("package_version"),
+        ),
+        auth_checker=lambda **kwargs: access.check(**kwargs),
+        plugin_attr=lambda plugin_id, attribute: getattr(
+            registry.instance(plugin_id),
+            attribute,
+            None,
+        ),
+        plugin_instance=instances.get,
+        plugin_instances=instances.all,
+        host_instances=instances.all_hosts,
+        runtime_status=registry.runtime_status,
+        log=environment.logger,
+    )
+    paths = PluginPathResolver(
+        runtime_root=environment.plugins_root,
+        running=lambda: registry.running,
+        system=environment.system,
+        strict_system_version=lambda: not environment.development(),
+        log=environment.logger,
+    )
+    recent_local_sync: dict[str, float] = {}
+    local_sync = LocalPluginSyncService(
+        installed_plugins=lambda: environment.storage().read(
+            SystemConfigKey.UserInstalledPlugins
+        ) or [],
+        candidate=lambda plugin_id: environment.system().local_candidate(plugin_id),
+        system=environment.system,
+        recent_sync=recent_local_sync,
+        log=environment.logger,
+    )
+    dependencies = PluginDependencyService(
+        system=environment.system,
+        # 分类结果会被逐个 start()，因此两层都只能给出应当装载的那一部分
+        instances=instances.enabled,
+        loadable_hosts=lambda: set(instances.enabled_hosts()),
+        registry=registry,
+        log=environment.logger,
+    )
+    sync = PluginSyncService(
+        frozen=lambda: environment.system().is_frozen(),
+        installed_plugins=lambda: environment.storage().read(
+            SystemConfigKey.UserInstalledPlugins
+        ) or [],
+        online_plugins=catalog.online,
+        # 启动恢复必须保留本地仓库扫描失败，不能把异常降级为空候选后
+        # 再从在线市场下载覆盖当前载荷。
+        local_plugins=lambda: catalog.local_repository(raise_errors=True),
+        merge_plugins=lambda higher, base, _markets: catalog.merge(higher, base),
+        plugin_exists=catalog.exists,
+        install=lambda plugin_id, repo_url, force, startup_token: environment.system().install_plugin(
+            plugin_id=plugin_id,
+            repo_url=repo_url,
+            force=force,
+            startup_token=startup_token,
+        ),
+        runtime_status_writer=registry.set_runtime_status,
+        log=environment.logger,
+    )
+
+    def source_plugin_id(plugin_id: str) -> str:
+        """
+        把虚拟实例归一到持久化的物理源码插件。
+        """
+        instance = instances.get(plugin_id)
+        return instance.source_plugin_id if instance else plugin_id
+
+    def plugin_registered(plugin_id: str) -> bool:
+        """
+        判断插件是否在册：装过（安装清单里有）或留有持久化的实例行。
+
+        默认调用目标与实例日志等级这两个管理接口问的都是「这个插件还在不在册、能不能
+        被管理」，因此共用这一个判据，而不能绑在运行期类注册表上：启动只把启用中的
+        本体与分身装进注册表，某插件的全部实例停用后重启，注册表里就没有它的类了，
+        但它的安装记录与实例行都还在。绑在注册表上等于说「停用即不存在」，而停用不是
+        卸载——在册的实例必须仍然可见、可管理，否则用户再也无法把它重新指回默认调用
+        目标，也调不出它的日志等级设置，而那份设置正是排查它为什么被停用时要看的。
+
+        「当前是否装载」是另一个问题，由各自的端口回答：插件配置读写看类注册表，
+        分身建号与安装前置看包在不在磁盘上，都不走这里。
+
+        :param plugin_id: 插件 ID
+        :return: 该插件是否在册
+        """
+        if instances.get_host(plugin_id) is not None:
+            return True
+        if instances.for_source(plugin_id):
+            return True
+        installed = environment.storage().read(
+            SystemConfigKey.UserInstalledPlugins
+        ) or []
+        return plugin_id in installed
+
+    def instance_id_taken(
+        instance_id: str,
+        *,
+        ignore_instance_row: bool = False,
+    ) -> bool:
+        """
+        判断一个候选实例 ID 是否已被占用。
+
+        创建分身的判存与自动分配后缀共用这一个判据，自动分配因此不可能挑中一个手填
+        时会被拒绝的 ID。四条依据各自覆盖一类占用者，缺一条就会让新分身顶掉一个真实
+        存在的插件身份：
+
+        * 类注册表——当前已装载的本体与分身；
+        * 实例行——含已停用的分身与本体，它们的配置还留在行上，不是空位；
+        * 安装清单——装过但此刻未装载的物理插件；
+        * 插件包目录——卸载不删源码，磁盘上因此会留下不在前三者里的插件包，占了它的
+          号会让那个插件以后再也装不回来（实例行的归属列对不上，写入直接被拒）。
+
+        判存不能只看运行态：源插件本次加载失败时，已有的同名分身会被判成「不存在」
+        而放行，随后它的描述符被覆盖，再在回滚里连同配置一起删掉。``catalog.exists``
+        不足以充当磁盘判据——它要从**运行中**的实例上取版本号，未装载的插件包一律
+        报告不存在，因而这里直接看包目录。
+
+        :param instance_id: 候选实例 ID
+        :param ignore_instance_row: 是否把实例行这一类占用者排除在外。恢复一个已停用的
+            分身时为真：那一行正是本次要拿回来的东西，它自己不构成冲突。一个 ID 在实例
+            表里至多一行，忽略这一类即等于只豁免待恢复的那一行，另外三类仍然要挡——否则
+            恢复会绕开全部判存，把一个真实插件的身份顶掉
+        :return: 该 ID 是否已被占用
+        """
+        if registry.plugin_class(instance_id) is not None:
+            return True
+        if not ignore_instance_row:
+            if instances.get(instance_id) is not None:
+                return True
+            if instances.get_host(instance_id) is not None:
+                return True
+        installed = environment.storage().read(
+            SystemConfigKey.UserInstalledPlugins
+        ) or []
+        if instance_id in installed:
+            return True
+        return (environment.plugins_root / instance_id.lower()).is_dir()
+
+    clone = PluginCloneService(
+        plugin_class=registry.plugin_class,
+        instance_id_taken=instance_id_taken,
+        get_instance=instances.get,
+        instances_for_source=instances.for_source,
+        source_plugin_id=source_plugin_id,
+        save_instance=instances.save,
+        delete_instance=instances.delete,
+        disable_instance=instances.disable,
+        read_config=configs.read,
+        save_config=lambda plugin_id, config: configs.write(
+            plugin_id,
+            config,
+            force=True,
+        ),
+        delete_config=lambda plugin_id: configs.delete(plugin_id, force=True),
+        reload_plugin=host.reload_plugin,
+        remove_plugin=host.remove_plugin,
+        log=environment.logger,
+    )
+    log_level = PluginLogLevelControl(
+        plugin_exists=plugin_registered,
+        get_instance=instances.get,
+        instances_for_source=instances.for_source,
+        read_log_level=configs.read_log_level,
+        write_log_level=configs.write_log_level,
+    )
+    default_target = PluginDefaultTargetControl(
+        plugin_exists=plugin_registered,
+        get_instance=instances.get,
+        instances_for_source=instances.for_source,
+        get_host_instance=instances.get_host,
+        save_host_instance=instances.save_host,
+        running=lambda: registry.running,
+        set_default_target=environment.set_default_target,
+        clear_default_target=environment.clear_default_target,
+    )
+    projection = PluginProjection(
+        registry.running,
+        environment.logger,
+        environment.remote_entry,
+    )
+    return PluginRuntime(
+        registry=registry,
+        instances=instances,
+        configs=configs,
+        access=access,
+        catalog=catalog,
+        paths=paths,
+        local_sync=local_sync,
+        monitor=PluginMonitorController(
+            runner=host._run_file_watcher,
+            log=environment.logger,
+        ),
+        admission=PluginMutationAdmission(),
+        dependencies=dependencies,
+        loader=loader,
+        tools=tools,
+        lifecycle=lifecycle,
+        metadata=metadata,
+        sync=sync,
+        clone=clone,
+        log_level=log_level,
+        default_target=default_target,
+        projection=projection,
+        classification=classification,
+        recent_local_sync=recent_local_sync,
+        system=environment.system,
+    )

@@ -1,0 +1,107 @@
+{
+  "app/domain/media.py": {
+    "E731": 1
+  },
+  "app/domain/meta/runtime.py": {
+    "E731": 2
+  },
+  "app/domain/meta/words.py": {
+    "E731": 1
+  },
+  "app/modules/discord/__init__.py": {
+    "F401": 2
+  },
+  "app/modules/discord/discord.py": {
+    "E741": 1
+  },
+  "app/modules/emby/__init__.py": {
+    "F401": 1
+  },
+  "app/modules/jellyfin/__init__.py": {
+    "F401": 1
+  },
+  "app/modules/navidrome/__init__.py": {
+    "F401": 2
+  },
+  "app/modules/slack/__init__.py": {
+    "F401": 2
+  },
+  "app/modules/zspace/__init__.py": {
+    "F401": 4
+  },
+  "app/runtime/cache.py": {
+    "E731": 2
+  },
+  "scripts/benchmark_filter_torrents_rust.py": {
+    "E402": 3,
+    "I001": 1
+  },
+  "scripts/benchmark_indexer_rust.py": {
+    "E402": 2
+  },
+  "scripts/benchmark_metainfo_rust.py": {
+    "E402": 9,
+    "F401": 3,
+    "I001": 1
+  },
+  "scripts/benchmark_rss_rust.py": {
+    "E402": 4
+  },
+  "scripts/dev/simulate_package_installer.py": {
+    "E402": 1
+  },
+  "scripts/perf/module_shutdown_ab.py": {
+    "E402": 3
+  },
+  "scripts/perf/task_registry_ab.py": {
+    "E402": 1
+  },
+  "tests/test_agent_session_status.py": {
+    "I001": 1
+  },
+  "tests/test_database_migration_startup.py": {
+    "F841": 1
+  },
+  "tests/test_db_declarative_2_0.py": {
+    "E402": 1
+  },
+  "tests/test_episode_format_helper.py": {
+    "F841": 1
+  },
+  "tests/test_feedback_issue_repository_routing.py": {
+    "I001": 1
+  },
+  "tests/test_feedback_issue_scripts.py": {
+    "I001": 1
+  },
+  "tests/test_interaction_router.py": {
+    "E402": 5
+  },
+  "tests/test_local_setup_config_dir.py": {
+    "F841": 1
+  },
+  "tests/test_media_interaction.py": {
+    "F841": 1
+  },
+  "tests/test_media_source_signature_compatibility.py": {
+    "I001": 1
+  },
+  "tests/test_mediaserver_image_signing.py": {
+    "I001": 1
+  },
+  "tests/test_message_channel_permissions.py": {
+    "I001": 1
+  },
+  "tests/test_plugin_sdk.py": {
+    "I001": 3
+  },
+  "tests/test_plugin_virtual_instances.py": {
+    "E731": 1
+  },
+  "tests/test_skills_command.py": {
+    "E402": 5
+  },
+  "tests/test_tmdb_retry_and_errors.py": {
+    "F811": 1
+  }
+}

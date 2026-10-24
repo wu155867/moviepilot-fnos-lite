@@ -1,0 +1,141 @@
+# 06 — Code Standards and Style
+
+## General Principles
+
+- Preserve the surrounding implementation style. Comments and docstrings always follow [08 — Comments and Documentation Style](08-comment-styles.md), even when neighboring code uses an older style.
+- Prefer the smallest correct change. Do not introduce a new abstraction layer without a clear payoff.
+- Do not add features, refactors, or abstractions beyond what the task requires.
+- Do not add error handling or validation for scenarios that cannot happen. Trust internal code and framework guarantees; only validate at system boundaries (user input, external API responses).
+
+---
+
+## Python Version and Typing
+
+- Target: **Python 3.14+**. Python 3.14 is the primary CI version; dependency CI also verifies supported platforms and both Linux runtime profiles.
+- **Type annotations are required** on all public methods and function signatures.
+- Use `Optional[X]` for nullable types (do not use `X | None` — keep consistency with the existing codebase style).
+- Use `Union[X, Y]` for multi-type parameters.
+- Prefer `list[X]`, `dict[K, V]`, `tuple[X, Y]` built-in generics in new code (Python 3.9+); match the style of the surrounding file.
+- Use `pathlib.Path` for all file path operations. Never use raw string concatenation for paths.
+
+---
+
+## Pydantic Models
+
+- All request body and response models must be defined as Pydantic `BaseModel` subclasses in `app/schemas/`.
+- Use `Field(...)` for required fields; use `Field(default=...)` or `Field(None)` for optional fields.
+- Do not define ad-hoc `dict` return types for API responses — define a schema class.
+- Settings and deployment configuration live in `ConfigModel` / `Settings` in `app/runtime/config.py` using `pydantic-settings`.
+- Use `model_validator` for cross-field validation logic.
+- Every Pydantic model requires a Chinese multiline class docstring, every declared model field requires a Chinese `Field(description=...)`, and validators and explicit methods require Chinese multiline docstrings. Ordinary `#` comments and class-level `:param:` entries do not replace Schema field descriptions. Comment migration must preserve defaults, constraints, aliases, and serialization behavior.
+
+---
+
+## Comments and Structured Contracts
+
+- All comment prose must be Chinese. Every docstring uses multiline triple double quotes with opening and closing delimiters on separate lines.
+- Use `:param name:`, `:return:`, and `:raises ExceptionType:` for parameters, results, and exceptions, not Google-style `Args:` / `Returns:` sections.
+- Every dataclass requires class and per-field documentation: `:param:` for initialization inputs, `:ivar:` for non-initialization instance attributes, and `:cvar:` for class variables. Explicitly defined methods also require documentation.
+- Every Protocol requires documentation for its class, members, methods, and properties. Methods explain parameters, results, and applicable exceptions, side effects, and implementation constraints. Private types and test scaffolding are not exempt.
+- Module headers, ordinary classes and functions, special Pydantic members, ordinary comments, and review requirements follow [08 — Comments and Documentation Style](08-comment-styles.md); do not introduce local formats.
+
+---
+
+## Async and Concurrency
+
+- Prefer `async def` for I/O-bound operations (network requests, database queries, file operations).
+- Use `await` consistently; do not mix sync and async code paths in the same function without using `run_in_threadpool` from FastAPI or `asyncio.to_thread`.
+- For CPU-bound work that must not block the event loop, submit to `ThreadHelper` (see `app/runtime/thread.py`).
+- Use `ThreadHelper.submit()` for finite background work. A long-lived protocol loop may use a
+  dedicated `threading.Thread` only when its existing lifecycle owner signals and joins that child,
+  while the external caller bounded-waits and retains the parent owner on non-convergence; do not
+  create a dedicated thread pool for that exception.
+
+---
+
+## Imports
+
+Order imports as follows, separated by blank lines:
+
+1. Standard library (`import os`, `import json`, etc.)
+2. Third-party packages (`from fastapi import ...`, `from pydantic import ...`)
+3. Local application packages (`from app.chain import ...`, `from app.schemas import ...`)
+
+Within each group, sort alphabetically. Do not use wildcard imports (`from module import *`) in application code.
+
+---
+
+## String Formatting
+
+- Use **f-strings** for all string interpolation. Do not use `%` formatting or `.format()`.
+- For log messages, use `logger.info(f"...")` — do not use lazy `%s` format in logger calls (the project does not rely on lazy evaluation here).
+
+---
+
+## Error Handling
+
+- In **chain and module layers**: do not raise HTTP exceptions. Catch exceptions, log them, and return `None` or a domain-level error object so the caller can decide how to proceed.
+- In **endpoint layer**: use FastAPI's `HTTPException` or the project's standard response schemas for errors.
+- Application and adapter layers must not swallow operational failures silently. Log or re-raise them according to the owning contract. Foundation primitives do not log; they return their documented fallback value or raise, leaving operational reporting to the caller.
+- Do not use bare `except:` — always catch a specific exception type or at minimum `Exception`.
+- `logger.exception(...)` records at ERROR level and includes the current traceback in console output by default. File and resource logs receive the formatted ERROR message through the usual routing. An explicit `exc_info` value follows standard-library logging semantics.
+
+```python
+# 保留失败原因，便于定位外部调用问题
+try:
+    result = self.do_work()
+except Exception as err:
+    logger.error(f"Failed to do work: {str(err)}")
+    return None
+
+# 错误示例：直接吞掉异常会掩盖失败原因
+try:
+    result = self.do_work()
+except:
+    pass
+```
+
+---
+
+## Logging
+
+- Host code uses `logger` from `app.runtime.log`; new plugins use `app.sdk.logging`. The historical `app.log` path is compatibility-only. Do not import the standard library `logging` directly in application code.
+- Log levels:
+  - `logger.debug(...)` — detailed diagnostic information, disabled by default.
+  - `logger.info(...)` — normal operational events.
+  - `logger.warning(...)` — unexpected but recoverable situations.
+  - `logger.error(...)` — failures that affect functionality.
+- Keep log messages in Chinese unless the surrounding file consistently uses English.
+
+---
+
+## Constants and Magic Values
+
+- Do not scatter raw string keys for `SystemConfig`. Add a `SystemConfigKey` enum entry and reference it.
+- Do not use magic numbers or magic strings inline. Define a named constant or enum value.
+
+---
+
+## File Organization
+
+- One primary class per file is the norm for chains, modules, services, and adapters.
+- Private functions in the same file are preferable to extracting a new module for single-use logic.
+- Add code to the canonical capability package that owns it, and extend an existing domain file whenever that domain already exists.
+- Do not recreate generic `core`, `helper`, or `utils` buckets; see `05-architecture.md` for placement rules.
+- New files use one focused lowercase noun. When the capability already names the package, put the role in a single-word child such as `plugin/manager.py`; do not flatten it back into `plugin_manager.py`.
+- Keep files focused on one domain concern.
+
+---
+
+## What Not To Do
+
+- Do not introduce new third-party libraries without placing them in the correct `pyproject.toml` dependency group and updating `uv.lock`: runtime packages belong in `[project].dependencies`, test/lint/build tooling in `[dependency-groups].dev`.
+- Do not use `requests` or `httpx` directly for external HTTP calls - host code uses `RequestUtils` from `app/adapters/network/http.py`; plugins use `app.sdk.network`.
+- Do not issue raw SQLAlchemy queries or import Oper classes from chains, modules,
+  or endpoints. Define/consume an Application persistence Port; its concrete
+  implementation under `app/db/adapters/` may use Oper classes from `app/db/oper/`.
+- Do not add TODO or FIXME without context. Only keep one if it is genuinely deferred and cannot be addressed in the current task.
+- Do not add noisy markers like `# change starts here`, `# important`, or `# this is a fix`.
+- Do not write comments that restate what the code already clearly says.
+
+*Last Updated: 2026-10-17*

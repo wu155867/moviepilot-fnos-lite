@@ -1,0 +1,251 @@
+"""
+Agent 本地文件搜索与安全编辑工具测试。
+"""
+
+import asyncio
+import hashlib
+import json
+
+from app.agent.tools.impl.edit_file import EditFileTool
+from app.agent.tools.impl.read_file import MAX_READ_SIZE, ReadFileTool
+from app.agent.tools.impl.write_file import WriteFileTool
+from app.foundation.identity import build_user_memory_key
+
+
+def _make_admin_tool(tool_class):
+    """
+    创建带管理员上下文的文件工具实例。
+    """
+    tool = tool_class(session_id="session-1", user_id="admin")
+    tool.set_agent_context({"is_admin": True})
+    return tool
+
+
+def test_edit_file_rejects_ambiguous_match_by_default(tmp_path):
+    """
+    精确编辑默认应拒绝多处匹配，避免静默批量修改代码。
+    """
+    file_path = tmp_path / "plugin.py"
+    file_path.write_text("enabled = False\nenabled = False\n", encoding="utf-8")
+    tool = _make_admin_tool(EditFileTool)
+
+    result = asyncio.run(tool.run(str(file_path), "enabled = False", "enabled = True"))
+
+    assert "匹配到 2 处" in result
+    assert "replace_all=true" in result
+    assert file_path.read_text(encoding="utf-8") == ("enabled = False\nenabled = False\n")
+
+
+def test_edit_file_replace_all_requires_explicit_flag(tmp_path):
+    """
+    显式开启 replace_all 后才应替换全部精确匹配。
+    """
+    file_path = tmp_path / "plugin.py"
+    file_path.write_text("old\nold\n", encoding="utf-8")
+    tool = _make_admin_tool(EditFileTool)
+
+    result = asyncio.run(tool.run(str(file_path), "old", "new", replace_all=True))
+
+    assert "替换了 2 处" in result
+    assert file_path.read_text(encoding="utf-8") == "new\nnew\n"
+
+
+def test_edit_file_rejects_empty_match_and_missing_file(tmp_path):
+    """
+    编辑工具不应再通过空匹配隐式创建文件。
+    """
+    file_path = tmp_path / "missing.py"
+    tool = _make_admin_tool(EditFileTool)
+
+    empty_result = asyncio.run(tool.run(str(file_path), "", "content"))
+    missing_result = asyncio.run(tool.run(str(file_path), "old", "new"))
+
+    assert "old_text 不能为空" in empty_result
+    assert "不存在" in missing_result
+    assert "write_file" in missing_result
+    assert not file_path.exists()
+
+
+def test_edit_file_rejects_stale_sha256(tmp_path):
+    """
+    文件在读取后变化时，哈希保护应拒绝基于旧版本编辑。
+    """
+    file_path = tmp_path / "plugin.py"
+    file_path.write_text("before", encoding="utf-8")
+    old_sha256 = hashlib.sha256(b"before").hexdigest()
+    file_path.write_text("changed elsewhere", encoding="utf-8")
+    tool = _make_admin_tool(EditFileTool)
+
+    result = asyncio.run(
+        tool.run(
+            str(file_path),
+            "changed elsewhere",
+            "agent change",
+            expected_sha256=old_sha256,
+        )
+    )
+
+    assert "已在读取后发生变化" in result
+    assert file_path.read_text(encoding="utf-8") == "changed elsewhere"
+
+
+def test_write_file_protects_existing_file_and_supports_guarded_overwrite(tmp_path):
+    """
+    完整写入应默认保护已有文件，并允许带版本校验的显式覆盖。
+    """
+    file_path = tmp_path / "plugin.py"
+    file_path.write_text("before", encoding="utf-8")
+    expected_sha256 = hashlib.sha256(b"before").hexdigest()
+    tool = _make_admin_tool(WriteFileTool)
+
+    refused_result = asyncio.run(tool.run(str(file_path), "unexpected"))
+    written_result = asyncio.run(
+        tool.run(
+            str(file_path),
+            "after",
+            overwrite=True,
+            expected_sha256=expected_sha256,
+        )
+    )
+    stale_result = asyncio.run(
+        tool.run(
+            str(file_path),
+            "stale write",
+            overwrite=True,
+            expected_sha256=expected_sha256,
+        )
+    )
+
+    assert "拒绝完整覆盖" in refused_result
+    assert "成功写入文件" in written_result
+    assert "sha256=" in written_result
+    assert "已在读取后发生变化" in stale_result
+    assert file_path.read_text(encoding="utf-8") == "after"
+
+
+def test_read_file_can_return_sha256_metadata(tmp_path):
+    """
+    读取工具应能返回供后续冲突检查使用的文件哈希。
+    """
+    file_path = tmp_path / "plugin.py"
+    file_path.write_text("插件内容", encoding="utf-8")
+    tool = _make_admin_tool(ReadFileTool)
+
+    result = asyncio.run(tool.run(str(file_path), include_metadata=True))
+    payload = json.loads(result)
+
+    assert payload["content"] == "插件内容"
+    assert payload["size_bytes"] == len("插件内容".encode("utf-8"))
+    assert payload["sha256"] == hashlib.sha256("插件内容".encode("utf-8")).hexdigest()
+    assert payload["truncated"] is False
+
+
+def test_non_admin_memory_access_is_scoped_to_current_user(tmp_path, monkeypatch):
+    """
+    普通用户只能写自己的记忆，公共记忆和其他用户记忆不可写读。
+    """
+    config_path = tmp_path / "config"
+    monkeypatch.setattr(
+        "app.agent.tools.base.get_runtime_setting",
+        lambda name: config_path if name == "CONFIG_PATH" else None,
+    )
+    user_id = "10001"
+    user_key = build_user_memory_key(user_id)
+    assert user_key is not None
+    own_memory = config_path / "agent" / "memory" / "users" / user_key / "MEMORY.md"
+    global_memory = config_path / "agent" / "memory" / "MEMORY.md"
+    other_memory = config_path / "agent" / "memory" / "users" / "other" / "MEMORY.md"
+    global_memory.parent.mkdir(parents=True)
+    global_memory.write_text("公共规则", encoding="utf-8")
+    other_memory.parent.mkdir(parents=True)
+    other_memory.write_text("其他用户规则", encoding="utf-8")
+    tool = WriteFileTool(session_id="session-1", user_id=user_id)
+    tool.set_agent_context({"is_admin": False})
+
+    own_result = asyncio.run(tool.run(str(own_memory), "我的偏好"))
+    global_result = asyncio.run(tool.run(str(global_memory), "不应写入", overwrite=True))
+    other_result = asyncio.run(tool.run(str(other_memory), "不应写入", overwrite=True))
+
+    assert "成功写入文件" in own_result
+    assert own_memory.read_text(encoding="utf-8") == "我的偏好"
+    assert "全局公共记忆" in global_result
+    assert "其他用户的记忆" in other_result
+
+    read_tool = ReadFileTool(session_id="session-1", user_id=user_id)
+    read_tool.set_agent_context({"is_admin": False})
+    read_other_result = asyncio.run(read_tool.run(str(other_memory)))
+    assert "其他用户的记忆" in read_other_result
+
+
+def test_read_file_rejects_invalid_line_ranges(tmp_path):
+    """
+    非法行号必须明确失败，不能静默裁剪成另一段内容。
+    """
+    file_path = tmp_path / "range.py"
+    file_path.write_text("one\ntwo\n", encoding="utf-8")
+    tool = _make_admin_tool(ReadFileTool)
+
+    below_one = asyncio.run(tool.run(str(file_path), start_line=0))
+    reversed_range = asyncio.run(tool.run(str(file_path), start_line=2, end_line=1))
+
+    assert "start_line" in below_one and "有效范围" in below_one
+    assert "end_line 不能小于 start_line" in reversed_range
+
+
+def test_read_file_returns_line_range_hint_when_truncated(tmp_path):
+    """
+    超过50KB时应保留前段内容并提示按行号范围继续读取。
+    """
+    file_path = tmp_path / "large.py"
+    exact_content = "a" * MAX_READ_SIZE
+    file_path.write_text(exact_content, encoding="utf-8")
+    tool = _make_admin_tool(ReadFileTool)
+
+    exact_result = asyncio.run(tool.ainvoke({"file_path": str(file_path)}))
+    file_path.write_text(f"{exact_content}b", encoding="utf-8")
+    truncated_result = asyncio.run(tool.ainvoke({"file_path": str(file_path)}))
+    metadata_result = asyncio.run(tool.run(str(file_path), include_metadata=True))
+    metadata = json.loads(metadata_result)
+
+    assert exact_result == exact_content
+    assert truncated_result.startswith(exact_content)
+    assert "50KB" in truncated_result
+    assert "start_line" in truncated_result
+    assert "end_line" in truncated_result
+    assert "tool_result_truncated" not in truncated_result
+    assert metadata["truncated"] is True
+    assert "行号范围" in metadata["truncation_message"]
+
+
+def test_non_admin_history_and_learning_read_stays_in_own_runtime(tmp_path, monkeypatch):
+    """
+    通用 read_file 不能绕过专用检索工具，读取另一用户消息或技能。
+    """
+    config = tmp_path / 'config'
+    monkeypatch.setattr('app.agent.tools.base.get_runtime_setting', lambda name: config if name == 'CONFIG_PATH' else None)
+    reader = ReadFileTool(session_id='session', user_id='alice')
+    reader.set_agent_context({'is_admin': False})
+    for library in ('history', 'learning'):
+        root = config / 'agent/runtime' / library / 'users'
+        own = root / build_user_memory_key('alice') / 'evidence.txt'
+        other = root / build_user_memory_key('bob') / 'evidence.txt'
+        own.parent.mkdir(parents=True)
+        other.parent.mkdir(parents=True)
+        own.write_text('当前用户内容')
+        other.write_text('另一用户内容')
+        assert '当前用户内容' in asyncio.run(reader.run(str(own)))
+        assert '不能读取或修改其他用户' in asyncio.run(reader.run(str(other)))
+
+
+def test_non_admin_cannot_bypass_personal_skill_tool_to_write_public_library(tmp_path, monkeypatch):
+    """
+    通用文件写入不能绕过个人技能管理边界而修改所有用户共用的技能。
+    """
+    config = tmp_path / 'config'
+    monkeypatch.setattr('app.agent.tools.base.get_runtime_setting', lambda name: config if name == 'CONFIG_PATH' else None)
+    writer = WriteFileTool(session_id='session', user_id='alice')
+    writer.set_agent_context({'is_admin': False})
+    target = config / 'agent/skills/public/SKILL.md'
+    result = asyncio.run(writer.run(str(target), '不能写入'))
+    assert '公共技能只有系统管理员' in result
+    assert not target.exists()

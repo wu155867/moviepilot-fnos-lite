@@ -1,0 +1,111 @@
+"""
+音乐目录应用服务测试。
+"""
+
+import asyncio
+
+from app.application.music.catalog import MusicCatalogService
+from app.domain.context import MusicInfo
+from app.schemas.types import MediaSource
+
+
+class _Source:
+    """
+    提供同步和异步搜索接口的音乐来源替身。
+    """
+
+    def search_music(self, _meta, limit=20):
+        """
+        返回重复候选，验证归一化去重。
+        """
+        return [
+            MusicInfo(media_source=MediaSource.MusicBrainz, media_id="1", title="A"),
+            MusicInfo(media_source=MediaSource.MusicBrainz, media_id="1", title="A"),
+        ][:limit]
+
+    async def async_search_music(self, _meta, limit=20):
+        """
+        返回异步候选。
+        """
+        return self.search_music(_meta, limit)
+
+
+def test_music_catalog_service_searches_and_deduplicates_sources():
+    """
+    同步和异步音乐搜索都应保留来源身份并去重。
+    """
+    service = MusicCatalogService(
+        source_resolver=lambda source: _Source() if source == MediaSource.MusicBrainz else None,
+        warning=lambda _message: None,
+    )
+
+    assert len(service.search("artist title")) == 1
+    assert len(asyncio.run(service.async_search("artist title"))) == 1
+
+
+def test_music_catalog_service_isolates_failed_source():
+    """
+    一个来源失败不应阻断其它来源。
+    """
+    errors = []
+
+    class _Broken:
+        """
+        模拟目录搜索失败的音乐来源。
+        """
+
+        def search_music(self, *_args, **_kwargs):
+            """
+            模拟来源错误。
+            """
+            raise RuntimeError("broken")
+
+    service = MusicCatalogService(
+        source_resolver=lambda _source: _Broken(),
+        warning=errors.append,
+    )
+
+    assert service.search("artist title") == []
+    assert errors and "broken" in errors[0]
+
+
+def test_music_catalog_service_forwards_stable_entity_filter_to_every_source():
+    """
+    实体过滤即使由生成器传入，也应完整转发给每个音乐来源。
+    """
+    received = []
+
+    class _FilteredSource:
+        """
+        记录每次目录搜索收到的实体过滤参数。
+        """
+
+        def search_music(self, _meta, limit=20, music_types=None):
+            """
+            返回空候选并记录稳定的搜索参数。
+            """
+            received.append((limit, music_types))
+            return []
+
+    service = MusicCatalogService(
+        source_resolver=lambda _source: _FilteredSource(),
+        warning=lambda _message: None,
+    )
+
+    assert service.search(
+        "Hotel California",
+        media_source=(MediaSource.MusicBrainz, MediaSource.DoubanMusic),
+        music_types=(item for item in ["album"]),
+    ) == []
+    assert received == [(20, ("album",)), (20, ("album",))]
+
+
+def test_music_catalog_merge_keeps_later_source_with_full_first_page():
+    """
+    第一来源达到条数上限也不能挤掉后来来源的准确目标。
+    """
+    first = [MusicInfo(media_source=MediaSource.MusicBrainz, media_id=str(index), title=f"Other {index}") for index in range(30)]
+    second = MusicInfo(media_source=MediaSource.DoubanMusic, media_id="exact", title="Target")
+    result = MusicCatalogService.merge_sources([first, [second]], limit=30)
+    assert len(result) == 30
+    assert result[1] is second

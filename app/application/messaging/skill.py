@@ -1,0 +1,1308 @@
+"""
+技能目录浏览、市场来源管理与安装删除交互。
+"""
+
+import re
+import uuid
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, List, Optional, Protocol, Tuple, Union
+
+from app.application.messaging.interaction import (
+    MessageGateway,
+    _ExpiringUserInteractionStore,
+    build_navigation_buttons,
+    page_items,
+    supports_interaction_buttons,
+    update_or_post_message,
+)
+from app.schemas.message import Message
+from app.schemas.types import NotificationChannel
+
+
+class SkillCatalogPort(Protocol):
+    """
+    消息层使用的技能目录能力端口，由启动组合根注入具体实现。
+    """
+
+    def add_custom_market_source(self, source: str) -> Tuple[bool, str]:
+        """
+        添加一个自定义技能市场来源。
+
+        :param source: 用户输入的技能市场来源地址
+        :return: 是否添加成功及可向用户展示的结果说明
+        """
+
+    def remove_custom_market_source(self, source: str) -> Tuple[bool, str]:
+        """
+        移除一个自定义技能市场来源。
+
+        :param source: 待移除的自定义市场来源地址
+        :return: 是否移除成功及可向用户展示的结果说明
+        """
+
+    def install_market_skill(self, skill: Any) -> Tuple[bool, str]:
+        """
+        安装指定的市场技能。
+
+        :param skill: 从市场目录选出的技能条目，包含安装所需来源信息
+        :return: 是否安装成功及可向用户展示的结果说明
+        """
+
+    def list_local_skills(self) -> List[Any]:
+        """
+        列出本地技能。
+
+        :return: 当前已安装的本地技能条目列表
+        """
+
+    def remove_local_skill(self, skill_id: str) -> Tuple[bool, str]:
+        """
+        移除指定的本地技能。
+
+        :param skill_id: 待删除的本地技能标识
+        :return: 是否删除成功及可向用户展示的结果说明
+        """
+
+    def list_market_source_entries(self) -> List[Any]:
+        """
+        列出技能市场来源。
+
+        :return: 包含来源地址及展示信息的市场来源条目列表
+        """
+
+    def list_market_skills(self, force: bool = False) -> List[Any]:
+        """
+        列出市场技能。
+
+        :param force: 是否强制刷新市场目录，默认允许使用缓存
+        :return: 已配置市场提供的技能条目列表
+        """
+
+    def filter_market_skills(self, skills: List[Any], query: str) -> List[Any]:
+        """
+        按查询词过滤市场技能。
+
+        :param skills: 待筛选的市场技能条目
+        :param query: 用户输入的筛选关键词，空值保留全部条目
+        :return: 与关键词匹配的技能条目列表
+        """
+
+
+SkillCatalogProvider = Callable[[], SkillCatalogPort]
+_skill_catalog_provider: Optional[SkillCatalogProvider] = None
+
+
+def register_skill_catalog_provider(
+    provider: Optional[SkillCatalogProvider],
+) -> Optional[SkillCatalogProvider]:
+    """
+    注册技能目录 provider，并返回先前 provider 供失败回滚。
+    """
+    global _skill_catalog_provider
+    previous = _skill_catalog_provider
+    _skill_catalog_provider = provider
+    return previous
+
+
+def reset_skill_catalog_provider() -> None:
+    """
+    清除技能目录 provider，避免跨 lifespan 持有旧 Agent 实现。
+    """
+    register_skill_catalog_provider(None)
+
+
+def _resolve_skill_catalog() -> SkillCatalogPort:
+    """
+    解析已注入的技能目录；缺少组合根装配时给出明确错误。
+    """
+    if _skill_catalog_provider is None:
+        raise RuntimeError(
+            "技能目录服务未注册：请先导入 app.startup.initializers.agent "
+            "完成组合根装配"
+        )
+    return _skill_catalog_provider()
+
+
+@dataclass
+class PendingSkillInteraction:
+    """
+    记录一次 /skills 会话的上下文，便于按钮和文本回复共用同一状态。
+
+    :param request_id: 当前交互请求标识，用于校验按钮是否仍属于活动会话
+    :param user_id: 所属用户标识，用于隔离不同用户的交互状态
+    :param channel: 回复使用的通知渠道，None 表示未指定
+    :param source: 渠道实例标识，None 表示未指定实例
+    :param username: 用户显示名称，未知时为 None
+    :param view: 当前视图：root、installed、market 或 sources，默认主菜单
+    :param local_page: 本地技能列表页索引，从 0 开始
+    :param market_page: 市场技能列表页索引，从 0 开始
+    :param market_query: 市场筛选词，空字符串表示不按关键词筛选
+    :param awaiting_input: 等待的输入用途：market-search、source-add 或 None
+    :param created_at: 会话创建的本地时间，用于计算过期时间
+    :param selection_id: 最近一次列表展示的唯一标识，旧展示按钮不复用新列表序号
+    :param selection_view: 最近一次展示的列表类别，installed或market；尚未展示时为空
+    :param selection_items: 展示时条目的独立快照，操作仅按该快照定位身份
+    """
+
+    request_id: str
+    user_id: str
+    channel: Optional[NotificationChannel]
+    source: Optional[str]
+    username: Optional[str]
+    view: str = "root"
+    local_page: int = 0
+    market_page: int = 0
+    market_query: str = ""
+    awaiting_input: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    selection_id: str = ""
+    selection_view: str = ""
+    selection_items: List[Any] = field(default_factory=list)
+
+
+class SkillInteractionManager(
+        _ExpiringUserInteractionStore[PendingSkillInteraction]
+):
+    """
+    管理用户当前的技能交互状态。
+
+    每个用户同一时间只保留一个有效会话，避免旧按钮继续生效。
+    """
+
+    def create_or_replace(
+            self,
+            user_id: Union[str, int],
+            channel: Optional[NotificationChannel],
+            source: Optional[str],
+            username: Optional[str],
+    ) -> PendingSkillInteraction:
+        """
+        为用户创建新会话，并替换掉旧的技能交互状态。
+        """
+        with self._lock:
+            self._cleanup_locked()
+            user_key = str(user_id)
+            request_id = uuid.uuid4().hex[:12]
+            request = PendingSkillInteraction(
+                request_id=request_id,
+                user_id=user_key,
+                channel=channel,
+                source=source,
+                username=username,
+            )
+            self._replace_locked(request)
+            return request
+
+
+skill_interaction_manager = SkillInteractionManager()
+
+
+class SkillInteractionHandler:
+    """
+    处理 /skills 指令、按钮回调和文本式技能管理交互。
+    """
+
+    _button_page_size = 6
+    _text_page_size = 8
+
+    def __init__(
+            self,
+            messenger: MessageGateway,
+            skill_catalog: Optional[SkillCatalogPort] = None,
+            skill_helper: Optional[SkillCatalogPort] = None,
+    ) -> None:
+        """
+        注入消息接口和技能目录端口，保留旧 ``skill_helper`` 关键字。
+        """
+        self._messenger = messenger
+        self.skillhelper = skill_catalog or skill_helper or _resolve_skill_catalog()
+
+    def remote_manage(
+            self,
+            arg_str: str,
+            channel: NotificationChannel,
+            userid: Union[str, int],
+            source: Optional[str] = None,
+    ) -> None:
+        """
+        /skills 入口。创建新会话并渲染首屏菜单。
+        """
+        request = skill_interaction_manager.create_or_replace(
+            user_id=userid,
+            channel=channel,
+            source=source,
+            username=None,
+        )
+        normalized_arg = (arg_str or "").strip()
+        force = normalized_arg.lower() in {"refresh", "刷新"}
+        search_query = self._extract_market_search_query(normalized_arg) or (
+            "" if force else normalized_arg
+        )
+        if search_query:
+            request.view = "market"
+            request.market_query = search_query
+        self._render_interaction(
+            request=request,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=None,
+            force_market_refresh=force,
+        )
+
+    @staticmethod
+    def parse_callback(callback_data: str) -> Optional[Tuple[str, str, Optional[int]]]:
+        """
+        解析 /skills 按钮回调。
+
+        导航格式：skills:{request_id}:{action}[:index]。
+        安装/删除格式：skills:{request_id}:{action}:{index}:{selection_id}，展示标识另行校验。
+        """
+        if not callback_data.startswith("skills:"):
+            return None
+        parts = callback_data.split(":")
+        if len(parts) < 3:
+            return None
+        request_id = parts[1]
+        action = parts[2]
+        index = None
+        if len(parts) >= 4 and parts[3].isdigit():
+            index = int(parts[3])
+        return request_id, action, index
+
+    def handle_callback_interaction(
+            self,
+            callback_data: str,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        处理 /skills 回调并保持消息链公开 ABI。
+        """
+        return self._handle_callback_interaction(
+            callback_data,
+            channel,
+            source,
+            userid,
+            username,
+            original_message_id,
+            original_chat_id,
+        )
+
+    def _handle_callback_interaction(
+            self,
+            callback_data: str,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        处理按钮交互，并在同一条消息上刷新当前视图。
+        """
+        parsed = self.parse_callback(callback_data)
+        if not parsed:
+            return False
+
+        request_id, action, index = parsed
+        request = skill_interaction_manager.get_by_id(request_id, userid)
+        if not request:
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="技能交互已失效，请重新发送 /skills",
+                )
+            )
+            return True
+
+        if self._selection_callback_is_stale(request, action, callback_data):
+            self._messenger.post_message(Message(channel=channel, source=source, userid=userid,
+                username=username, title="技能列表已变化，请使用最新列表重新选择"))
+            return True
+
+        request.channel = channel
+        request.source = source
+        request.username = username
+
+        if action == "close":
+            skill_interaction_manager.remove(request.request_id)
+            self._update_or_post_message(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="技能管理",
+                text="技能交互已结束",
+                original_message_id=original_message_id,
+                original_chat_id=original_chat_id,
+            )
+            return True
+
+        if action == "root":
+            request.view = "root"
+            request.awaiting_input = None
+        elif action == "installed":
+            request.view = "installed"
+            request.local_page = 0
+            request.awaiting_input = None
+        elif action == "market":
+            request.view = "market"
+            request.market_page = 0
+            request.awaiting_input = None
+        elif action == "sources":
+            request.view = "sources"
+            request.awaiting_input = None
+        elif action == "search":
+            request.view = "market"
+            request.awaiting_input = "market-search"
+        elif action == "source-add":
+            request.view = "sources"
+            request.awaiting_input = "source-add"
+        elif action == "clear-search":
+            self._clear_market_search(request)
+        elif action == "refresh":
+            request.awaiting_input = None
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                original_message_id=original_message_id,
+                original_chat_id=original_chat_id,
+                force_market_refresh=True,
+            )
+            return True
+        elif action == "page-next":
+            request.awaiting_input = None
+            if request.view == "installed":
+                request.local_page += 1
+            elif request.view == "market":
+                request.market_page += 1
+        elif action == "page-prev":
+            request.awaiting_input = None
+            if request.view == "installed":
+                request.local_page = max(0, request.local_page - 1)
+            elif request.view == "market":
+                request.market_page = max(0, request.market_page - 1)
+        elif action == "install" and index:
+            request.awaiting_input = None
+            _, message = self._install_market_skill(request, index)
+            self._messenger.post_message(Message(channel=channel, source=source, userid=userid,
+                                                username=username, title=message))
+        elif action == "remove" and index:
+            request.awaiting_input = None
+            success, message = self._remove_local_skill(request, index)
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            if not success:
+                # 保持当前页
+                pass
+        elif action == "source-remove" and index:
+            request.view = "sources"
+            request.awaiting_input = None
+            success, message = self._remove_market_source(index)
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+
+        self._render_interaction(
+            request=request,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+        return True
+
+    def handle_text_interaction(
+            self,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
+    ) -> bool:
+        """
+        处理 /skills 文本交互并保持消息链公开 ABI。
+        """
+        return self._handle_text_interaction(channel, source, userid, username, text)
+
+    def _handle_text_interaction(
+            self,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
+    ) -> bool:
+        """
+        处理不支持按钮渠道上的文本指令，也兼容用户直接回复文字操作。
+        """
+        request = skill_interaction_manager.get_by_user(userid)
+        if not request:
+            return False
+
+        request.channel = channel
+        request.source = source
+        request.username = username
+
+        normalized = (text or "").strip()
+        lowered = normalized.lower()
+        if lowered in {"退出", "关闭", "q", "quit", "exit"}:
+            skill_interaction_manager.remove(request.request_id)
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="技能交互已结束",
+                    save_history=False,
+                )
+            )
+            return True
+
+        if lowered in {"返回", "back"}:
+            request.view = "root"
+            request.awaiting_input = None
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        add_source = self._extract_market_source_input(normalized)
+        remove_source_match = re.match(
+            r"^(?:删除源|移除源|删除仓库|移除仓库|remove source)\s*(\d+)$",
+            normalized,
+            re.IGNORECASE,
+        )
+
+        if add_source:
+            request.view = "sources"
+            request.awaiting_input = None
+            _, message = self.skillhelper.add_custom_market_source(add_source)
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if remove_source_match:
+            request.view = "sources"
+            request.awaiting_input = None
+            _, message = self._remove_market_source(
+                page_index=int(remove_source_match.group(1))
+            )
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"刷新", "refresh"}:
+            request.awaiting_input = None
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                force_market_refresh=True,
+            )
+            return True
+
+        if lowered in {"p", "prev", "上一页"}:
+            request.awaiting_input = None
+            if request.view == "installed":
+                request.local_page = max(0, request.local_page - 1)
+            elif request.view == "market":
+                request.market_page = max(0, request.market_page - 1)
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"n", "next", "下一页"}:
+            request.awaiting_input = None
+            if request.view == "installed":
+                request.local_page += 1
+            elif request.view == "market":
+                request.market_page += 1
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if request.view == "root":
+            if lowered in {"1", "已安装", "本地", "local"}:
+                request.view = "installed"
+            elif lowered in {"2", "市场", "market"}:
+                request.view = "market"
+            elif lowered in {"3", "技能源", "源", "sources", "source"}:
+                request.view = "sources"
+            elif self._extract_market_search_query(normalized):
+                self._apply_market_search(
+                    request,
+                    self._extract_market_search_query(normalized),
+                )
+            else:
+                self._messenger.post_message(
+                    Message(
+                        channel=channel,
+                        source=source,
+                        userid=userid,
+                        username=username,
+                        title="请输入 `1` 查看已安装技能，`2` 查看技能市场，3 管理技能源，或回复 `刷新/退出`",
+                    )
+                )
+                return True
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if request.awaiting_input == "source-add":
+            if lowered in {"取消", "cancel"}:
+                request.awaiting_input = None
+            else:
+                _, message = self.skillhelper.add_custom_market_source(normalized)
+                request.awaiting_input = None
+                self._messenger.post_message(
+                    Message(
+                        channel=channel,
+                        source=source,
+                        userid=userid,
+                        username=username,
+                        title=message,
+                    )
+                )
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"清除搜索", "取消搜索", "clear", "clear search"}:
+            if request.view == "market" or request.market_query:
+                self._clear_market_search(request)
+                self._render_interaction(
+                    request=request,
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                )
+                return True
+
+        if request.awaiting_input == "market-search":
+            if lowered in {"取消", "cancel"}:
+                request.awaiting_input = None
+            else:
+                search_query = self._extract_market_search_query(normalized) or normalized
+                self._apply_market_search(request, search_query)
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        search_query = self._extract_market_search_query(normalized)
+        if search_query:
+            self._apply_market_search(request, search_query)
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        install_match = re.match(r"^(?:安装|装)\s*(\d+)$", normalized)
+        remove_match = re.match(r"^(?:删除|删)\s*(\d+)$", normalized)
+        if request.view == "market" and install_match:
+            request.awaiting_input = None
+            success, message = self._install_market_skill(
+                request=request,
+                page_index=int(install_match.group(1)),
+            )
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+        if request.view == "installed" and remove_match:
+            request.awaiting_input = None
+            _, message = self._remove_local_skill(
+                request=request,
+                page_index=int(remove_match.group(1)),
+            )
+            self._messenger.post_message(
+                Message(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        self._messenger.post_message(
+            Message(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title=self._build_usage_hint(request.view),
+            )
+        )
+        return True
+
+    @staticmethod
+    def _selection_callback_is_stale(request: PendingSkillInteraction, action: str, callback_data: str) -> bool:
+        """
+        核对安装/删除按钮的展示标识及当前视图，旧列表不能沿用新序号。
+
+        :param request: 当前技能交互会话
+        :param action: 解析后的按钮动作
+        :param callback_data: 包含展示标识的完整按钮数据
+        :return: 属于安装/删除且展示已失效时为True，其它导航动作不受影响
+        """
+        expected_view = {"install": "market", "remove": "installed"}.get(action)
+        return expected_view is not None and (
+            callback_data.split(":")[4:] != [request.selection_id]
+            or request.selection_view != expected_view or request.view != expected_view
+        )
+
+    def _install_market_skill(
+            self,
+            request: PendingSkillInteraction,
+            page_index: int,
+    ) -> Tuple[bool, str]:
+        """
+        按展示快照的可见序号安装技能，不重新按实时目录计算序号。
+        """
+        items = request.selection_items if request.selection_view == "market" else []
+        if page_index < 1 or page_index > len(items):
+            return False, "安装序号无效"
+        return self.skillhelper.install_market_skill(items[page_index - 1])
+
+    def _remove_local_skill(
+            self,
+            request: PendingSkillInteraction,
+            page_index: int,
+    ) -> Tuple[bool, str]:
+        """
+        按展示快照删除对应技能，目标变化或内置技能不会被删除。
+        """
+        items = request.selection_items if request.selection_view == "installed" else []
+        if page_index < 1 or page_index > len(items):
+            return False, "删除序号无效"
+        target = items[page_index - 1]
+        if target not in self.skillhelper.list_local_skills():
+            return False, "技能列表已变化，请刷新后重新选择"
+        if not target.removable:
+            return False, f"技能 {target.id} 是内置技能，不能删除"
+        return self.skillhelper.remove_local_skill(target.id)
+
+    def _remove_market_source(self, page_index: int) -> Tuple[bool, str]:
+        """
+        按当前源列表序号删除自定义技能源，避免误删内置默认源。
+        """
+        sources = self.skillhelper.list_market_source_entries()
+        if page_index < 1 or page_index > len(sources):
+            return False, "删除源序号无效"
+        target = sources[page_index - 1]
+        if not target.removable:
+            return False, f"技能源 {target.label} 是内置默认源，不能删除"
+        return self.skillhelper.remove_custom_market_source(target.source)
+
+    def _render_interaction(
+            self,
+            request: PendingSkillInteraction,
+            channel: NotificationChannel,
+            source: Optional[str],
+            userid: Union[str, int],
+            username: Optional[str],
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+            force_market_refresh: bool = False,
+    ) -> None:
+        """
+        根据当前视图生成内容，并选择编辑原消息或发送新消息。
+        """
+        if request.view == "installed":
+            title, text, buttons = self._build_installed_view(
+                request=request
+            )
+        elif request.view == "market":
+            title, text, buttons = self._build_market_view(
+                request=request,
+                force_market_refresh=force_market_refresh,
+            )
+        elif request.view == "sources":
+            title, text, buttons = self._build_sources_view(
+                request=request,
+            )
+        else:
+            title, text, buttons = self._build_root_view(
+                request=request,
+                force_market_refresh=force_market_refresh,
+            )
+
+        self._update_or_post_message(
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            title=title,
+            text=text,
+            buttons=buttons,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+
+    def _build_root_view(
+            self,
+            request: PendingSkillInteraction,
+            force_market_refresh: bool = False,
+    ) -> Tuple[str, str, Optional[List[List[dict[str, str]]]]]:
+        """
+        构建根菜单视图，汇总本地技能和市场概览。
+        """
+        local_skills = self.skillhelper.list_local_skills()
+        market_skills = [
+            skill
+            for skill in self.skillhelper.list_market_skills(force=force_market_refresh)
+            if not skill.installed
+        ]
+        source_entries = self.skillhelper.list_market_source_entries()
+        source_lines = []
+        for index, source_entry in enumerate(source_entries, start=1):
+            state = "内置" if source_entry.builtin else "自定义"
+            source_lines.append(
+                f"{index}. {source_entry.label}（{state}）"
+            )
+
+        text_lines = [
+            f"已安装技能：{len(local_skills)}",
+            f"市场可安装技能：{len(market_skills)}",
+        ]
+        if source_lines:
+            text_lines.extend(["", "当前技能源：", *source_lines])
+        text_lines.extend(
+            [
+                "",
+                "1. 查看已安装技能",
+                "2. 浏览技能市场",
+                "3. 管理技能源",
+                "回复 `刷新` 重新获取市场数据，回复 `退出` 结束交互",
+            ]
+        )
+
+        buttons = None
+        if self._supports_interactive_buttons(request.channel):
+            buttons = [
+                [{"text": "已安装技能", "callback_data": f"skills:{request.request_id}:installed"}],
+                [{"text": "技能市场", "callback_data": f"skills:{request.request_id}:market"}],
+                [{"text": "技能源管理", "callback_data": f"skills:{request.request_id}:sources"}],
+                [
+                    {"text": "刷新市场", "callback_data": f"skills:{request.request_id}:refresh"},
+                    {"text": "关闭", "callback_data": f"skills:{request.request_id}:close"},
+                ],
+            ]
+        return "技能管理", "\n".join(text_lines), buttons
+
+    def _build_installed_view(
+            self,
+            request: PendingSkillInteraction
+    ) -> Tuple[str, str, Optional[List[List[dict[str, str]]]]]:
+        """
+        构建已安装技能视图，列出来源和可删除状态。
+        """
+        local_skills = self.skillhelper.list_local_skills()
+        items, page, total_pages = self._page_items(
+            items=local_skills,
+            page=request.local_page,
+            page_size=self._page_size(request.channel),
+        )
+        request.local_page = page
+        request.selection_id = uuid.uuid4().hex[:12]
+        request.selection_view = "installed"
+        request.selection_items = deepcopy(items)
+
+        text_lines = [f"第 {page + 1}/{total_pages} 页，共 {len(local_skills)} 个技能"]
+        if not items:
+            text_lines.append("")
+            text_lines.append("当前没有已安装技能")
+        else:
+            for index, skill in enumerate(items, start=1):
+                action = "可删除" if skill.removable else "内置不可删"
+                text_lines.extend(
+                    [
+                        "",
+                        f"{index}. {skill.id} ({skill.source_label}，{action})",
+                        self._truncate(skill.description),
+                    ]
+                )
+
+        text_lines.extend(
+            [
+                "",
+                "回复 `删除 <序号>` 删除技能，回复 `n/p` 翻页，回复 `返回` 回到菜单，回复 `退出` 结束交互",
+            ]
+        )
+
+        buttons = None
+        if self._supports_interactive_buttons(request.channel):
+            buttons = []
+            for index, skill in enumerate(items, start=1):
+                if not skill.removable:
+                    continue
+                buttons.append(
+                    [
+                        {
+                            "text": f"删除 {index}",
+                            "callback_data": f"skills:{request.request_id}:remove:{index}:{request.selection_id}",
+                        }
+                    ]
+                )
+            buttons.extend(self._navigation_buttons(request, page, total_pages))
+            buttons.append(
+                [
+                    {"text": "返回", "callback_data": f"skills:{request.request_id}:root"},
+                    {"text": "关闭", "callback_data": f"skills:{request.request_id}:close"},
+                ]
+            )
+        return "已安装技能", "\n".join(text_lines), buttons
+
+    def _build_market_view(
+            self,
+            request: PendingSkillInteraction,
+            force_market_refresh: bool = False,
+    ) -> Tuple[str, str, Optional[List[List[dict[str, str]]]]]:
+        """
+        构建技能市场视图，仅展示尚未安装的技能。
+        """
+        market_skills = self._get_market_skills(
+            request=request,
+            force_market_refresh=force_market_refresh,
+        )
+        items, page, total_pages = self._page_items(
+            items=market_skills,
+            page=request.market_page,
+            page_size=self._page_size(request.channel),
+        )
+        request.market_page = page
+        request.selection_id = uuid.uuid4().hex[:12]
+        request.selection_view = "market"
+        request.selection_items = deepcopy(items)
+
+        text_lines = [f"第 {page + 1}/{total_pages} 页，共 {len(market_skills)} 个可安装技能"]
+        if request.market_query:
+            text_lines.append(f"当前搜索：{request.market_query}")
+        if request.awaiting_input == "market-search":
+            text_lines.extend(
+                [
+                    "",
+                    "搜索输入中：直接回复关键词即可筛选市场技能，回复 `取消` 结束输入。",
+                ]
+            )
+        if not items:
+            text_lines.append("")
+            if request.market_query:
+                text_lines.append("当前搜索没有匹配的市场技能")
+            else:
+                text_lines.append("当前没有可安装的市场技能")
+        else:
+            for index, skill in enumerate(items, start=1):
+                text_lines.extend(
+                    [
+                        "",
+                        f"{index}. {skill.id} ({skill.source_label})",
+                        self._truncate(skill.description),
+                    ]
+                )
+                if skill.source_type == "registry":
+                    text_lines.append("社区源，安装前请自行甄别安全性")
+
+        if any(skill.source_type == "registry" for skill in items):
+            text_lines.extend(
+                [
+                    "",
+                    "提示：ClawHub 属于社区注册表，技能质量与安全性需要自行甄别。",
+                ]
+            )
+
+        text_lines.extend(
+            [
+                "",
+                "回复 `搜索 <关键词>` 筛选技能，回复 `清除搜索` 恢复全量列表，回复 `安装 <序号>` 安装技能，回复 `刷新` 重新拉取市场，回复 `n/p` 翻页，回复 `返回` 回到菜单，回复 `退出` 结束交互",
+            ]
+        )
+
+        buttons = None
+        if self._supports_interactive_buttons(request.channel):
+            buttons = []
+            search_row = []
+            if request.market_query:
+                search_row.append(
+                    {
+                        "text": "清除搜索",
+                        "callback_data": f"skills:{request.request_id}:clear-search",
+                    }
+                )
+            else:
+                search_row.append(
+                    {
+                        "text": "搜索",
+                        "callback_data": f"skills:{request.request_id}:search",
+                    }
+                )
+            if search_row:
+                buttons.append(search_row)
+            for index, _skill in enumerate(items, start=1):
+                buttons.append(
+                    [
+                        {
+                            "text": f"安装 {index}",
+                            "callback_data": f"skills:{request.request_id}:install:{index}:{request.selection_id}",
+                        }
+                    ]
+                )
+            buttons.extend(self._navigation_buttons(request, page, total_pages))
+            buttons.append(
+                [
+                    {"text": "刷新", "callback_data": f"skills:{request.request_id}:refresh"},
+                    {"text": "返回", "callback_data": f"skills:{request.request_id}:root"},
+                    {"text": "关闭", "callback_data": f"skills:{request.request_id}:close"},
+                ]
+            )
+        return "技能市场", "\n".join(text_lines), buttons
+
+    def _build_sources_view(
+            self,
+            request: PendingSkillInteraction,
+    ) -> Tuple[str, str, Optional[List[List[dict[str, str]]]]]:
+        """
+        构建技能源管理视图，提供自定义 GitHub 源的增删入口。
+        """
+        sources = self.skillhelper.list_market_source_entries()
+        custom_count = len([source for source in sources if not source.builtin])
+        text_lines = [
+            f"当前技能源：{len(sources)}",
+            f"自定义技能源：{custom_count}",
+        ]
+        if request.awaiting_input == "source-add":
+            text_lines.extend(
+                [
+                    "",
+                    "添加输入中：直接回复 GitHub 仓库地址即可。",
+                    "支持 owner/repo、https://github.com/owner/repo，或 /tree/<branch>/<skills_path> 形式。",
+                    "回复 `取消` 结束输入。",
+                ]
+            )
+
+        if not sources:
+            text_lines.extend(["", "当前没有可用技能源"])
+        else:
+            for index, market_source in enumerate(sources, start=1):
+                state = "自定义可删" if market_source.removable else "内置默认"
+                text_lines.extend(
+                    [
+                        "",
+                        f"{index}. {market_source.label}（{state}）",
+                        self._truncate(market_source.source, limit=200),
+                    ]
+                )
+
+        text_lines.extend(
+            [
+                "",
+                "回复 `添加源 <GitHub仓库地址>` 添加自定义源，回复 `删除源 <序号>` 删除自定义源，回复 `返回` 回到菜单，回复 `退出` 结束交互",
+            ]
+        )
+
+        buttons = None
+        if self._supports_interactive_buttons(request.channel):
+            buttons = [
+                [
+                    {
+                        "text": "添加自定义源",
+                        "callback_data": f"skills:{request.request_id}:source-add",
+                    }
+                ]
+            ]
+            for index, market_source in enumerate(sources, start=1):
+                if not market_source.removable:
+                    continue
+                buttons.append(
+                    [
+                        {
+                            "text": f"删除 {index}",
+                            "callback_data": f"skills:{request.request_id}:source-remove:{index}",
+                        }
+                    ]
+                )
+            buttons.append(
+                [
+                    {"text": "返回", "callback_data": f"skills:{request.request_id}:root"},
+                    {"text": "关闭", "callback_data": f"skills:{request.request_id}:close"},
+                ]
+            )
+        return "技能源管理", "\n".join(text_lines), buttons
+
+    @staticmethod
+    def _truncate(text: str, limit: int = 140) -> str:
+        """
+        对技能描述做轻量截断，避免消息过长。
+        """
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    @staticmethod
+    def _page_items(
+            items: List[Any],
+            page: int,
+            page_size: int,
+    ) -> Tuple[List[Any], int, int]:
+        """
+        返回当前页的数据，并把页码钳制到有效范围内。
+        """
+        return page_items(items=items, page=page, page_size=page_size)
+
+    def _page_size(self, channel: Optional[NotificationChannel]) -> int:
+        """
+        按渠道能力选择分页大小，按钮渠道单页更短，便于直接操作。
+        """
+        return (
+            self._button_page_size
+            if self._supports_interactive_buttons(channel)
+            else self._text_page_size
+        )
+
+    @staticmethod
+    def _supports_interactive_buttons(channel: Optional[NotificationChannel]) -> bool:
+        """
+        判断当前渠道是否同时支持按钮展示和回调。
+        """
+        return supports_interaction_buttons(channel)
+
+    @staticmethod
+    def _navigation_buttons(
+            request: PendingSkillInteraction,
+            page: int,
+            total_pages: int,
+    ) -> List[List[dict[str, str]]]:
+        """
+        为分页视图生成上一页和下一页按钮。
+        """
+        return build_navigation_buttons(
+            prefix="skills",
+            request=request,
+            page=page,
+            total_pages=total_pages,
+        )
+
+    def _update_or_post_message(
+            self,
+            channel: NotificationChannel,
+            source: Optional[str],
+            userid: Union[str, int],
+            username: Optional[str],
+            title: str,
+            text: str,
+            buttons: Optional[List[List[dict[str, str]]]] = None,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> None:
+        """
+        优先编辑原消息，编辑失败时再回退为发送新消息。
+        """
+        update_or_post_message(
+            chain=self._messenger,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            title=title,
+            text=text,
+            buttons=buttons,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+
+    @staticmethod
+    def _build_usage_hint(view: str) -> str:
+        """
+        根据当前视图返回可执行的文本命令提示。
+        """
+        if view == "market":
+            return "请输入 搜索 <关键词>、清除搜索、安装 <序号>、刷新、n、p、返回 或 退出"
+        if view == "installed":
+            return "请输入 删除 <序号>、n、p、返回 或 退出"
+        if view == "sources":
+            return "请输入 添加源 <GitHub仓库地址>、删除源 <序号>、返回 或 退出"
+        return "请输入 1、2、3、搜索 <关键词>、刷新 或 退出"
+
+    def _get_market_skills(
+            self,
+            request: PendingSkillInteraction,
+            force_market_refresh: bool = False,
+    ) -> List[Any]:
+        """
+        获取当前 /skills 会话可见的市场技能，并应用搜索词过滤。
+        """
+        skills = [
+            skill
+            for skill in self.skillhelper.list_market_skills(force=force_market_refresh)
+            if not skill.installed
+        ]
+        if not request.market_query:
+            return skills
+        return self.skillhelper.filter_market_skills(
+            skills=skills,
+            query=request.market_query,
+        )
+
+    @staticmethod
+    def _extract_market_search_query(text: str) -> str:
+        """
+        从文本命令中提取市场搜索词，兼容“搜索/查找/查”前缀。
+        """
+        normalized = (text or "").strip()
+        if not normalized:
+            return ""
+        match = re.match(r"^(?:搜索|查找|查)\s+(.+)$", normalized)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _extract_market_source_input(text: str) -> str:
+        """
+        从文本命令中提取自定义技能源地址。
+        """
+        normalized = (text or "").strip()
+        if not normalized:
+            return ""
+        match = re.match(
+            r"^(?:添加源|新增源|添加仓库|新增仓库|add source)\s+(.+)$",
+            normalized,
+            re.IGNORECASE,
+        )
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _apply_market_search(
+            request: PendingSkillInteraction,
+            query: str,
+    ) -> None:
+        """
+        将会话切到市场搜索结果视图，并重置分页状态。
+        """
+        request.view = "market"
+        request.market_query = (query or "").strip()
+        request.market_page = 0
+        request.awaiting_input = None
+
+    @staticmethod
+    def _clear_market_search(request: PendingSkillInteraction) -> None:
+        """
+        清除当前市场搜索状态，恢复全量市场列表。
+        """
+        request.market_query = ""
+        request.market_page = 0
+        request.awaiting_input = None
