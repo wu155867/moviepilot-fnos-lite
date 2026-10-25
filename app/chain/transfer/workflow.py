@@ -400,9 +400,20 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 for selected_fileitem in selected_fileitems
                 if (latest_fileitem := storage_chain.get_item(selected_fileitem))
             ]
-        return [
+        filtered = [
             (item, is_bluray_dir) for item, is_bluray_dir in candidates if is_allowed(item, is_bluray_dir)
-        ], matched_template
+        ]
+        # 字幕/音轨等附件只能跟随视频主文件整理，批次内没有视频时全部跳过，
+        # 避免 English.srt 这类文件被单独识别为电影入库。
+        if batch_mtype is not MediaType.MUSIC and filtered:
+            has_video = any(
+                is_bluray_dir_flag or self._is_media_file(item, batch_mtype)
+                for item, is_bluray_dir_flag in filtered
+            )
+            if not has_video:
+                logger.info(f"{fileitem.path or fileitem.name} 批次内没有视频文件，跳过字幕/音轨等附件的独立整理")
+                return [], matched_template
+        return filtered, matched_template
 
     def do_transfer(
         self,
