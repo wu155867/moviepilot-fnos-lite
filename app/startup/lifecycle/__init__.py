@@ -64,6 +64,7 @@ from app.startup.initializers.plugins import (
     sync_plugins,
 )
 from app.startup.initializers.routers import init_routers
+from app.startup.initializers.static_frontend import init_frontend_static
 from app.startup.initializers.scheduler import (
     init_plugin_scheduler,
     init_scheduler,
@@ -522,6 +523,13 @@ def build_lifecycle_components(app: FastAPI) -> tuple[LifecycleComponent, ...]:
             start=lambda: init_routers(app, get_runtime_setting('API_V1_STR')),
             start_order=60,
             start_timeout_seconds=30,
+        ),
+        LifecycleComponent(
+            name="前端静态资源",
+            dependencies=("路由",),
+            start=lambda: init_frontend_static(app),
+            start_order=61,
+            start_timeout_seconds=10,
         ),
         LifecycleComponent(
             name="插件运行时装配",

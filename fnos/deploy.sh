@@ -26,7 +26,7 @@ VPIP="$ROOT/.venv-linux/bin/pip"
 
 echo "==> 3/4 安装依赖（清华镜像）"
 "$VPIP" install -q --upgrade pip
-"$VPIP" install -q -i "$PIP_MIRROR" -e "$ROOT"
+"$VPIP" install -q -i "$PIP_MIRROR" $(.venv-linux/bin/python -c "import tomllib;print(' '.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))")
 
 echo "==> 4/4 写入默认环境配置"
 mkdir -p "$ROOT/config"
