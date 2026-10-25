@@ -354,7 +354,7 @@ class ConfigModel(BaseModel):
 
     # TMDB配置
     TMDB_IMAGE_DOMAIN: str = Field(default="image.tmdb.org", description='TMDB图片地址')
-    TMDB_API_DOMAIN: str = Field(default="api.themoviedb.org", description='TMDB API地址')
+    TMDB_API_DOMAIN: str = Field(default="api.tmdb.org", description='TMDB API地址')
     TMDB_LOCALE: str = Field(default="zh", description='TMDB元数据语言')
     EMPTY_RESULT_CACHE_TTL: int = Field(default=30 * 60, description='TMDB空结果缓存独立过期时间（秒），故障期间产生的空响应快速过期，故障自愈后可自然恢复')
     TMDB_SCRAP_ORIGINAL_IMAGE: bool = Field(default=False, description='刮削使用TMDB原始语种图片')
