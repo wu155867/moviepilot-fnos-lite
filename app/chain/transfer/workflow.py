@@ -28,6 +28,7 @@ from app.application.transfer.workflow import (
 )
 from app.chain.media import MediaChain
 from app.chain.storage import StorageChain
+from app.runtime.settings import get_runtime_setting
 from app.chain.transfer.contract import _TransferOwnerBase
 from app.domain.context import MediaInfo, MusicAlbumInfo, MusicInfo
 from app.domain.meta.metabase import MetaBase
@@ -420,7 +421,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         library_category_folder: Optional[bool] = None,
         season: Optional[int] = None,
         epformat: Optional[EpisodeFormat] = None,
-        min_filesize: Optional[int] = 0,
+        min_filesize: Optional[int] = 0,  # noqa: FBT001
         downloader: Optional[str] = None,
         download_hash: Optional[str] = None,
         force: Optional[bool] = False,
@@ -495,7 +496,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         library_category_folder: Optional[bool] = None,
         season: Optional[int] = None,
         epformat: Optional[EpisodeFormat] = None,
-        min_filesize: Optional[int] = 0,
+        min_filesize: Optional[int] = 0,  # noqa: FBT001
         downloader: Optional[str] = None,
         download_hash: Optional[str] = None,
         force: Optional[bool] = False,
@@ -610,7 +611,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             file_items, matched_episode_format_template = self._collect_transfer_candidates(
                 fileitem=fileitem,
                 batch_mtype=batch_mtype,
-                min_filesize=min_filesize or 0,
+                min_filesize=min_filesize or get_runtime_setting('TRANSFER_MIN_FILESIZE') or 0,
                 epformat=epformat,
                 season=season,
                 continue_callback=continue_callback,
