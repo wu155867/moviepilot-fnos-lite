@@ -442,9 +442,9 @@ class ManualTransferTargetPath(BaseModel):
     target_storage: Optional[str] = Field(default=None, description="目标存储")
     target_path: Optional[str] = Field(default=None, description="目标路径")
     transfer_type: Optional[str] = Field(default=None, description="整理方式")
-    scrape: Optional[bool] = Field(default=False, description="刮削")
-    library_type_folder: Optional[bool] = Field(default=False, description="媒体库类型子目录")
-    library_category_folder: Optional[bool] = Field(default=False, description="媒体库类别子目录")
+    scrape: Optional[bool] = Field(default=True, description="刮削")
+    library_type_folder: Optional[bool] = Field(default=True, description="媒体库类型子目录")
+    library_category_folder: Optional[bool] = Field(default=True, description="媒体库类别子目录")
 
 
 class ManualTransferPreviewSummary(BaseModel):
