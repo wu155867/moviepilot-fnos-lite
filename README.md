@@ -1,88 +1,59 @@
-# MoviePilot
+# MP入库助手 (moviepilot-fnos-lite)
 
-简体中文 | [English](README_EN.md)
+基于 [MoviePilot](https://github.com/jxxghp/MoviePilot) 裁剪的**飞牛 fnOS 原生应用**（FPK 格式），专注做好一件事：**影视文件的识别、刮削与整理入库**。原生运行、内置 Python 运行时，**无需 Docker**，安装即用。
 
-![GitHub Repo stars](https://img.shields.io/github/stars/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub forks](https://img.shields.io/github/forks/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub contributors](https://img.shields.io/github/contributors/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub repo size](https://img.shields.io/github/repo-size/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub issues](https://img.shields.io/github/issues/jxxghp/MoviePilot?style=for-the-badge)
-![Docker Pulls](https://img.shields.io/docker/pulls/jxxghp/moviepilot?style=for-the-badge)
-![Docker Pulls V2](https://img.shields.io/docker/pulls/jxxghp/moviepilot-v2?style=for-the-badge)
-![Docker Pulls V3](https://img.shields.io/docker/pulls/jxxghp/moviepilot-v3?style=for-the-badge)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Synology-blue?style=for-the-badge)
+> 上游项目：[jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot)（GPL-3.0）
+> 本项目为函数级裁剪衍生版，遵守 GPL-3.0 协议开源。
 
-基于 [NAStool](https://github.com/NAStool/nas-tools) 部分代码重新设计，聚焦自动化核心需求，减少问题同时更易于扩展和维护。
+## ✨ 功能
 
-# 仅用于学习交流使用，请勿在任何国内平台宣传该项目！
+### 保留的核心功能
+- **媒体识别**：文件名解析 + TMDB / 豆瓣 / Bangumi 元数据识别
+- **TMDB 刮削**：海报、简介、演员等元数据自动刮削
+- **目录扫描整理**：监控下载目录，识别 → 重命名 → 入库媒体库
+- **qBittorrent 对接**：下载器管理与下载完成自动整理
+- **Emby / Jellyfin / Plex** 媒体服务器对接
+- **媒体库分类**：电影 / 电视剧按类型、类别自动归档
 
-发布频道：https://t.me/moviepilot_channel
+### 相比上游的定制（开箱即用默认值）
+| 项目 | 默认行为 |
+|---|---|
+| 整理方式 | **硬链接**（不占双份空间，同卷秒完成） |
+| 刮削元数据 | **开启** |
+| 类型子目录（电影/电视剧） | **开启** |
+| 类别子目录（华语/外语/动画等） | **开启** |
+| TMDB API 域名 | `api.tmdb.org`（国内可直连，无需代理） |
+| 广告文件过滤 | 10MB 以下小文件不参与整理 |
+| 字幕/音轨 | 不会被误识别为独立影片入库 |
 
-## 主要特性
+### 已移除的 PT 相关功能
+- PT 站点认证、用户认证（不再有认证失败消息）
+- 站点管理、站点数据刷新、站点资源更新
+- 订阅、推荐（含相关定时任务与菜单）
+- Indexer 索引器、Transmission/rTorrent 下载器
+- Telegram / WeChat / Slack 等消息推送
 
-- 聚焦影视自动化的核心流程：订阅、搜索、下载、整理、刮削、媒体库刷新与消息通知。
-- 前后端分离，后端基于 FastAPI，前端基于 Vue 3，部署和扩展边界更清晰。
-- 支持下载器、媒体服务器、元数据源、消息渠道、插件、工作流和 AI Agent 等能力组合。
-- 更完整的功能介绍、截图和使用入口见官网：https://movie-pilot.org
+## 📦 安装（飞牛 fnOS）
 
-## 安装使用
+### 方式一：应用中心手动安装
+1. 下载 [Releases](https://github.com/wu155867/moviepilot-fnos-lite/releases) 最新 `.fpk`
+2. fnOS 桌面 → **应用中心** → 右上角菜单 → **手动安装** → 上传 fpk
+3. 安装完成，桌面出现「MP入库助手」图标
 
-推荐优先使用 Docker 部署。V3 使用独立镜像 `jxxghp/moviepilot-v3`，V2 和旧版镜像保持原命名。Compose 示例、环境变量、目录映射和升级方式以官方 Wiki 为准：
-
-- 官方 Wiki：https://wiki.movie-pilot.org
-- V2 到 V3 版本变化总览：[docs/v2-to-v3-overview.md](docs/v2-to-v3-overview.md)
-- PostgreSQL 部署说明：[docs/postgresql-setup.md](docs/postgresql-setup.md)
-
-也可以使用本地 CLI 以源码模式安装和管理 MoviePilot：
-
-```shell
-curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootstrap-local.sh | bash
+### 方式二：命令行
+```bash
+sudo appcenter-cli install-fpk -e /tmp/empty.env moviepilot-fnos-lite-1.0.3.fpk -v 1
+sudo appcenter-cli start moviepilot-fnos-lite
 ```
 
-安装完成后使用 `moviepilot` 命令完成初始化、启动、停止、更新和配置查看。完整命令见 [docs/cli.md](docs/cli.md)。
+- 服务端口：**3011**（浏览器访问 `http://NAS_IP:3011`）
+- 数据目录：`/vol1/@appdata/moviepilot-fnos-lite/`（配置、数据库、日志）
+- 升级：先卸载再安装，**配置与数据库会保留**
 
-## Agent
+## 🛠 打包（开发者）
 
-1. MoviePilot 自带智能体能力，可在完成模型配置后，通过自然语言调用系统工具，辅助完成搜索、订阅、下载、整理、排障等管理任务。
-2. 其它智能体可以导入本仓库的 `skills/` 目录以获得 MoviePilot 操作能力；支持 `skills` CLI 的环境可使用：
+详见 [`fnos/fpk/README.md`](fnos/fpk/README.md)，含 FPK 目录结构、生命周期脚本与踩坑记录。
 
-   ```shell
-   npx skills add https://github.com/jxxghp/MoviePilot
-   ```
+## 📄 许可证
 
-   内置 Skills 列表见 [skills/](skills/)，自定义 Skill 可参考 [skills/create-moviepilot-skill/SKILL.md](skills/create-moviepilot-skill/SKILL.md)。
-3. 其它 MCP 客户端可以通过 MoviePilot 的 MCP 端点 `/api/v1/mcp` 调用工具，认证方式、客户端配置和工具 API 见 [docs/mcp-api.md](docs/mcp-api.md)。
-
-
-## 参与开发
-
-开发前请先阅读仓库规则和本地环境说明，保持变更聚焦，通过测试后再提交 PR。常用入口：
-
-- 文档规则入口：[docs/rules/README.md](docs/rules/README.md)
-- 开发环境与本地源码运行：[docs/development-setup.md](docs/development-setup.md)
-- 测试说明：[docs/testing.md](docs/testing.md)
-- 新站点适配采集与 Feature Request 提交：[MoviePilot-Site-Collector](https://github.com/jxxghp/MoviePilot-Site-Collector/blob/main/docs/site-adapter-capture.md)
-- 站点采集器下载：[独立 Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest)，仅在采集器变化时递增版本并发布。
-- REST API 文档：https://api.movie-pilot.org
-- 插件开发说明：https://wiki.movie-pilot.org/zh/plugindev
-
-## 相关项目
-
-- [MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend)
-- [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)
-- [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
-- [MoviePilot-Server](https://github.com/jxxghp/MoviePilot-Server)
-- [MoviePilot-Rust](https://github.com/jxxghp/MoviePilot-Rust)
-- [MoviePilot-Wiki](https://github.com/jxxghp/MoviePilot-Wiki)
-
-## 免责申明
-
-- 本软件仅供学习交流使用，任何人不得将本软件用于商业用途，任何人不得将本软件用于违法犯罪活动，软件对用户行为不知情，一切责任由使用者承担。
-- 本软件代码开源，基于开源代码进行修改，人为去除相关限制导致软件被分发、传播并造成责任事件的，需由代码修改发布者承担全部责任，不建议对用户认证机制进行规避或修改并公开发布。
-- 本项目不接受捐赠，没有在任何地方发布捐赠信息页面，软件本身不收费也不提供任何收费相关服务，请仔细辨别避免误导。
-
-## 贡献者
-
-<a href="https://github.com/jxxghp/MoviePilot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jxxghp/MoviePilot" />
-</a>
+[GPL-3.0](LICENSE) © 基于 [MoviePilot](https://github.com/jxxghp/MoviePilot) 裁剪。
