@@ -245,10 +245,8 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                     recovery=JobRecoveryPolicy.MANUAL_ONLY,
                 ),
                 JobSpec("data_cleanup", "数据表清理", services.cleanup_data, "database"),
-                JobSpec("user_auth", "用户认证检查", self.user_auth, "security"),
                 JobSpec("scheduler_job", "公共定时服务", services.run_modules, "module"),
                 *_wallpaper_job_specs(services, config.wallpaper),
-                JobSpec("sitedata_refresh", "站点数据刷新", services.refresh_site_data, "site"),
                 JobSpec("recommend_refresh", "推荐缓存", services.refresh_recommend, "recommend"),
                 JobSpec(
                     "plugin_market_refresh",
@@ -453,26 +451,7 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 kwargs={"job_id": "data_cleanup"},
             )
 
-        # 定时检查用户认证，每隔10分钟
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="user_auth",
-            name="用户认证检查",
-            minutes=10,
-            kwargs={"job_id": "user_auth"},
-        )
-
-        # 站点数据刷新
-        if config.sitedata_refresh_interval:
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="sitedata_refresh",
-                name="站点数据刷新",
-                minutes=config.sitedata_refresh_interval * 60,
-                kwargs={"job_id": "sitedata_refresh"},
-            )
+        # fnos-lite：站点认证与站点数据刷新已在剥离版中移除，不注册相关定时任务。
 
         # 推荐缓存
         self._scheduler.add_job(

@@ -538,6 +538,8 @@ def check_auth() -> None:
     """
     检查认证状态
     """
+    # fnos-lite：站点认证功能已移除，不再发送认证失败消息。
+    return
     if SitesHelper().auth_level < 2:
         err_msg = "用户认证失败，站点相关功能将无法使用！"
         MessageHelper().put(f"注意：{err_msg}", title="用户认证", role="system", level="warning")
@@ -807,7 +809,8 @@ async def _initialize_modules() -> HostRuntime:
         lambda: (sites_helper.auth_version, sites_helper.indexer_version)
     )
     # 用户认证
-    user_auth()
+    # fnos-lite：站点认证已移除，跳过启动时认证检查。
+    pass
     # 事件错误通知由启动组合层接入消息服务。
     EventManager().set_error_notifier(notify_event_error)
     # WebAgent 事件监听由组合根统一装配，HTTP 请求只管理自己的队列。
