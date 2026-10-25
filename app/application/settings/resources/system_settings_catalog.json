@@ -1602,6 +1602,10 @@
       "group": "logging",
       "source_file": "app/runtime/log.py",
       "source_line": 57
+    },
+    "TRANSFER_MIN_FILESIZE": {
+      "description": "参与整理的视频文件最小体积(MB)，小于该值的视频文件视为广告/杂物不整理；0 表示不过滤",
+      "group": "downloads"
     }
   },
   "systemconfig": {
