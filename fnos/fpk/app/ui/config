@@ -1,7 +1,7 @@
 {
     ".url": {
         "moviepilot-fnos-lite.Application": {
-            "title": "影视入库助手",
+            "title": "MP入库助手",
             "icon": "images/icon_{0}.png",
             "type": "url",
             "protocol": "http",
