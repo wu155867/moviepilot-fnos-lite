@@ -1,0 +1,4 @@
+#!/bin/bash
+# FPK 安装向导：收集端口与媒体目录（字段名即环境变量名，写入 fnos.env）
+echo "MOVIEPILOT_PORT=3011"
+echo "MEDIA_DIR=/vol1/1000/media"

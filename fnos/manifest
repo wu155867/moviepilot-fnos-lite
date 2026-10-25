@@ -1,0 +1,6 @@
+appname = moviepilot-fnos-lite
+version = 1.0.0
+display_name = MoviePilot 影视入库助手
+desc = 基于 MoviePilot 裁剪的媒体库整理工具：文件识别、TMDB 刮削、目录扫描入库、qBittorrent 下载管理。原生运行，无需 Docker。
+arch = x86_64
+service_port = 3011
