@@ -5,7 +5,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Optional, cast
+from typing import Any, ClassVar, Mapping, Optional, cast
 
 from app.application.configuration import get_chain_runtime_config_snapshot
 from app.application.music.observation import music_recognition_needs_confirmation
@@ -19,6 +19,7 @@ from app.domain.context import (
 from app.domain.media import is_music_media_source, music_recognition_sources
 from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
+from app.foundation.text import contains_chinese, convert as zhconv_convert
 from app.runtime.cache import async_fresh, fresh
 from app.runtime.log import logger
 from app.schemas.types import (
@@ -116,6 +117,9 @@ class MediaRecognitionOwner(_MediaOwnerBase):
     """
     媒体原生来源路由与同步、异步识别回退编排。
     """
+
+    # fnos-lite：豆瓣中文名兜底失败过的媒体标识缓存（进程级，避免重复查询）
+    _douban_fallback_failed: ClassVar[set[str]] = set()
 
     def _native_recognition_plan(
         self,
@@ -316,7 +320,9 @@ class MediaRecognitionOwner(_MediaOwnerBase):
         )
         if not mediainfo:
             logger.warn(f"{metainfo.title} 未识别到媒体信息")
-        return mediainfo
+            return mediainfo
+        # fnos-lite：TMDB 无中文译名时用豆瓣中文名兜底
+        return self._apply_douban_cn_title_fallback(mediainfo)
 
     def _recognize_with_fallback_by_meta(
         self,
@@ -429,6 +435,207 @@ class MediaRecognitionOwner(_MediaOwnerBase):
         )
         if not mediainfo:
             logger.warn(f"{metainfo.title} 未识别到媒体信息")
+            return mediainfo
+        # fnos-lite：TMDB 无中文译名时用豆瓣中文名兜底
+        return await self._async_apply_douban_cn_title_fallback(mediainfo)
+
+    @staticmethod
+    def _douban_fallback_cache_key(mediainfo: MediaInfo) -> Optional[str]:
+        """
+        构造豆瓣兜底去重缓存键。
+        """
+        if mediainfo.tmdb_id:
+            return f"tmdb:{mediainfo.tmdb_id}"
+        if mediainfo.imdb_id:
+            return f"imdb:{mediainfo.imdb_id}"
+        return None
+
+    @classmethod
+    def _douban_cn_title_fallback_applicable(cls, mediainfo: MediaInfo) -> bool:
+        """
+        判断是否需要豆瓣中文名兜底。
+
+        仅当 TMDB 识别结果标题不含中文时触发（TMDB 中文别名回退已失败）。
+        """
+        if not mediainfo or mediainfo.media_source != MediaSource.TMDB:
+            return False
+        _type_value = getattr(mediainfo.type, "value", mediainfo.type)
+        if _type_value not in ("电影", "电视剧"):
+            return False
+        cache_key = cls._douban_fallback_cache_key(mediainfo)
+        if cache_key and cache_key in cls._douban_fallback_failed:
+            return False
+        return not contains_chinese(mediainfo.title or "")
+
+    def _apply_douban_cn_title_fallback(self, mediainfo: MediaInfo) -> MediaInfo:
+        """
+        fnos-lite：豆瓣中文名兜底（同步版）。
+
+        标题不含中文时，通过豆瓣（优先 IMDb ID 精确匹配）查询中文译名，
+        将标题改写为「中文名 原名」格式，供整理命名与 nfo 使用。
+        查询失败或无中文结果时保持原标题，不阻塞识别流程。
+        """
+        if not self._douban_cn_title_fallback_applicable(mediainfo):
+            return mediainfo
+        logger.info(f"fnos-lite：TMDB 标题无中文，尝试豆瓣中文名兜底：{mediainfo.title}")
+        cache_key = self._douban_fallback_cache_key(mediainfo)
+        search_name = mediainfo.original_title or mediainfo.title
+        search_year = str(mediainfo.year) if mediainfo.year else None
+        try:
+            # 第一级：IMDb ID 精确匹配（豆瓣此路径可能返回英文原名）
+            douban_info = self.match_doubaninfo(
+                name=search_name,
+                imdbid=mediainfo.imdb_id,
+                mtype=mediainfo.type,
+                year=search_year,
+            )
+            merged = self._merge_douban_cn_title(mediainfo, douban_info)
+            # 第二级：IMDb 路径未取得中文时，直接搜索豆瓣取中文译名
+            if merged is mediainfo:
+                cn_title = self._douban_direct_search_cn(
+                    search_name, getattr(mediainfo.type, "value", mediainfo.type), search_year
+                )
+                if cn_title:
+                    merged = self._merge_douban_cn_title(
+                        mediainfo, {"title": cn_title, "year": search_year}
+                    )
+        except Exception as e:
+            logger.warn(f"fnos-lite：豆瓣中文名兜底查询失败，保持原标题：{e}")
+            if cache_key:
+                self._douban_fallback_failed.add(cache_key)
+            return mediainfo
+        if merged is mediainfo and cache_key:
+            self._douban_fallback_failed.add(cache_key)
+        return merged
+
+    async def _async_apply_douban_cn_title_fallback(self, mediainfo: MediaInfo) -> MediaInfo:
+        """
+        fnos-lite：豆瓣中文名兜底（异步版）。
+        """
+        if not self._douban_cn_title_fallback_applicable(mediainfo):
+            return mediainfo
+        logger.info(f"fnos-lite：TMDB 标题无中文，尝试豆瓣中文名兜底：{mediainfo.title}")
+        cache_key = self._douban_fallback_cache_key(mediainfo)
+        search_name = mediainfo.original_title or mediainfo.title
+        search_year = str(mediainfo.year) if mediainfo.year else None
+        try:
+            # 第一级：IMDb ID 精确匹配（豆瓣此路径可能返回英文原名）
+            douban_info = await self.async_match_doubaninfo(
+                name=search_name,
+                imdbid=mediainfo.imdb_id,
+                mtype=mediainfo.type,
+                year=search_year,
+            )
+            merged = self._merge_douban_cn_title(mediainfo, douban_info)
+            # 第二级：IMDb 路径未取得中文时，直接搜索豆瓣取中文译名
+            if merged is mediainfo:
+                cn_title = await self._douban_direct_search_cn_async(
+                    search_name, getattr(mediainfo.type, "value", mediainfo.type), search_year
+                )
+                if cn_title:
+                    merged = self._merge_douban_cn_title(
+                        mediainfo, {"title": cn_title, "year": search_year}
+                    )
+        except Exception as e:
+            logger.warn(f"fnos-lite：豆瓣中文名兜底查询失败，保持原标题：{e}")
+            if cache_key:
+                self._douban_fallback_failed.add(cache_key)
+            return mediainfo
+        if merged is mediainfo and cache_key:
+            self._douban_fallback_failed.add(cache_key)
+        return merged
+
+    @staticmethod
+    def _pick_douban_cn_candidate(result: Any, search_year: Optional[str]) -> Optional[str]:
+        """
+        从豆瓣搜索结果中挑选年份匹配（±1 年）且标题含中文的条目。
+        """
+        if not isinstance(result, dict):
+            return None
+        for item_obj in result.get("items") or []:
+            target = item_obj.get("target")
+            if not isinstance(target, dict):
+                continue
+            title = target.get("title")
+            if not title or not contains_chinese(str(title)):
+                continue
+            item_year = str(target.get("year") or "")[:4]
+            if search_year and item_year.isdigit() and search_year[:4].isdigit():
+                if abs(int(item_year) - int(search_year[:4])) > 1:
+                    continue
+            return str(title)
+        return None
+
+    @classmethod
+    def _douban_direct_search_cn(cls, search_name: str, type_value: str, search_year: Optional[str]) -> Optional[str]:
+        """
+        直接调用豆瓣搜索接口查询中文译名（同步版）。
+        """
+        try:
+            from app.modules.douban.apiv2 import DoubanApi
+            api = DoubanApi()
+            if type_value == "电视剧":
+                result = api.tv_search(search_name, count=10)
+            else:
+                result = api.movie_search(search_name, count=10)
+            return cls._pick_douban_cn_candidate(result, search_year)
+        except Exception as e:
+            logger.warn(f"fnos-lite：豆瓣直连搜索失败：{e}")
+            return None
+
+    @staticmethod
+    async def _douban_direct_search_cn_async(search_name: str, type_value: str, search_year: Optional[str]) -> Optional[str]:
+        """
+        直接调用豆瓣搜索接口查询中文译名（异步版）。
+        """
+        try:
+            from app.modules.douban.apiv2 import DoubanApi
+            api = DoubanApi()
+            if type_value == "电视剧":
+                result = await api.async_tv_search(search_name, count=10)
+            else:
+                result = await api.async_movie_search(search_name, count=10)
+            return MediaRecognitionOwner._pick_douban_cn_candidate(result, search_year)
+        except Exception as e:
+            logger.warn(f"fnos-lite：豆瓣直连搜索失败：{e}")
+            return None
+
+    @staticmethod
+    def _merge_douban_cn_title(mediainfo: MediaInfo, douban_info: Any) -> MediaInfo:
+        """
+        将豆瓣中文名合并进媒体信息。
+
+        命名格式：「中文名 原名」，如「圣诞好戏 Merry Christmas Aubrey Flint (2026)」。
+        """
+        if not isinstance(douban_info, dict):
+            return mediainfo
+        cn_title = douban_info.get("title")
+        if not cn_title or not isinstance(cn_title, str):
+            return mediainfo
+        cn_title = zhconv_convert(cn_title, "zh-hans").strip()
+        if not cn_title or not contains_chinese(cn_title):
+            return mediainfo
+        original_title = mediainfo.original_title or mediainfo.title or ""
+        if cn_title in original_title:
+            return mediainfo
+        # 年份容差校验（±1 年），防止同名错认
+        douban_year = str(douban_info.get("year") or "")[:4]
+        if mediainfo.year and douban_year.isdigit():
+            if abs(int(douban_year) - int(str(mediainfo.year)[:4])) > 1:
+                logger.info(
+                    f"fnos-lite：豆瓣年份 {douban_year} 与 TMDB 年份 {mediainfo.year} 不符，"
+                    f"放弃中文名兜底：{original_title}"
+                )
+                return mediainfo
+        mediainfo.title = f"{cn_title} {original_title}".strip()
+        # 更新别名列表，保证后续搜索匹配可用
+        names = list(mediainfo.names or [])
+        if cn_title not in names:
+            names.insert(0, cn_title)
+        mediainfo.names = names
+        logger.info(
+            f"fnos-lite：已使用豆瓣中文名兜底：{original_title} -> {mediainfo.title}"
+        )
         return mediainfo
 
     async def _async_recognize_with_fallback_by_meta(

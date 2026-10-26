@@ -823,7 +823,15 @@ class RecognitionMixin:
         if not plan.identity_valid:
             logger.warning("媒体识别需要同时提供有效的 media_source 和 media_id")
             return None
-        return cast(Optional[MediaInfo], self._finalize_recognition_result(self._run_recognition_steps(plan)))
+        result = cast(Optional[MediaInfo], self._finalize_recognition_result(self._run_recognition_steps(plan)))
+        # fnos-lite：TMDB 无中文译名时用豆瓣中文名兜底（覆盖按标题/按媒体 ID 全部路径）
+        try:
+            from app.chain.media.douban_fallback import apply_douban_cn_title_fallback
+            if isinstance(result, MediaInfo):
+                result = apply_douban_cn_title_fallback(result)
+        except Exception:
+            pass
+        return result
 
     async def async_recognize_media(
             self,
@@ -862,7 +870,15 @@ class RecognitionMixin:
         if not plan.identity_valid:
             logger.warning("媒体识别需要同时提供有效的 media_source 和 media_id")
             return None
-        return cast(Optional[MediaInfo], await self._async_finalize_recognition_result(await self._async_run_recognition_steps(plan)))
+        result = cast(Optional[MediaInfo], await self._async_finalize_recognition_result(await self._async_run_recognition_steps(plan)))
+        # fnos-lite：TMDB 无中文译名时用豆瓣中文名兜底（覆盖按标题/按媒体 ID 全部路径）
+        try:
+            from app.chain.media.douban_fallback import async_apply_douban_cn_title_fallback
+            if isinstance(result, MediaInfo):
+                result = await async_apply_douban_cn_title_fallback(result)
+        except Exception:
+            pass
+        return result
 
     @staticmethod
     def _media_recognize_plugin_payload(

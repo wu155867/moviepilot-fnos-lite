@@ -270,5 +270,27 @@ class MediaChain(ChainBase, metaclass=Singleton):
         _AsyncMediaCall, MediaRecognitionOwner.async_recognize_by_meta
     )
     _async_recognize_with_fallback_by_meta = MediaRecognitionOwner._async_recognize_with_fallback_by_meta
+    # fnos-lite：豆瓣中文名兜底方法绑定（staticmethod/classmethod 需按原描述符类型重绑定）
+    _apply_douban_cn_title_fallback = MediaRecognitionOwner._apply_douban_cn_title_fallback
+    _async_apply_douban_cn_title_fallback = MediaRecognitionOwner._async_apply_douban_cn_title_fallback
+    _douban_cn_title_fallback_applicable = classmethod(
+        MediaRecognitionOwner._douban_cn_title_fallback_applicable.__func__
+    )
+    _douban_fallback_cache_key = staticmethod(
+        MediaRecognitionOwner._douban_fallback_cache_key
+    )
+    _merge_douban_cn_title = staticmethod(
+        MediaRecognitionOwner._merge_douban_cn_title
+    )
+    _douban_fallback_failed = MediaRecognitionOwner._douban_fallback_failed
+    _pick_douban_cn_candidate = staticmethod(
+        MediaRecognitionOwner._pick_douban_cn_candidate
+    )
+    _douban_direct_search_cn = classmethod(
+        MediaRecognitionOwner._douban_direct_search_cn.__func__
+    )
+    _douban_direct_search_cn_async = staticmethod(
+        MediaRecognitionOwner._douban_direct_search_cn_async
+    )
     search = cast(_SearchCall, MediaSearchOwner.search)
     async_search = cast(_AsyncSearchCall, MediaSearchOwner.async_search)
