@@ -63,7 +63,7 @@ def build_planning_rejection_checkpoint(
         root_target_path=source_path,
         final_target_path=source_path,
         resolved_transfer_type=(
-            task.transfer_type or planning_input.requested_transfer_type or "copy"
+            task.transfer_type or planning_input.requested_transfer_type or "link"
         ),
         items=(),
         classification_snapshot=classification_snapshot,
