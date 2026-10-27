@@ -653,26 +653,26 @@ class SystemChain(_SystemUpdateChain):
     @staticmethod
     def __get_server_release_version() -> Optional[str]:
         """
-        获取后端V3最新版本
+        获取本仓库（MP 入库助手）最新版本
         """
         try:
             http, _ = _system_ports_snapshot()
             response = http.get(
-                "https://api.github.com/repos/jxxghp/MoviePilot/releases",
+                "https://api.github.com/repos/wu155867/moviepilot-fnos-lite/releases",
                 proxies=get_chain_runtime_config_snapshot().proxy,
                 headers=get_chain_runtime_config_snapshot().github_headers,
             )
             if response:
                 try:
                     releases: list[str] = [release['tag_name'] for release in response.json()]
-                    v3_releases = [tag for tag in releases if re.match(r"^v3\.", tag)]
-                    if not v3_releases:
-                        logger.warning("获取v3后端最新版本出错！")
+                    v1_releases = [tag for tag in releases if re.match(r"^v1\.", tag)]
+                    if not v1_releases:
+                        logger.warning("获取本仓库最新版本出错！")
                     else:
-                        # 找到最新的v3版本
-                        latest_v3 = sorted(v3_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
-                        logger.info(f"获取到后端最新版本：{latest_v3}")
-                        return latest_v3
+                        # 找到最新的 v1 版本
+                        latest_v1 = sorted(v1_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
+                        logger.info(f"获取到最新版本：{latest_v1}")
+                        return latest_v1
                 finally:
                     _close_system_response(response)
             else:
@@ -684,33 +684,12 @@ class SystemChain(_SystemUpdateChain):
     @staticmethod
     def __get_front_release_version() -> Optional[str]:
         """
-        获取前端V3最新版本
+        获取前端版本。
+
+        精简版前端来自上游 MoviePilot v3.1.9 基线，锁定不参与更新判定：
+        直接返回本地前端版本，使比较结果恒为"已是最新"。
         """
-        try:
-            http, _ = _system_ports_snapshot()
-            response = http.get(
-                "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases",
-                proxies=get_chain_runtime_config_snapshot().proxy,
-                headers=get_chain_runtime_config_snapshot().github_headers,
-            )
-            if response:
-                try:
-                    releases: list[str] = [release['tag_name'] for release in response.json()]
-                    v3_releases = [tag for tag in releases if re.match(r"^v3\.", tag)]
-                    if not v3_releases:
-                        logger.warning("获取v3前端最新版本出错！")
-                    else:
-                        # 找到最新的v3版本
-                        latest_v3 = sorted(v3_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
-                        logger.info(f"获取到前端最新版本：{latest_v3}")
-                        return latest_v3
-                finally:
-                    _close_system_response(response)
-            else:
-                logger.error("无法获取前端版本信息，请检查网络连接或GitHub API请求。")
-        except Exception as err:
-            logger.error(f"获取前端最新版本失败：{str(err)}")
-        return None
+        return runtime_version.get_frontend_version()
 
     @staticmethod
     def get_server_local_version() -> str:

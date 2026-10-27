@@ -63,12 +63,15 @@ class SystemUpdateManager(metaclass=SingletonClass):
     持久化两类升级状态，并保证同一时刻只有一个后台下载任务。
     """
 
-    _BACKEND_RELEASES_API = "https://api.github.com/repos/jxxghp/MoviePilot/releases"
+    # 更新渠道：本精简版仓库（MP 入库助手），只比对 v1.x 标签
+    _BACKEND_RELEASES_API = (
+        "https://api.github.com/repos/wu155867/moviepilot-fnos-lite/releases"
+    )
     _FRONTEND_RELEASE_API = (
-        "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/tags/{tag}"
+        "https://api.github.com/repos/wu155867/moviepilot-fnos-lite/releases/tags/{tag}"
     )
     _BACKEND_ARCHIVE_URL = (
-        "https://github.com/jxxghp/MoviePilot/archive/refs/tags/{tag}.zip"
+        "https://github.com/wu155867/moviepilot-fnos-lite/archive/refs/tags/{tag}.zip"
     )
     _VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:[-.](?:alpha|beta|rc)\d*)?$", re.I)
     # 镜像构建时写入的系统基线（ISO 日期），记录镜像系统软件包刷新到的安全基线。
@@ -77,8 +80,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
     # MIN_SYSTEM_BASELINE 提高到该日期之后才会拦截旧镜像。
     _LEGACY_SYSTEM_BASELINE = "2026-01-01"
     _SYSTEM_BASELINE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    # 稳定版允许 -N 后缀，用于不升小版本的临时修复（如 v3.0.10-1）
-    _STABLE_VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:-\d+)?$", re.I)
+    # 稳定版允许 -N 后缀，用于不升小版本的临时修复（如 v1.0.8-1）
+    _STABLE_VERSION_PATTERN = re.compile(r"^v1\.\d+\.\d+(?:-\d+)?$", re.I)
 
     def __init__(self) -> None:
         """
@@ -565,7 +568,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
         """
         release = self._latest_application_release()
         if not release:
-            raise RuntimeError("未找到可用的 v3 稳定版本")
+            raise RuntimeError("未找到可用的稳定版本")
         version = str(release["tag_name"])
         current_version = get_app_version()
         has_update = compare_version(version, "gt", current_version) is True
@@ -586,9 +589,9 @@ class SystemUpdateManager(metaclass=SingletonClass):
             can_install=False,
         )
         if has_update:
-            logger.info(f"发现 MoviePilot 主程序更新：{current_version} -> {version}")
+            logger.info(f"发现主程序更新：{current_version} -> {version}")
         else:
-            logger.info(f"MoviePilot 主程序已是最新版本：{current_version}")
+            logger.info(f"主程序已是最新版本：{current_version}")
 
     def _check_resources(self, *, ready_version: str | None = None) -> None:
         """

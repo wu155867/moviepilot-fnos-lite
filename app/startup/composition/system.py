@@ -313,10 +313,11 @@ class _ReleaseCatalogAdapter(ReleaseCatalogPort):
         """
         读取有效 JSON 列表，失败时返回空值。
         """
+        # 精简版：读取本仓库（MP 入库助手）的 Release 列表
         response = await AsyncRequestUtils(
             proxies=self._settings.get("PROXY"),
             headers=self._settings.get("GITHUB_HEADERS"),
-        ).get_res("https://api.github.com/repos/jxxghp/MoviePilot/releases")
+        ).get_res("https://api.github.com/repos/wu155867/moviepilot-fnos-lite/releases")
         if response is None or response.status_code != 200:
             return None
         payload = response.json()
