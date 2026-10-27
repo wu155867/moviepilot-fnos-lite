@@ -1,0 +1,36 @@
+#!/bin/bash
+# 安装后：把安装向导里填的端口落盘，并同步系统侧三处登记
+set -u
+APP_NAME="moviepilot-fnos-lite"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+VAR_DIR="${TRIM_PKGVAR:-/vol1/@appdata/$APP_NAME}"
+APP_DIR="${TRIM_APPDEST:-/vol1/@appcenter/$APP_NAME}"
+mkdir -p "$VAR_DIR/log"
+
+valid_port() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+PORT=""
+if valid_port "${wizard_port:-}"; then
+  PORT="$wizard_port"
+fi
+if [ -z "$PORT" ]; then
+  OLD="$(tr -dc '0-9' < "$VAR_DIR/port" 2>/dev/null)"
+  if valid_port "$OLD"; then PORT="$OLD"; fi
+fi
+if [ -z "$PORT" ]; then
+  PORT="$(awk -F= '/^[[:space:]]*service_port[[:space:]]*=/{gsub(/[^0-9]/,"",$2); print $2}' "$SELF_DIR/../manifest" 2>/dev/null | head -1)"
+fi
+valid_port "$PORT" || PORT=3011
+
+echo "$PORT" > "$VAR_DIR/port"
+if [ -n "${TRIM_UID:-}" ] && [ "$(id -u)" = "0" ]; then
+  chown "${TRIM_UID}:${TRIM_GID}" "$VAR_DIR/port" 2>/dev/null || true
+fi
+
+if [ -f "$SELF_DIR/port_sync.py" ] && [ "$(id -u)" = "0" ]; then
+  python3 "$SELF_DIR/port_sync.py" "$PORT" "$APP_NAME" "$APP_DIR" "$SELF_DIR/.." >> "$VAR_DIR/log/port_sync.log" 2>&1 || true
+fi
+exit 0

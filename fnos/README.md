@@ -22,9 +22,12 @@
 按飞牛 FPK 结构组装：
 ```
 manifest            <- fnos/manifest（需按 developer.fnnas.com 文档补全字段）
-cmd/main            <- fnos/cmd/main（生命周期：start/stop/status）
-config/privilege    <- run-as=package
-wizard/install      <- fnos/wizard/install（端口、媒体目录）
+cmd/main            <- fnos/fpk/cmd/main（生命周期：start/stop/status，root 运行 + setpriv 降权）
+cmd/port_sync.py    <- fnos/fpk/cmd/port_sync.py（端口同步到 ui/config、manifest、数据库）
+cmd/install_callback、config_callback <- 落盘向导端口并同步登记
+config/privilege    <- fnos/fpk/config/privilege（run-as=root，见 fpk/README.md）
+wizard/install      <- fnos/wizard/install（JSON 表单，服务端口）
+wizard/config       <- fnos/wizard/config（安装后可在设置页改端口）
 app/                <- 整个项目（含 runtime/python 与 .venv-linux）
 ```
 用官方 fnpack CLI 构建 .fpk，在飞牛「应用中心 → 手动安装」实测。

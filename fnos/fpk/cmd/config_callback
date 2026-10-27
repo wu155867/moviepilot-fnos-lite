@@ -1,0 +1,45 @@
+#!/bin/bash
+# 应用设置页保存后：若填了新端口，落盘 → 同步三处登记 → 重启应用
+set -u
+APP_NAME="moviepilot-fnos-lite"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+VAR_DIR="${TRIM_PKGVAR:-/vol1/@appdata/$APP_NAME}"
+APP_DIR="${TRIM_APPDEST:-/vol1/@appcenter/$APP_NAME}"
+LOG="$VAR_DIR/log/port_sync.log"
+mkdir -p "$VAR_DIR/log"
+
+valid_port() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+# 留空 = 不修改端口
+if [ -z "${wizard_port:-}" ]; then
+  exit 0
+fi
+
+if ! valid_port "$wizard_port"; then
+  echo "端口必须是 1-65535 之间的数字，请重新填写。" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  exit 1
+fi
+
+OLD="$(tr -dc '0-9' < "$VAR_DIR/port" 2>/dev/null)"
+if [ "$OLD" = "$wizard_port" ]; then
+  exit 0
+fi
+
+# 先停掉旧端口的实例（此时 port 文件仍是旧值，可直接定位旧进程）
+bash "$SELF_DIR/main" stop >/dev/null 2>&1 || true
+
+echo "$wizard_port" > "$VAR_DIR/port"
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_UID:-}" ]; then
+  chown "${TRIM_UID}:${TRIM_GID}" "$VAR_DIR/port" 2>/dev/null || true
+fi
+
+if [ -f "$SELF_DIR/port_sync.py" ] && [ "$(id -u)" = "0" ]; then
+  python3 "$SELF_DIR/port_sync.py" "$wizard_port" "$APP_NAME" "$APP_DIR" "$SELF_DIR/.." >> "$LOG" 2>&1 || true
+fi
+
+# 让新端口立即生效
+bash "$SELF_DIR/main" start >/dev/null 2>&1 || true
+exit 0
