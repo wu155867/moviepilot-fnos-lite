@@ -46,34 +46,6 @@ class _MediaServerSchedule(TypedDict):
     interval: int
 
 
-def _subscription_search_job_specs(
-    services: SchedulerServices, search_interval: int = 24,
-) -> tuple[JobSpec, ...]:
-    """
-    构造订阅搜索、新增搜索与持久队列恢复任务目录。
-    """
-    return (
-        JobSpec(
-            "subscribe_search", "订阅搜索补全", services.search_subscribe, "subscription",
-            kwargs={"state": "R", "scheduled_interval": search_interval}
-        ),
-        JobSpec(
-            "new_subscribe_search",
-            "新增订阅搜索",
-            services.search_subscribe,
-            "subscription",
-            kwargs={"state": "N"},
-        ),
-        JobSpec(
-            "subscribe_search_queue",
-            "恢复订阅搜索队列",
-            services.resume_subscribe_search,
-            "subscription",
-            recovery=JobRecoveryPolicy.DURABLE_QUEUE,
-        ),
-    )
-
-
 def _wallpaper_job_specs(
     services: SchedulerServices,
     wallpaper: str,
@@ -195,40 +167,16 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             replace_existing=True,
         )
 
-    def _poll_subscription_search_queue(self) -> None:
-        """
-        仅在消费者空闲时唤醒托管协程，轮询不等待搜索也不重复报告重入。
-        """
-        if not self._is_job_active("subscribe_search_queue"):
-            self.start("subscribe_search_queue")
-
-    def _register_subscription_search_queue_job(self, config: SchedulerRuntimeConfig) -> None:
-        """
-        注册轻量轮询；搜索协程的真实生命周期由 Scheduler 持有。
-        """
-        self._scheduler.add_job(
-            self._poll_subscription_search_queue,
-            "interval",
-            id="subscribe_search_queue",
-            name="恢复订阅搜索队列",
-            seconds=10,
-            next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(seconds=5),
-        )
-
     def _initialize_catalog(self, config: SchedulerRuntimeConfig) -> None:
         """
         构建完整任务目录并投影到尚未启动的 APScheduler。
         """
         services = self._scheduler_services()
         # 各服务的运行状态
+        # 精简版：站点（CookieCloud）与订阅相关的定时任务已全部移除。
         self._jobs = JobCatalog(
             [
-                JobSpec("cookiecloud", "同步CookieCloud站点", services.sync_cookies, "site"),
                 JobSpec("mediaserver_sync", "同步媒体服务器", services.sync_mediaserver, "mediaserver"),
-                JobSpec("subscribe_tmdb", "订阅元数据更新", services.check_subscribe, "subscription"),
-                *_subscription_search_job_specs(services, config.subscribe_search_interval),
-                JobSpec("subscribe_refresh", "订阅刷新", services.refresh_subscribe, "subscription"),
-                JobSpec("subscribe_follow", "关注的订阅分享", services.follow_subscribe, "subscription"),
                 JobSpec(
                     "transfer",
                     "下载文件整理",
@@ -255,7 +203,6 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                     "plugin",
                     kwargs={"force": True},
                 ),
-                JobSpec("subscribe_calendar_cache", "订阅日历缓存", services.cache_subscribe_calendar, "subscription"),
                 JobSpec("full_gc", "主动内存回收", self.full_gc, "runtime"),
                 JobSpec("agent_heartbeat", "智能体定时任务", self.agent_heartbeat, "agent"),
                 JobSpec("usage_report", "安装版本统计上报", MoviePilotServerHelper.report_usage, "server"),
@@ -298,21 +245,7 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             kwargs={"job_id": "outbox_dispatch"},
             replace_existing=True,
         )
-        # CookieCloud定时同步
-        if (
-            config.cookiecloud_configured
-            and config.cookiecloud_interval
-            and str(config.cookiecloud_interval).isdigit()
-        ):
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="cookiecloud",
-                name="同步CookieCloud站点",
-                minutes=int(config.cookiecloud_interval),
-                next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(minutes=5),
-                kwargs={"job_id": "cookiecloud"},
-            )
+        # 精简版：CookieCloud 站点同步任务已移除。
 
         # 按媒体服务器分别注册自动同步任务
         mediaserver_schedules = self._build_mediaserver_sync_schedules(
@@ -340,72 +273,7 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 kwargs={"job_id": job_id},
             )
 
-        # 新增订阅时搜索（5分钟检查一次）
-        self._register_subscription_search_queue_job(config)
-
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="new_subscribe_search",
-            name="新增订阅搜索",
-            minutes=5,
-            kwargs={"job_id": "new_subscribe_search"},
-        )
-
-        # 检查更新订阅TMDB数据（每隔6小时）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="subscribe_tmdb",
-            name="订阅元数据更新",
-            hours=6,
-            kwargs={"job_id": "subscribe_tmdb"},
-        )
-
-        # 每五分钟检查逐条订阅到期时间；实际搜索仍受系统或独立周期约束。
-        if config.subscribe_search:
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="subscribe_search",
-                name="订阅搜索补全",
-                minutes=5,
-                kwargs={"job_id": "subscribe_search"},
-            )
-
-        if config.subscribe_mode == "spider":
-            # 站点首页种子定时刷新模式
-            triggers = TimerUtils.random_scheduler(num_executions=32)
-            for trigger in triggers:
-                self._scheduler.add_job(
-                    self.start,
-                    "cron",
-                    id=f"subscribe_refresh|{trigger.hour}:{trigger.minute}",
-                    name="订阅刷新",
-                    hour=trigger.hour,
-                    minute=trigger.minute,
-                    kwargs={"job_id": "subscribe_refresh"},
-                )
-        else:
-            # RSS订阅模式
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="subscribe_refresh",
-                name="RSS订阅刷新",
-                minutes=config.subscribe_rss_interval,
-                kwargs={"job_id": "subscribe_refresh"},
-            )
-
-        # 关注订阅分享（每1小时）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="subscribe_follow",
-            name="关注的订阅分享",
-            hours=1,
-            kwargs={"job_id": "subscribe_follow"},
-        )
+        # 精简版：订阅搜索、订阅元数据更新、订阅刷新、订阅分享等任务已移除。
 
         # 下载器文件转移（每5分钟）
         self._scheduler.add_job(
@@ -486,16 +354,7 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 kwargs={"job_id": "system_update_check"},
             )
 
-        # 订阅日历缓存
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="subscribe_calendar_cache",
-            name="订阅日历缓存",
-            hours=6,
-            next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(minutes=2),
-            kwargs={"job_id": "subscribe_calendar_cache"},
-        )
+        # 精简版：订阅日历缓存任务已移除。
 
         # 主动内存回收
         if config.memory_gc_interval:
