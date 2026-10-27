@@ -1,5 +1,5 @@
 appname               = moviepilot-fnos-lite
-version               = 1.0.6
+version               = 1.0.7
 display_name          = MP入库助手
 desc                  = 基于 MoviePilot 裁剪的媒体库整理工具：文件识别、TMDB 刮削、目录扫描入库、qBittorrent 下载管理。原生运行，无需 Docker。内置运行时，安装即用，支持自定义服务端口。
 platform              = x86
